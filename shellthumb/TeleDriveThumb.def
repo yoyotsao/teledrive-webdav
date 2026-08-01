@@ -1,0 +1,4 @@
+LIBRARY TeleDriveThumb
+EXPORTS
+    DllGetClassObject   PRIVATE
+    DllCanUnloadNow     PRIVATE

@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.pyc
+config.ini
+cache/
+staging/
+*.session
+*.log
+.pytest_cache/
+
+# Native build output — rebuilt by shellthumb\build.bat
+*.dll
+*.exe
+*.obj
+*.exp
+*.lib
+*.pdb
+
+# Generated reports about the current state of the drive, not source
+truncated.csv
+padded.csv

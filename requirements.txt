@@ -1,0 +1,8 @@
+wsgidav>=4.3
+cheroot>=10.0
+telethon>=1.40
+# Native AES-IGE. Without it Telethon falls back to a pure-Python implementation
+# that decrypts at ~0.15 MiB/s and caps every download well below the link speed;
+# the wheel lifts a single connection to several MiB/s. Not optional in practice.
+cryptg>=0.4
+requests>=2.31
