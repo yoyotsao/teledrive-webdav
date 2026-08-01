@@ -159,15 +159,41 @@ class JsonStore:
             self.flush()
 
     def flush(self) -> None:
+        """Merge this process's entries into the file and write it back.
+
+        Writing ``self._data`` wholesale loses everything another process added
+        since this one loaded the file. That is not hypothetical: a warm-up run
+        filled 21,228 media-property entries while the bridge was up, and the
+        bridge — still holding the older, nearly empty view — overwrote it back
+        down to 2,371 on its next write.
+
+        Every value here is derived from an immutable Telegram message, so two
+        writers never disagree about a key and a plain merge is enough. Loading
+        the file again on each flush costs a read the bridge does rarely, and
+        only when something actually changed.
+        """
         with self._lock:
             if not self._dirty:
                 return
-            payload = json.dumps(self._data)
+            mine = dict(self._data)
             self._dirty = False
+
+        merged = {}
+        try:
+            merged = json.loads(self._path.read_text(encoding="utf-8"))
+            if not isinstance(merged, dict):
+                merged = {}
+        except (OSError, ValueError):
+            merged = {}
+        merged.update(mine)
+
+        with self._lock:
+            self._data = merged
+
         tmp = self._path.with_suffix(self._path.suffix + ".tmp")
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(payload, encoding="utf-8")
+            tmp.write_text(json.dumps(merged), encoding="utf-8")
             os.replace(tmp, self._path)
         except OSError as exc:  # pragma: no cover - cache is best-effort
             log.warning("could not persist %s: %s", self._path.name, exc)

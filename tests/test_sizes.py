@@ -181,3 +181,54 @@ def test_clipping_survives_the_disk_cache():
     second = api.parts_for(e)  # served from _split_cache this time
     assert api.calls == 1
     assert first == second == [(100, SEG), (101, SEG), (102, 100)]
+
+
+# --------------------------------------------------------------------------- #
+# JsonStore concurrency
+#
+# Two processes hold these caches at once — the bridge while a warm-up run
+# fills them. A whole-file write loses whatever the other one added: measured,
+# 21,228 media-property entries went back down to 2,371 that way.
+# --------------------------------------------------------------------------- #
+
+
+def test_flush_keeps_entries_another_writer_added(tmp_path):
+    from tdapi import JsonStore
+
+    path = tmp_path / "shared.json"
+    first = JsonStore(path)
+    first.put("a", 1)
+
+    # A second holder of the same file, as a separate process would be.
+    second = JsonStore(path)
+    second.put("b", 2)
+
+    # The first one writes again from its own, older view.
+    first.put("c", 3)
+
+    import json
+
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    assert on_disk == {"a": 1, "b": 2, "c": 3}
+
+
+def test_flush_is_a_noop_when_nothing_changed(tmp_path):
+    from tdapi import JsonStore
+
+    path = tmp_path / "quiet.json"
+    store = JsonStore(path)
+    store.flush()
+    assert not path.exists()  # nothing written, nothing to merge
+
+
+def test_later_value_wins_over_the_file(tmp_path):
+    from tdapi import JsonStore
+
+    path = tmp_path / "shared.json"
+    JsonStore(path).put("k", "old")
+    store = JsonStore(path)
+    store.put("k", "new")
+
+    import json
+
+    assert json.loads(path.read_text(encoding="utf-8")) == {"k": "new"}
