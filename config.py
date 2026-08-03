@@ -48,6 +48,9 @@ class Config:
     # should not have to care about a tuning knob or the rclone side.
     download_connections: int = 8
     rclone_dir: Path = Path("rclone")
+    warmup_auto: bool = True
+    warmup_interval_minutes: float = 360.0
+    upload_parts: int = 12
 
     @property
     def api_base(self) -> str:
@@ -161,6 +164,7 @@ def load_config(path: Optional[Path] = None) -> Config:
         api_hash=api_hash,
         session=session,
         download_connections=int(get("telegram", "download_connections", "8")),
+        upload_parts=int(get("telegram", "upload_parts", "12")),
         base_url=get("teledrive", "base_url", "http://127.0.0.1:8000"),
         game_folder=get("teledrive", "game_folder", "game"),
         dir_cache_seconds=float(get("teledrive", "dir_cache_seconds", "60")),
@@ -177,4 +181,6 @@ def load_config(path: Optional[Path] = None) -> Config:
         staging_dir=data_root / "staging",
         rclone_dir=data_root / "rclone",
         debounce_minutes=float(get("game", "debounce_minutes", "5")),
+        warmup_auto=get("warmup", "auto", "true").lower() not in ("0", "false", "no", "off"),
+        warmup_interval_minutes=float(get("warmup", "interval_minutes", "360")),
     )

@@ -24,13 +24,14 @@ bridge 只用現有 public API，沒有為它新增任何會讀寫二進位資�
 | `bridge.py` | wsgidav provider、寫入保護、`/rpc/*`、cheroot 伺服器（綁 127.0.0.1） |
 | `tdapi.py` | TeleDrive REST client：JWT 取得/快取/401 自動重登、路徑解析、split part 表快取、`JsonStore` |
 | `tgio.py` | split 位移數學、Telethon worker（背景 event loop）、連線池、`SeekableRemoteFile`、分段上傳、縮圖與 media attributes |
+| `tgupload.py` | `/game` 大檔案的並行分 part 上傳：自算 part index、`UploadGate`（window+rate 的 AIMD 節流）、繞過 `client._call` 直送 `SaveBigFilePart` |
 | `zipfs.py` | 讀 zip central directory → 虛擬目錄樹；單一 entry 的 range 讀取 |
 | `gamestage.py` | `/game` staging + debounce 打包（`ZIP_STORED`）+ 上傳 + 去重 + 清理 |
 | `fetchlocal.py` | 「儲存在本地」：伺服端複製邏輯 + 右鍵 verb 用的進度顯示 CLI |
-| `warmup.py` | 走遍整棵樹批次填滿縮圖與屬性快取，可續跑 |
+| `warmup.py` | 走遍整棵樹批次填滿縮圖與屬性快取、跑 Windows 縮圖快取，可續跑；`BackgroundWarmup` 讓 bridge 自己跑 |
 | `install_menu.py` | 註冊/移除 Explorer 右鍵 verb |
 | `install_thumb.py` | 註冊/移除 shell handler，逐副檔名記錄被取代的既有 CLSID |
-| `shellthumb/` | C++ shell 擴充：`IThumbnailProvider` + `IPropertyStore`，同一份 DLL 兩個 CLSID |
+| `shellthumb/` | C++ shell 擴充：`IThumbnailProvider` + `IPropertyStore`，同一份 DLL 兩個 CLSID；`warmshell.exe` 把縮圖灌進 Windows thumbcache，`bench.exe` / `isolate.exe` 量測 |
 | `config.py` | 讀 `config.ini`，空值回退環境變數，再回退 `env_file`；由單一 `cache_dir` 推導所有路徑 |
 | `start.bat` | 啟動 bridge + `rclone mount` |
 
@@ -87,7 +88,89 @@ Windows 唯一支援「不要讀檔案」的介入點就是縮圖處理常式。
 
 批次之間會等 `THUMB_PREFETCH_IDLE` 的安靜期才繼續，讓前景請求優先。
 **`_thumb` 刻意不呼叫 `note_demand()`** —— 呼叫的話等待中的 `/rpc/thumb` 會一直刷新
-`_last_demand`，預抓永遠等不到安靜期，等於自己擋自己。
+`_last_demand`，預抓永遠等不到安靜期，等於自己擋自己。同理，預抓與整棵樹的 sweep
+呼叫 `props_for(..., demand=False)`：把自己的抓取記成 demand 就是自己等自己。
+
+整棵樹的 sweep 由 bridge **在自己的行程裡**跑（`BackgroundWarmup`，`[warmup] auto`），
+不是排程去啟動 `warmup.py`。理由是所有 Telegram 請求都擠在同一個 client loop 上，
+第二個行程只會變成競爭者 —— 而 `wait_for_quiet` 的禮讓只在同一個行程內看得到。
+`warmup.py` 的 CLI 保留，走的是同一個 `Warmer`，只是 `quiet=0`（沒人要禮讓）。
+
+sweep 每批之間等 `warmup.QUIET`（3 秒，比資料夾預抓的 0.1 秒長得多：預抓是在補完
+有人正在看的資料夾，sweep 是投機性的）。走樹本身也會禮讓 —— 那是打 backend 的 HTTPS
+不是 Telegram，但幾千次 listing 連著打一樣會拖慢每次瀏覽都要的路徑解析。
+
+**沒有 media attributes 的檔案也要寫進快取。** `media_info` 現在對「讀得到但沒東西可報」
+的訊息回 `{}`（讀不到才是缺 key），`props_for` 因此存得下這個事實。否則 `.txt` / `.zip`
+這種檔案永遠算「未快取」，每一輪 sweep 都會再問一次 Telegram，永遠收斂不了。
+
+### 4. 檔頭（`HEAD_SIZE` + `heads/`）
+
+縮圖與屬性都答對了，沒開過的 JPEG 資料夾還是 2–5 秒一張。分開量兩條路徑就知道為什麼：
+同樣 8 個冷 JPEG，**只做縮圖 13.02 秒且 8 個檔案全被讀，只做屬性 0.81 秒且一個都沒讀**。
+shell 是在 `IShellItemImageFactory::GetImage` 裡、在 `IThumbnailProvider` 已經回傳
+有效點陣圖**之後**，自己用 WIC 去開那個檔案 —— 那不是任何可註冊的介面，攔不掉。
+（PNG 不會。試過回報 `System.Photo.Orientation` 讓它別去讀，沒有用。）
+
+所以改成讓那個讀取變便宜：把每張靜態圖的前 `HEAD_SIZE` 存進 `meta/heads/`，
+`SeekableRemoteFile` 收一個 `head` 參數，落在範圍內的讀取直接從磁碟回答。
+
+**這是暫存檔，不是快取。** 一度整棵樹常駐存著（18,451 張圖 8.67 GB），但量出來發現
+每個檔案的檔頭只會被用到一次 —— 就是它第一次被 `warmshell.exe` 那次（見第 5 節）。
+之後 rclone 自己的 VFS 快取接手：shell-warm 過的檔案重讀，12 個裡 11 個在 5–13ms 內
+由 rclone 本機回答，根本沒到 bridge；thumbcache 命中之後 shell 連檔案都不開。所以
+常駐這份檔頭純粹是跟 rclone 快取重複的死重量。改成 `Warmer.fill()` 每一批自己的
+迴圈：抓檔頭 → 跑 `warmshell` → 用 `finally` 刪掉（`Resolver.drop_heads`），
+磁碟峰值從 8.67 GB 降到一批的量級。`needs_warming()` 因此**不再**檢查檔頭
+存不存在 —— 檔頭不再是收斂條件，用完刪掉不會讓下一輪 sweep 又把整棵樹當成沒暖過。
+`BackgroundWarmup._pass` 收尾另外呼叫 `Resolver.clear_heads()` 當保底，防止行程
+在某一批中途掛掉時留下的碎片累積。
+
+- **`HEAD_SIZE` 要蓋住的是 rclone 抓多少，不是 shell 讀多少。** shell 只讀檔頭，
+  但 rclone 的 read-ahead 會放大到 252 KB（最大量到 508 KB）。128 KB 試過，
+  12 個檔案還是 35.4 秒，因為每次都讀出界。設成 `REQUEST_SIZE`（512 KB，也就是
+  reader 的 block 0）之後降到 3.7 秒。放大不增加往返次數 —— 反正就是一個 Telegram
+  請求，而 warmup 是被請求數綁住的，不是頻寬 —— 現在只是暫存，磁碟成本是過渡性的。
+- **`_head_complete` 比對長度而不是存在。** 除了 `HEAD_SIZE` 可能再調之外，
+  同一批內 `heads_for` 到 `drop_heads` 之間若行程中斷，殘留的檔頭要能被正確識別
+  並重用，而不是被當成「已經處理過」直接跳過。
+- **split 檔案直接排除。** 檔頭是從 `entry.message_id` 讀的，那只有在單一 part 時
+  才是邏輯檔案的開頭。靜態圖離 500 MiB 的切割門檻很遠，所以不花成本。
+- **只在 sweep 裡做，不在資料夾預抓裡做。** 一個檔頭是真的檔案讀取，預覽只是 20 KB
+  現成的東西；一百個檔頭要一分半。擋在正在看資料夾的人前面是錯的取捨。
+- PNG 也一起暖。四個冷 PNG 資料夾沒抓到它讀檔，但那不足以拿來當「這個副檔名免除」
+  的依據，代價是多一類莫名其妙變慢的檔案。
+
+### 5. Windows 自己的 thumbcache → `warmshell.exe`
+
+上面三層全部命中，冷資料夾也只有每秒 3 張左右 —— 因為不管我們答什麼，shell 每個檔案
+還是有它自己的工作要做。**看過一次的資料夾是每秒 274 張，而且連 handler 都不會被呼叫**，
+差別在 `thumbcache_*.db`，Python 這邊沒有任何東西寫得進去。
+
+唯一的入口就是用 Explorer 的方式去要縮圖，讓 shell 自己存起來。`warmshell.exe`
+從 stdin 讀 UTF-8 路徑，每個呼叫 `IShellItemImageFactory::GetImage`
+（`SIIGBF_THUMBNAILONLY` 不能省，否則 shell 可能回一個檔案類型圖示、根本沒碰檔案，
+那什麼都沒快取到）。實測同一個冷資料夾跑兩次：第一次 handler 被呼叫 10 次、
+第二次 **0 次**。
+
+| 狀態 | 速率 |
+|---|---|
+| 全冷 | 0.3 張/秒 |
+| bridge 端全暖（預覽+屬性+檔頭） | 1.5–3 張/秒 |
+| **thumbcache 命中** | **274 張/秒** |
+
+- **每一輪都跑，而且不記錄做過什麼。** thumbcache 是 Windows 的，磁碟清理會清空、
+  它自己也會修剪。記住「已經做過」的預熱，會正好在它填的快取被丟掉時安靜下來。
+  重跑已經在快取裡的檔案是一個 4ms。
+- **`SHELL_BATCH` 要小（25）。** 這是 shell warm 唯一的禮讓點，而一個冷 JPEG 要
+  0.7 秒，批次 200 等於連續佔線兩分鐘。
+- **這一層刻意會登記成 demand**（跟預覽/屬性那兩層相反）：它的讀取真的走 rclone 和
+  provider 出去，跟有人在瀏覽分不出來。效果是每批之後多等 3 秒，不是自己等自己 ——
+  下一次 `_yield_` 跑的時候讀取已經結束了。
+- **`pending(start_id, base)` 的 `base` 不能省。** walk 是從它被告知的起點開始編路徑的，
+  所以只暖一個子樹卻不給 base，三層深的檔案會變成 `H:\photo.jpg`。shell 對這種路徑
+  瞬間回答、什麼都沒暖 —— 在計時上跟成功完全一樣。`shell_warm` 因此回報 exe 真正暖成
+  的數量，不是送出去的數量。
 
 ## 踩過的坑
 
@@ -109,6 +192,18 @@ Windows 唯一支援「不要讀檔案」的介入點就是縮圖處理常式。
   整份 in-memory dict，後寫的那個會蓋掉對方 —— 實測屬性快取從 21,228 筆掉回 2,371 筆，
   瀏覽速度整個垮掉。`flush()` 必須先讀回檔案再 merge。所有值都衍生自不可變的 Telegram
   訊息，所以 last-writer-wins 是安全的。
+- **URL 跳脫不能用 `iswalnum()` 判斷 UTF-8 位元組。** 它收的是寬字元，所以續接位元組
+  `0xE6` 被當成 `U+00E6`（`æ`，是個字母）而原樣送出，鄰居卻被跳脫 —— `湊あくあ` 變成
+  `æ¹%8Aã%81%82…`，bridge 解不出路徑。**含非 ASCII 的路徑因此縮圖與屬性全部 404**，
+  DLL 退回內建 handler 去讀整檔，等於那些資料夾完全沒有這個專案。修法是明確列 ASCII
+  範圍，連 `isalnum()` 也不用：CRT 的 locale 是宿主行程決定的，不該依賴。
+  症狀跟「冷資料夾慢」一模一樣，但成因無關 —— 分辨方法是看 DLL 記錄有沒有 `delegating`。
+- **`keep_alive_conn_limit = 0`。** Windows 上 cheroot 的 connection manager 不會在
+  閒置連線變成可讀時被喚醒，只能輪詢，上限寫死 50ms（`cheroot/connections.py`：
+  "select() does not return when a socket is ready"）。重用連線上的每一個請求因此都要
+  等下一輪：實測 50ms 對比新連線的 1ms，shell handler 的每一次 `/rpc` 和 rclone 的
+  每一次 range 讀取都在付。loopback 開新連線只要 0.2ms，沒有什麼好 keep alive 的。
+  用 curl 量不出來 —— curl 每次都是新行程新連線，要用 WinHTTP 才會重現。
 - **量測會被 Windows 自己的縮圖快取（`thumbcache_*.db`）騙。** 看過一次的資料夾再測，
   回應 0.04 秒但**根本沒呼叫到 handler**。用 `shellthumb\bench.exe` 或把
   `HKCU\Software\TeleDriveWebDAV\LogPath` 設成檔案路徑來確認 handler 真的有跑：
@@ -123,6 +218,21 @@ Windows 唯一支援「不要讀檔案」的介入點就是縮圖處理常式。
   完全沒有記錄，就代表 Windows 用了自己的快取。刪掉那個登錄值即關閉。
 - **PowerShell 寫的縮圖測試工具不可靠。** `flags=0` 會回一個圖示但根本沒碰檔案；
   介面在兩個 statement 之間傳遞會拿到 `E_NOINTERFACE`。用原生的 `thumbprobe.exe` / `bench.exe`。
+- **Telethon 的 `__call__` 收下 `flood_sleep_threshold` 就丟掉。** `client(request, flood_sleep_threshold=...)`
+  簽章有這個參數，但實作（`client/users.py:29-30`）直接 `return await self._call(self._sender, request, ordered=ordered)`，
+  完全沒有傳下去 —— per-call 覆寫是假的，真正睡覺的那行讀的是 `self.flood_sleep_threshold`。
+  `tgupload.send_part` 因此完全繞過 `_call`，直接 `client._sender.send(request)`：這樣才能讓
+  FLOOD_WAIT 老實地 raise 上來給自己的 pacer 處理，而不是被 Telethon 用同一顆 client
+  的全域設定靜默吞掉，也才不會誤觸 `_call` 裡按請求型別記憶的 `_flood_waited_requests` 閘門
+  （一次 flood 後，同型別的下一個請求會直接 raise 或自己先睡，讓並行送出的其他 part 全部誤判）。
+- **512 KB 的本機讀取不能在 `tg-loop` 上做。** 那條 asyncio loop 同時服務所有 rclone range read
+  與 `/rpc/*`，同步的 `seek()+read()` 會直接卡住瀏覽。`tgupload._PartReader` 用單執行緒
+  `ThreadPoolExecutor` 跑這兩個呼叫 —— 單執行緒本身就是鎖（seek+read 不是 atomic），
+  同時滿足「離開 loop」。win32 沒有 `os.pread`，這是唯一乾淨的做法。
+- **`asyncio.gather()` 不會取消手足 task。** 一堆平行 task 裡第一個丟例外，`gather()` 會立刻
+  把例外傳出來，但**其他還在跑的 task 不會被取消**，會繼續吃併發額度與頻寬上傳一個
+  已經不可能 commit 的 segment。`tgupload.upload_file_parts` 在 `except` 裡明確
+  `t.cancel()` 每一個未完成的 task，再 `gather(..., return_exceptions=True)` 排空。
 
 ## rclone 掛載參數
 
@@ -160,13 +270,16 @@ Windows 唯一支援「不要讀檔案」的介入點就是縮圖處理常式。
 | `tests/test_split_math.py` | offset→(part, 內部 offset) 映射、跨界切段、`SeekableRemoteFile` 的 seek/range/block 快取 |
 | `tests/test_zipfs.py` | 虛擬樹結構（空目錄、非 ASCII、隱含目錄、traversal 防護）、local header 偏移、單 entry range |
 | `tests/test_sizes.py` | `filesize` 灌水的裁切（`_hash_size` / `_clip_parts` / `total_size`）、`JsonStore` 並行合併 |
-| `tests/test_bridge_e2e.py` | 真的用 HTTP 跑整個 bridge（PROPFIND / GET / Range / 403 / MKCOL+PUT → 打包 → 上傳 → 再瀏覽 / `/rpc/*` / fetch-local），只有 MTProto 與 backend 是假的 |
+| `tests/test_upload_pace.py` | `tgupload.UploadGate`：distinct-event guard、window/rate 的 AIMD、rate cap 從量測值算出且爬回不再綁得住時拆掉、注入假時鐘 |
+| `tests/test_upload_parts.py` | `plan_parts`、`_PartReader` 的隨機讀取、`send_part` 的 flood/斷線重試（繞過 `client._call`）、`upload_file_parts` 的 segment-relative index、bytes↔offset、永久失敗時取消手足 task |
+| `tests/test_bridge_e2e.py` | 真的用 HTTP 跑整個 bridge（PROPFIND / GET / Range / 403 / MKCOL+PUT → 打包 → 上傳 → 再瀏覽 / `/rpc/*` / fetch-local / warmup sweep 的續跑與禮讓 / split part 的精確大小非灌水），只有 MTProto 與 backend 是假的 |
 
 掛載後仍需手動走一遍（測試無法代替）：
 
 1. `rclone ls teledrive:` 與網頁列表一致
 2. 小檔 / 非 split 大檔 / split 大檔各取一份，`certutil -hashfile <檔> SHA256` 與網頁下載相同
-3. 多層資料夾移入 `H:\game\`，debounce 到期後網頁出現 `<名稱>.zip`，`H:` 上仍是資料夾且內容正確
+3. 多層資料夾移入 `H:\game\`，debounce 到期後網頁出現 `<名稱>.zip`，`H:` 上仍是資料夾且內容正確 ——
+   要用 **> 500 MiB 的多 segment** 遊戲跑一次，這是並行上傳第一次對真的 TeleDrive 跑
 4. 對虛擬 zip 資料夾右鍵取回 → 解壓後遊戲能執行
 5. 快取到 `--vfs-cache-max-size` 上限時淘汰正常
 6. 瀏覽器開網頁確認 `/game` 上傳的 zip 顯示、下載正常

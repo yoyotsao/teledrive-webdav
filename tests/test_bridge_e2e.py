@@ -56,6 +56,7 @@ class FakeWorker:
         self.thumbs = {}
         self.media = {}
         self.uploads = []
+        self.reads = []
         self._next_id = 1000
 
     def add_message(self, blob: bytes) -> int:
@@ -64,6 +65,7 @@ class FakeWorker:
         return self._next_id
 
     def read(self, message_id: int, offset: int, length: int) -> bytes:
+        self.reads.append((message_id, offset, length))
         blob = self.messages[message_id]
         return blob[offset : offset + length]
 
@@ -81,7 +83,9 @@ class FakeWorker:
     def media_info(self, message_ids):
         self.media_batches = getattr(self, "media_batches", [])
         self.media_batches.append(list(message_ids))
-        return {m: self.media[m] for m in message_ids if m in self.media}
+        # Like the real one: every message that could be read gets an entry, and
+        # one with nothing to report answers {} rather than going missing.
+        return {m: self.media.get(m, {}) for m in message_ids if m in self.messages}
 
     def upload_segment(self, stream, size, file_name, progress=None):
         data = bytearray()
@@ -285,6 +289,20 @@ class Rig:
 
     def propfind(self, path, depth="1"):
         return self.request("PROPFIND", path, headers={"Depth": depth})
+
+    def entry_for(self, path):
+        return self.resolver.api.resolve(path.split("/"))
+
+    def blob_for(self, path):
+        """A cloud file's real bytes, straight out of the fake Telegram.
+
+        Clipped to total_size like the provider does: the backend's filesize is
+        rounded up to whole 512 KB chunks, so the concatenated parts are longer
+        than the file.
+        """
+        entry = self.entry_for(path)
+        whole = b"".join(self.worker.messages[mid] for mid, _ in self.resolver.api.parts_for(entry))
+        return whole[: self.resolver.api.total_size(entry)]
 
     def prop(self, path, name, depth="0"):
         """One live property's text, without assuming wsgidav's XML prefix."""
@@ -595,6 +613,28 @@ def test_large_pack_is_split_and_reads_back_intact(rig, monkeypatch):
 
     # The virtual folder still resolves, which means the parts concatenate.
     assert rig.request("GET", "/game/Huge/blob.bin").content == payload
+
+
+def test_split_segment_sizes_are_exact_not_inflated(rig, monkeypatch):
+    # The browser uploader records the *inflated* size of the boundary
+    # segment (parts_in_segment * PART_SIZE, frontend/src/lib/gramjs.ts:504,581)
+    # -- tdapi's real_size/_clip_parts exists specifically to undo that
+    # padding on read. webdav's own segment planning must never regress to
+    # it: every part's registered filesize must be the exact byte count.
+    monkeypatch.setattr(gamestage, "SEGMENT_SIZE", 4096)
+    payload = bytes((i * 3) % 256 for i in range(4096 + 1))
+    rig.request("PUT", "/game/Exact.zip", data=payload)
+    _pack_now(rig, "Exact.zip")
+
+    rows = sorted(
+        (r for r in rig.backend.rows if r["filename"] == "Exact.zip"),
+        key=lambda r: r["part_index"],
+    )
+    assert len(rows) == 2
+    assert [r["filesize"] for r in rows] == [4096, 1]
+    assert sum(r["filesize"] for r in rows) == len(payload)
+
+    assert rig.request("GET", "/game/Exact.zip").content == payload
 
 
 def _stage_and_pack(rig, top, member, payload, mtime=1_770_000_000):
@@ -945,3 +985,242 @@ def test_props_rpc_caches_on_disk(rig):
     _settle(rig)
     assert len(rig.worker.media_batches) == 1
     assert (rig.cfg.cache_dir / "media_props.json").exists()
+
+
+# --------------------------------------------------------------------------- #
+# warmup — the whole tree, in the background, without getting in the way
+#
+# Previews and dimensions only make a folder fast once they are already on disk.
+# Fetching them on first visit still leaves that first visit slow, so the bridge
+# walks the tree by itself and fills the caches in the gaps between requests.
+# --------------------------------------------------------------------------- #
+
+
+def _warmer(rig, **kw):
+    from warmup import Warmer
+
+    kw.setdefault("quiet", 0.0)
+    # No shell warm by default: it drives the real Windows thumbnail pipeline
+    # against a drive letter that does not exist here. shell_paths is tested on
+    # its own, which is the part that can be wrong.
+    kw.setdefault("shell_exe", None)
+    return Warmer(rig.resolver, **kw)
+
+
+def test_warmup_finds_every_file_in_the_tree(rig):
+    files, todo = _warmer(rig).pending()
+    # photos/small.txt, photos/shot.png, movie.mkv, game/MyGame.zip
+    assert len(files) == 4
+    assert len(todo) == 4
+
+
+def test_warmup_caches_previews_and_dimensions(rig):
+    warmer = _warmer(rig)
+    _, todo = warmer.pending()
+    assert warmer.fill(todo) == len(todo)
+    assert list((rig.cfg.cache_dir / "thumbs").glob("*.jpg"))
+    assert (rig.cfg.cache_dir / "media_props.json").exists()
+
+
+def test_warmup_is_resumable(rig):
+    """A second pass must find nothing to do, including for files with no media.
+
+    A file whose document reports no dimensions has to cache that fact, or every
+    pass asks Telegram about it again for as long as the bridge is up.
+    """
+    warmer = _warmer(rig)
+    _, todo = warmer.pending()
+    warmer.fill(todo)
+    files, again = warmer.pending()
+    assert len(files) == 4
+    assert again == []
+
+
+def test_warmup_serves_later_requests_from_disk(rig):
+    warmer = _warmer(rig)
+    _, todo = warmer.pending()
+    warmer.fill(todo)
+    rig.worker.thumb_batches = []
+    rig.worker.media_batches = []
+    assert rig.request("GET", "/rpc/thumb", params={"path": r"E:\photos\shot.png"}).status_code == 200
+    assert rig.request("GET", "/rpc/props", params={"path": r"E:\photos\shot.png"}).status_code == 200
+    _settle(rig)
+    assert rig.worker.thumb_batches == []
+    assert rig.worker.media_batches == []
+
+
+def test_fill_fetches_the_head_of_still_images_and_drops_it_after(rig):
+    """The front of every image, because the shell reads it whatever we answer.
+
+    Explorer opens each JPEG from inside its thumbnail pipeline, after the
+    provider has already handed it a bitmap. fill() fetches that head and hands
+    it to that batch's shell warm — but the head is scratch, not a cache: it
+    gets deleted the moment the warm is done with it, whether or not the warm
+    itself found anything to do (shell_exe is None in these tests), because
+    nothing past that one read ever looks at it again.
+    """
+    from bridge import HEAD_SIZE
+
+    warmer = _warmer(rig)
+    _, todo = warmer.pending()
+    png = rig.entry_for("photos/shot.png")
+    warmer.fill(todo)
+    assert (png.message_id, 0, HEAD_SIZE) in rig.worker.reads
+    # movie.mkv and small.txt are not files the shell reads the front of, and
+    # shot.png's own head must not have survived past its batch.
+    assert not list((rig.cfg.cache_dir / "heads").glob("*.head")), \
+        "a head is scratch — nothing should be left once fill() returns"
+
+
+def test_a_fetched_head_is_served_without_asking_telegram_again(rig):
+    """What the head cache is actually for: SeekableRemoteFile answering from it.
+
+    Not routed through fill() — that fetches and immediately drops the head, so
+    this calls heads_for() directly to catch it while it exists, the same way a
+    batch's shell warm briefly gets to use it.
+    """
+    png = rig.entry_for("photos/shot.png")
+    rig.resolver.heads_for([png])
+    rig.worker.reads = []
+    body = rig.request("GET", "/photos/shot.png", headers={"Range": "bytes=0-31"}).content
+    assert body == rig.blob_for("photos/shot.png")[:32]
+    assert rig.worker.reads == [], "the head region must not go back to Telegram"
+
+
+def test_a_read_past_the_head_still_returns_the_whole_file(rig):
+    png = rig.entry_for("photos/shot.png")
+    rig.resolver.heads_for([png])
+    assert rig.request("GET", "/photos/shot.png").content == rig.blob_for("photos/shot.png")
+
+
+def test_needs_warming_does_not_check_for_a_head(rig):
+    """A head is scratch, not a persisted condition — see Warmer.fill.
+
+    Preview and properties cached, no head file anywhere (fill() already
+    deleted it), and needs_warming must still say this file is done rather than
+    sending the whole tree through another pass just because it cleaned up
+    after itself.
+    """
+    warmer = _warmer(rig)
+    _, todo = warmer.pending()
+    warmer.fill(todo)
+    png = rig.entry_for("photos/shot.png")
+    assert not (rig.cfg.cache_dir / "heads" / f"{png.file_id}.head").exists()
+    assert rig.resolver.needs_warming(png) is False
+
+
+def test_drop_heads_is_a_no_op_for_a_file_with_no_head(rig):
+    png = rig.entry_for("photos/shot.png")
+    rig.resolver.drop_heads([png])  # never had a head cached — must not raise
+
+
+def test_clear_heads_removes_any_leftover_head_files(rig):
+    """The backstop for a crash between heads_for and drop_heads inside a batch."""
+    png = rig.entry_for("photos/shot.png")
+    rig.resolver.heads_for([png])
+    assert list((rig.cfg.cache_dir / "heads").glob("*.head"))
+    rig.resolver.clear_heads()
+    assert not list((rig.cfg.cache_dir / "heads").glob("*.head"))
+
+
+def test_clear_heads_is_a_no_op_when_the_directory_does_not_exist(rig):
+    import shutil
+
+    shutil.rmtree(rig.cfg.cache_dir / "heads", ignore_errors=True)
+    rig.resolver.clear_heads()  # must not raise
+
+
+def test_shell_warm_targets_the_images_on_the_mount(rig):
+    """The shell warm asks Windows about paths, not Telegram about entries.
+
+    Only the files the shell renders and then goes and reads: a .txt or a .zip
+    would cost a process round trip to be told there is no thumbnail.
+    """
+    warmer = _warmer(rig)
+    files, _ = warmer.pending()
+    assert warmer.shell_paths(files) == [rig.cfg.mount_drive + r"\photos\shot.png"]
+
+
+def test_shell_warm_is_a_no_op_when_the_exe_is_not_built(rig):
+    warmer = _warmer(rig)
+    files, _ = warmer.pending()
+    assert warmer.shell_warm(files) == 0
+
+
+def test_warmup_does_not_mark_its_own_fetches_as_demand(rig):
+    """Otherwise the sweep waits for a quiet line it is itself keeping busy."""
+    warmer = _warmer(rig, quiet=30.0)
+    _, todo = warmer.pending()
+    rig.resolver._last_demand = 0.0  # noqa: SLF001 - white-box on purpose
+    started = time.monotonic()
+    warmer.fill(todo)
+    assert time.monotonic() - started < 5.0
+
+
+def test_warmup_waits_while_a_request_is_being_served(rig):
+    warmer = _warmer(rig, quiet=0.3)
+    _, todo = warmer.pending()
+    rig.resolver.note_demand()
+    started = time.monotonic()
+    warmer.fill(todo)
+    assert time.monotonic() - started >= 0.25
+
+
+def test_warmup_stops_mid_pass_when_asked(rig):
+    stop = threading.Event()
+    stop.set()
+    warmer = _warmer(rig, stop=stop)
+    _, todo = warmer.pending()
+    assert warmer.fill(todo) == 0
+    assert not list((rig.cfg.cache_dir / "thumbs").glob("*.jpg"))
+
+
+def test_background_warmup_runs_a_pass_and_shuts_down(rig):
+    from warmup import BackgroundWarmup
+
+    warmup = BackgroundWarmup(rig.resolver, interval_minutes=60, start_delay=0.0)
+    warmup.start()
+    try:
+        deadline = time.time() + 5
+        while time.time() < deadline and _warmer(rig).pending()[1]:
+            time.sleep(0.02)
+        assert _warmer(rig).pending()[1] == []
+    finally:
+        warmup.stop()
+    assert not warmup._thread.is_alive()  # noqa: SLF001 - white-box on purpose
+
+
+def test_a_failing_batch_ends_the_pass_rather_than_spinning(rig, monkeypatch):
+    calls = []
+
+    def boom(entries):
+        calls.append(entries)
+        raise RuntimeError("telegram said no")
+
+    monkeypatch.setattr(rig.resolver, "thumbs_for", boom)
+    warmer = _warmer(rig)
+    _, todo = warmer.pending()
+    assert warmer.fill(todo) == 0
+    assert len(calls) == 1
+
+
+def test_warmup_abandons_the_tree_walk_when_stopped(rig):
+    """Shutdown must not leave a sweep listing thousands of folders behind it."""
+    stop = threading.Event()
+    stop.set()
+    files, todo = _warmer(rig, stop=stop).pending()
+    assert (files, todo) == ([], [])
+
+
+def test_shell_warm_paths_are_absolute_when_warming_a_subtree(rig):
+    r"""A subtree walk still has to produce paths rooted at the drive.
+
+    The walk numbers paths from wherever it starts, so warming one folder
+    without telling it where that folder is gave H:\shot.png for a file one
+    level down. The shell answers a path like that instantly and warms nothing,
+    which is indistinguishable from success in the timings.
+    """
+    warmer = _warmer(rig)
+    photos = rig.entry_for("photos")
+    files, _ = warmer.pending(photos.file_id, "/photos")
+    assert warmer.shell_paths(files) == [rig.cfg.mount_drive + r"\photos\shot.png"]

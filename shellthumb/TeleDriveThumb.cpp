@@ -234,7 +234,17 @@ static std::wstring UrlEscape(const std::wstring& text) {
 
     std::wstring out;
     for (unsigned char c : utf8) {
-        if (iswalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+        // Spelled out rather than iswalnum(): that takes a wide character, so a
+        // UTF-8 continuation byte arrives as the codepoint of the same number.
+        // 0xE6 became U+00E6 'æ', which is a letter, so it was emitted raw while
+        // its neighbours were escaped — "湊あくあ" went out as "æ¹%8Aã%81%82…"
+        // and the bridge could not resolve it. Every path with a non-ASCII
+        // character therefore 404'd and fell back to reading the whole file.
+        // Ranges, not isalnum() either: the CRT's locale is whatever the host
+        // process left it as, and this must not depend on that.
+        const bool unreserved =
+            (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+        if (unreserved || c == '-' || c == '_' || c == '.' || c == '~') {
             out.push_back(static_cast<wchar_t>(c));
         } else {
             out.push_back(L'%');

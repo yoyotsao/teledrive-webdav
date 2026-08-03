@@ -41,6 +41,14 @@ HASH_SAMPLE = 100 * 1024 * 1024
 TICK_SECONDS = 15
 RETRY_SECONDS = 600
 MAX_ATTEMPTS = 5
+
+# One segment failing outright (a part permanently exhausted its retries)
+# shouldn't cost a whole unit retry — that re-packs the archive from scratch
+# and re-uploads every already-committed segment. A couple of quick retries
+# with a fresh upload (fresh file_id, since tgio/tgupload generate one per
+# call) rides out the common transient case instead.
+SEGMENT_RETRIES = 2
+SEGMENT_RETRY_SECONDS = 30
 ZIP_MIME = "application/zip"
 
 
@@ -294,8 +302,6 @@ class GameStager:
                 self._units.pop(top, None)
         except Exception as exc:
             log.exception("packing/upload of %s failed", top)
-            if packed is not None and packed.exists() and packed.parent == self.cfg.pack_dir:
-                packed.unlink(missing_ok=True)
             with self._lock:
                 unit = self._units.get(top) or Unit(name=top)
                 unit.attempts += 1
@@ -307,6 +313,12 @@ class GameStager:
                     unit.state = "failed"
                     unit.retry_after = time.monotonic() + RETRY_SECONDS
                 self._units[top] = unit
+            # Only discard the pack once the unit is truly abandoned. A
+            # transient failure keeps it on disk (see _pack's reuse check) so
+            # the unit retry doesn't re-zip a potentially 60 GB tree just
+            # because one segment's upload failed.
+            if unit.state == "abandoned" and packed is not None and packed.exists() and packed.parent == self.cfg.pack_dir:
+                packed.unlink(missing_ok=True)
 
     def _set_state(self, top: str, state: str) -> None:
         with self._lock:
@@ -324,6 +336,13 @@ class GameStager:
 
         target = self.cfg.pack_dir / f"{top}.zip"
         if target.exists():
+            if zipfile.is_zipfile(target):
+                # A previous attempt already packed this and only the upload
+                # failed transiently (_process keeps the zip in that case,
+                # see the exception handler there) — reuse it instead of
+                # re-zipping a potentially 60 GB tree.
+                log.info("reusing existing pack %s from a previous attempt", target.name)
+                return target, f"{top}.zip", True
             target.unlink()
         root = _ext(source)
         count = 0
@@ -351,6 +370,10 @@ class GameStager:
 
     def _upload_and_register(self, archive: Path, upload_name: str) -> None:
         size = archive.stat().st_size
+        if size == 0:
+            # Telegram rejects a 0-part file with an opaque RPC error; fail
+            # fast and readably instead of reaching that path.
+            raise ValueError(f"{upload_name} is empty (0 bytes) — nothing to upload")
         game = self.api.ensure_folder(self.cfg.game_folder)
         file_hash = sample_hash(archive)
 
@@ -401,13 +424,27 @@ class GameStager:
             )
             reader = SegmentReader(_ext(archive), offset, seg_size)
             try:
-                result = self.worker.upload_segment(
-                    reader, seg_size, name, progress=_progress_logger(name, seg_size)
-                )
+                result = self._upload_one_segment(reader, seg_size, name)
             finally:
                 reader.close()
             parts.append({**result, "filesize": result["size"]})
         return parts
+
+    def _upload_one_segment(self, reader: SegmentReader, seg_size: int, name: str) -> dict:
+        for attempt in range(SEGMENT_RETRIES + 1):
+            try:
+                return self.worker.upload_segment(
+                    reader, seg_size, name, progress=_progress_logger(name, seg_size)
+                )
+            except Exception:
+                if attempt >= SEGMENT_RETRIES:
+                    raise
+                log.warning(
+                    "segment %s failed (attempt %s/%s) — retrying in %ss",
+                    name, attempt + 1, SEGMENT_RETRIES + 1, SEGMENT_RETRY_SECONDS,
+                )
+                reader.seek(0)
+                time.sleep(SEGMENT_RETRY_SECONDS)
 
 
 def _progress_logger(name: str, total: int):

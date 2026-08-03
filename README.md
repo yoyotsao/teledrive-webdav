@@ -98,6 +98,9 @@ shellthumb\build.bat
 .venv\Scripts\python.exe install_thumb.py --install
 ```
 
+（`build.bat` 會編出兩個東西：處理常式的 DLL，以及步驟 7 預熱要用的
+`warmshell.exe`。需要 Visual Studio 的 C++ 工具。）
+
 接著**以系統管理員身分**開一個 PowerShell，再跑：
 
 ```powershell
@@ -133,18 +136,32 @@ Windows 的縮圖與屬性處理是**依副檔名**註冊的，沒有「只對�
 屬性那半 Windows 只認機器層級的設定，所以會影響這台電腦的所有使用者，也因此要管理員權限。
 </details>
 
-### 7. 預先抓一次縮圖（建議睡前跑）
+### 7. 預熱（自動，不用做任何事）
+
+`start.bat` 開著的時候，bridge 會自己走遍整棵目錄樹，抓縮圖、抓尺寸，然後
+**用檔案總管的方式跟 Windows 要一次縮圖**，讓 Windows 存進它自己的快取。
+全部跑完之後，**任何資料夾第一次打開都跟看過一樣快**（每秒約 270 張）。
+
+最後那一步靠 `shellthumb\warmshell.exe`，它由步驟 6 的 `build.bat` 一起編出來。
+少了它其他兩層還是有效，只是大約每秒 3 張而不是 270 張。
+
+- 它只在**沒有請求在等**的空檔跑，你在用的時候會自動讓路，不會拖慢瀏覽
+- 縮圖、尺寸抓過的自動跳過，關掉 bridge 也沒關係，下次開起來接著跑
+- 跟 Windows 要縮圖那一步每輪都會重跑，因為 Windows 自己的快取會被磁碟清理清掉，
+  重跑已經在裡面的檔案一個只要 4ms
+- 每 6 小時再走一次，網頁那邊新上傳的東西會自己被補上
+
+想立刻抓完（例如剛裝好、今晚就要用），可以另外手動跑一次：
 
 ```powershell
-.venv\Scripts\python.exe warmup.py
+.venv\Scripts\python.exe warmup.py            # 全部
+.venv\Scripts\python.exe warmup.py pixiv      # 只抓某一區
 ```
 
-它會把整棵目錄樹的縮圖和尺寸先抓下來存好。跑過之後，**任何資料夾第一次打開都是滿速**
-（每秒約 10 張以上）；沒跑過的話，第一次進某個資料夾要現抓，會明顯慢一截。
+手動跑不會禮讓，所以快得多，但跑的時候瀏覽會比較卡。**不需要跟 bridge 同時跑**——
+兩邊會擠在同一條 Telegram 連線上，不會比較快。
 
-- 中途關掉沒關係，下次執行會接著跑，已經抓過的自動跳過
-- 只想處理某一區：`.venv\Scripts\python.exe warmup.py pixiv`
-- **新上傳東西之後再跑一次**就好
+不想要自動預抓的話，`config.ini` 裡設 `[warmup] auto = false`。
 
 ---
 
@@ -196,7 +213,7 @@ Windows 的縮圖與屬性處理是**依副檔名**註冊的，沒有「只對�
 
 1. `start.bat` 的視窗還開著嗎？關掉就沒有磁碟了
 2. `.venv\Scripts\python.exe install_thumb.py --status` —— 兩個 handler 都有裝嗎？
-3. `.venv\Scripts\python.exe warmup.py` —— 新上傳的東西還沒抓過縮圖，跑一次就好
+3. `.venv\Scripts\python.exe warmup.py` —— 新上傳的東西背景預抓還沒輪到，手動跑一次就好
 
 正常速度是**每秒 10 張以上**。進一個從沒開過的資料夾，第一個檔案可能要等十秒左右
 （在解析路徑），之後就順了。

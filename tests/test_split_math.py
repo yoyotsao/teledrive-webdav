@@ -308,3 +308,53 @@ def test_read_wider_than_the_cache_still_returns_everything(remote):
         reader, [(1, 300), (2, 300), (3, 40)], block_size=64, blocks_cached=8
     )
     assert fh.read() == whole
+
+
+# --------------------------------------------------------------------------- #
+# cached head: the first bytes served from disk instead of Telegram
+# --------------------------------------------------------------------------- #
+
+
+def test_head_serves_the_front_without_touching_the_reader(remote):
+    reader, whole = remote
+    fh = SeekableRemoteFile(
+        reader, [(1, 300), (2, 300), (3, 40)], block_size=64, head=whole[:128]
+    )
+    assert fh.read(128) == whole[:128]
+    assert reader.calls == []
+
+
+def test_head_shorter_than_the_read_falls_through_for_the_rest(remote):
+    reader, whole = remote
+    fh = SeekableRemoteFile(
+        reader, [(1, 300), (2, 300), (3, 40)], block_size=64, head=whole[:100]
+    )
+    # 100 bytes of head plus the remainder, which must be whole and correct
+    assert fh.read(250) == whole[:250]
+    assert reader.calls, "the tail past the head still has to be fetched"
+
+
+def test_head_does_not_disturb_reads_past_it(remote):
+    reader, whole = remote
+    fh = SeekableRemoteFile(
+        reader, [(1, 300), (2, 300), (3, 40)], block_size=64, head=whole[:128]
+    )
+    fh.seek(400)
+    assert fh.read(100) == whole[400:500]
+
+
+def test_head_longer_than_the_file_is_clipped(remote):
+    reader, _ = remote
+    small = SeekableRemoteFile(reader, [(3, 40)], block_size=64, head=b"\x00" * 4096)
+    assert small.size == 40
+    assert len(small.read()) == 40
+
+
+def test_head_survives_seek_and_reread(remote):
+    reader, whole = remote
+    fh = SeekableRemoteFile(
+        reader, [(1, 300), (2, 300), (3, 40)], block_size=64, head=whole[:128]
+    )
+    assert fh.read() == whole
+    fh.seek(0)
+    assert fh.read(64) == whole[:64]

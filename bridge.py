@@ -26,6 +26,7 @@ import shutil
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -38,7 +39,7 @@ from wsgidav.wsgidav_app import WsgiDAVApp
 import zipfs
 from config import Config, load_config
 from tdapi import ApiError, Entry, JsonStore, TeleDriveClient
-from tgio import STREAM_BLOCK_SIZE, SeekableRemoteFile, TelegramWorker
+from tgio import REQUEST_SIZE, STREAM_BLOCK_SIZE, SeekableRemoteFile, TelegramWorker
 
 log = logging.getLogger("bridge")
 
@@ -78,6 +79,44 @@ THUMB_PREFETCH_IDLE = 0.1
 # delivers 33 previews a second, a lone fetch about 8.
 THUMB_WAIT = 10.0
 
+# Bytes kept from the start of every still image while the shell warm is using
+# it, and the extensions it applies to. The thumbnail provider does not end the
+# shell's interest in the file: measured on cold folders with previews and
+# dimensions both answered in 20ms, eight JPEGs still took 13.0s and every one
+# of them was read, while eight PNGs took 0.8s and none were. Isolating the two
+# halves put the reads squarely in IShellItemImageFactory::GetImage, after
+# IThumbnailProvider returned a valid bitmap — WIC opening the file directly,
+# which no registered handler can intercept. So the read is made cheap instead
+# of prevented.
+#
+# This is a scratch file, not a cache: it exists only for the one read a batch's
+# warmshell pass makes, and gets deleted right after (see Warmer.fill in
+# warmup.py). Keeping it around bought nothing once warmshell existed — rereading
+# a shell-warmed file lands in rclone's own VFS cache 11 times out of 12 measured
+# (5-13ms, never reaching this process), and once thumbcache_*.db has the
+# thumbnail the shell does not open the file at all (274/s, handler uncalled).
+# 18,451 of these at the old always-on lifetime cost 8.67 GB on disk for no
+# measurable benefit past the first touch.
+#
+# One Telegram request wide, which is also the reader's block 0. Size is not a
+# free choice: what has to be covered is whatever rclone pulls when the shell
+# reads, and that is its own read-ahead rather than the shell's request — 252 KB
+# most files, 508 KB at the top of everything measured. A 128 KB head was tried
+# and left a cold folder at 35s for twelve files, because every read still ran
+# off the end of it. Going wider costs no extra round trips (the fetch is one
+# request either way, and requests are what the warm-up is bound by) — only a
+# transient disk cost now, since it is deleted right after use.
+#
+# PNG is included despite never having been caught reading: four cold PNG
+# folders is thin evidence to hang "this extension is exempt" on, and the
+# alternative is a class of files that stays mysteriously slow.
+HEAD_SIZE = REQUEST_SIZE
+HEAD_SUFFIX = ".head"
+HEAD_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+# Heads fetched at once. One head is a single Telegram request on a single
+# pooled connection, so the batch is what keeps the other seven busy.
+HEAD_BATCH = 8
+
 PACKED_MESSAGE = (
     "This name is already a packed archive on TeleDrive and is read-only. "
     "Delete the .zip from the web UI first, or stage the new copy under a different name."
@@ -86,6 +125,30 @@ PACKED_MESSAGE = (
 
 def split_dav_path(path: str) -> List[str]:
     return [seg for seg in path.replace("\\", "/").split("/") if seg]
+
+
+def _write_atomic(path: Path, data: bytes) -> None:
+    """Write ``data`` to ``path`` so no reader can see a half-written file.
+
+    Nothing here is ever invalidated — every cached byte is derived from an
+    immutable Telegram message — so a partial file would be a permanent one.
+
+    The temp name is unique per writer: the background warm-up and a foreground
+    request routinely race for the same file, and on Windows the loser of a
+    shared temp name cannot rename over it. Losing the race is not a failure
+    either, since both writers had the same bytes; Windows also refuses the
+    rename while a reader holds the target open, and that reader is getting the
+    right content anyway.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}-{threading.get_ident()}.part")
+    tmp.write_bytes(data)
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        if not path.exists():
+            raise
 
 
 @dataclass
@@ -126,7 +189,12 @@ class Resolver:
     def open_remote(self, entry: Entry) -> SeekableRemoteFile:
         """A fresh seekable reader over a cloud file (split parts concatenated)."""
         self.note_demand()
-        return SeekableRemoteFile(self.worker, self.api.parts_for(entry), name=entry.name)
+        return SeekableRemoteFile(
+            self.worker,
+            self.api.parts_for(entry),
+            name=entry.name,
+            head=self.cached_head(entry),
+        )
 
     def zip_view(self, entry: Entry) -> zipfs.ZipView:
         with self._zip_lock:
@@ -183,24 +251,7 @@ class Resolver:
             found[entry.file_id] = data
             path = self._thumb_path(entry.file_id)
             try:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                # Via a temp file: a reader must never see a half-written
-                # preview, because nothing would ever invalidate it. The name is
-                # unique per writer — the background prefetch and a foreground
-                # request routinely race for the same file, and on Windows the
-                # loser of a shared temp name cannot rename over it.
-                tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}-{threading.get_ident()}.part")
-                tmp.write_bytes(data)
-                try:
-                    os.replace(tmp, path)
-                except OSError:
-                    # Losing the race is not a failure: a preview is immutable,
-                    # so whoever got there first wrote the same bytes. Windows
-                    # also refuses the rename while a reader holds the target
-                    # open, and that reader is getting the right content anyway.
-                    tmp.unlink(missing_ok=True)
-                    if not path.exists():
-                        raise
+                _write_atomic(path, data)
             except OSError as exc:  # pragma: no cover - cache is best-effort
                 log.warning("could not cache thumbnail %s: %s", path.name, exc)
         return found
@@ -208,13 +259,128 @@ class Resolver:
     def thumb_bytes(self, entry: Entry) -> Optional[bytes]:
         return self.thumbs_for([entry]).get(entry.file_id)
 
-    def props_for(self, entries: List[Entry]) -> Dict[str, dict]:
+    # -- file heads -------------------------------------------------------- #
+
+    def _head_path(self, file_id: str) -> Path:
+        return self.cfg.cache_dir / "heads" / f"{file_id}{HEAD_SUFFIX}"
+
+    def wants_head(self, entry: Entry) -> bool:
+        """Whether this file is one the shell will go and read the front of.
+
+        Split files are excluded rather than handled: a head is read from
+        ``entry.message_id`` alone, which is only the start of the logical file
+        when there is exactly one part. Nothing in HEAD_EXTENSIONS is anywhere
+        near the 500 MiB split threshold, so this costs nothing.
+        """
+        return (
+            not entry.is_dir
+            and entry.message_id is not None
+            and not entry.is_split
+            and os.path.splitext(entry.name)[1].lower() in HEAD_EXTENSIONS
+        )
+
+    def cached_head(self, entry: Entry) -> bytes:
+        """The first bytes of this file if they are on disk, else empty."""
+        try:
+            return self._head_path(entry.file_id).read_bytes()
+        except OSError:
+            return b""
+
+    def _head_complete(self, entry: Entry) -> bool:
+        """Whether the cached head is as long as it should be.
+
+        Length, not existence: HEAD_SIZE is chosen from measurements and may be
+        raised again, and a head cached under the old value is exactly the case
+        that looks warm and still reads off the end into Telegram.
+        """
+        try:
+            have = self._head_path(entry.file_id).stat().st_size
+        except OSError:
+            return False
+        return have >= min(HEAD_SIZE, self.api.total_size(entry))
+
+    def heads_for(self, entries: List[Entry], *, before=None) -> int:
+        """Cache the first HEAD_SIZE bytes of each still image; returns how many.
+
+        Concurrent because one head is a single Telegram request on a single
+        pooled connection: sequentially this runs at 0.57 files a second and
+        leaves seven connections idle. Eight at a time reaches 1.15 a second —
+        latency-bound rather than bandwidth-bound, so widening it further only
+        queues on the pool.
+
+        ``before`` runs ahead of each group and stops the run by returning
+        False. Heads are much heavier than previews — a whole tree is hours,
+        not minutes — so the caller has to be able to yield between groups, and
+        the grouping lives here to keep HEAD_BATCH in one place.
+        """
+        missing = [
+            e for e in entries
+            if self.wants_head(e) and not self._head_complete(e)
+        ]
+        if not missing:
+            return 0
+
+        def one(entry: Entry) -> bool:
+            try:
+                data = self.worker.read(entry.message_id, 0, HEAD_SIZE)
+                if not data:
+                    return False
+                _write_atomic(self._head_path(entry.file_id), data)
+                return True
+            except Exception as exc:  # pragma: no cover - cache is best-effort
+                log.warning("could not cache head of %s: %s", entry.name, exc)
+                return False
+
+        done = 0
+        for at in range(0, len(missing), HEAD_BATCH):
+            if before is not None and before() is False:
+                break
+            group = missing[at : at + HEAD_BATCH]
+            with ThreadPoolExecutor(max_workers=HEAD_BATCH) as pool:
+                done += sum(1 for ok in pool.map(one, group) if ok)
+        return done
+
+    def drop_heads(self, entries: List[Entry]) -> None:
+        """Remove the scratch head file for each entry, once the shell warm is done with it.
+
+        Best-effort: a head is disposable, so a stray one left behind by a crash
+        mid-batch is not worth raising over. The next pass that finds it still
+        there via _head_complete just reuses it instead of refetching.
+        """
+        for entry in entries:
+            try:
+                self._head_path(entry.file_id).unlink(missing_ok=True)
+            except OSError as exc:  # pragma: no cover - best-effort cleanup
+                log.warning("could not drop head of %s: %s", entry.name, exc)
+
+    def clear_heads(self) -> None:
+        """Delete every scratch head file still on disk.
+
+        A backstop around Warmer.fill's per-batch drop_heads: if the process
+        died mid-batch, this is what keeps "heads/ is empty between passes" a
+        fact rather than an invariant that quietly depends on nothing crashing.
+        """
+        try:
+            paths = list((self.cfg.cache_dir / "heads").iterdir())
+        except OSError:
+            return
+        for path in paths:
+            try:
+                path.unlink()
+            except OSError as exc:  # pragma: no cover - best-effort cleanup
+                log.warning("could not clear head %s: %s", path.name, exc)
+
+    def props_for(self, entries: List[Entry], *, demand: bool = True) -> Dict[str, dict]:
         """``{file_id: {...}}`` media properties, cached on disk.
 
         Same shape as thumbs_for and for the same reason: Explorer asks per file,
         Telegram answers per hundred. Unlike previews these cost no bytes at all —
         the numbers are already in the document's attributes — so the whole point
         is to stop Explorer reading file headers to work them out itself.
+
+        ``demand=False`` for warm-up callers: a background sweep that marked its
+        own fetches as demand would keep resetting the quiet timer it is waiting
+        on, and so never get to run.
         """
         found: Dict[str, dict] = {}
         missing: List[Entry] = []
@@ -229,7 +395,8 @@ class Resolver:
         if not missing:
             return found
 
-        self.note_demand()
+        if demand:
+            self.note_demand()
         fetched = self.worker.media_info([e.message_id for e in missing])
         for entry in missing:
             info = fetched.get(entry.message_id)
@@ -249,22 +416,46 @@ class Resolver:
         """
         self._last_demand = time.monotonic()
 
-    def _wait_for_quiet(self) -> None:
-        """Hold the warm-up back while Explorer is actively asking.
+    def wait_for_quiet(self, quiet: float = THUMB_PREFETCH_IDLE) -> None:
+        """Hold a warm-up back while Explorer is actively asking.
 
         Every Telegram request funnels through one client loop, so a warm-up
         running flat out competes with the very requests it exists to serve — and
         with Explorer's own reads of the originals. Observed on a 3,119-file
         folder: the handler answered in 47ms but Explorer stalled up to 9.7s
         between files. Prefetching is only worth doing in the gaps.
+
+        ``quiet`` is how long the line has to have been idle. The folder prefetch
+        keeps it short because someone is watching that folder fill in; the
+        whole-tree sweep in warmup.py asks for much more, being speculative.
         """
         while True:
             idle = time.monotonic() - self._last_demand
-            if idle >= THUMB_PREFETCH_IDLE:
+            if idle >= quiet:
                 return
             # Never longer than one slice's worth: callers are now waiting on
             # this warm-up, so stalling it stalls them.
-            time.sleep(min(THUMB_PREFETCH_IDLE - idle, THUMB_PREFETCH_IDLE))
+            time.sleep(min(quiet - idle, THUMB_PREFETCH_IDLE))
+
+    def needs_warming(self, entry: Entry) -> bool:
+        """Whether this file still owes the caches a preview or its dimensions.
+
+        Deliberately checks that the preview file *exists* rather than reading
+        it: a whole-tree sweep asks this about every file it has ever seen, and
+        reading a hundred thousand small files to throw the bytes away is the
+        kind of thing that makes a warm-up look expensive.
+
+        The head cache is not a condition here on purpose: it is a scratch file
+        deleted right after each batch's shell warm uses it (see Warmer.fill),
+        so a completed pass never has one lying around, and asking about it
+        would make every subsequent pass think the whole tree needs warming
+        again just because it cleaned up after itself.
+        """
+        if entry.is_dir or entry.message_id is None:
+            return False
+        if entry.has_thumbnail and not self._thumb_path(entry.file_id).exists():
+            return True
+        return self._prop_cache.get(entry.file_id) is None
 
     def await_thumb(self, entry: Entry, timeout: float = THUMB_WAIT) -> Optional[bytes]:
         """Wait briefly for a running warm-up to produce this preview."""
@@ -312,12 +503,12 @@ class Resolver:
                 # requests interleave, at the cost of one extra get_messages per
                 # slice.
                 for at in range(0, len(entries), THUMB_PREFETCH_SLICE):
-                    self._wait_for_quiet()
+                    self.wait_for_quiet()
                     slice_ = entries[at : at + THUMB_PREFETCH_SLICE]
                     self.thumbs_for(slice_)
                     # Properties ride the same documents, and Explorer wants them
                     # for the same files at the same moment.
-                    self.props_for(slice_)
+                    self.props_for(slice_, demand=False)
             except Exception as exc:  # a warm-up failure must never surface
                 log.warning("preview prefetch failed: %s", exc)
             finally:
@@ -967,8 +1158,11 @@ def main(argv=None) -> int:
     # Imported here so `python bridge.py --help` works without Telethon present.
     from fetchlocal import LocalFetcher
     from gamestage import GameStager
+    from warmup import BackgroundWarmup
 
-    worker = TelegramWorker(cfg.api_id, cfg.api_hash, cfg.session, cfg.download_connections)
+    worker = TelegramWorker(
+        cfg.api_id, cfg.api_hash, cfg.session, cfg.download_connections, upload_parts=cfg.upload_parts
+    )
     worker.start()
     api = TeleDriveClient(cfg)
     api.login()
@@ -979,11 +1173,28 @@ def main(argv=None) -> int:
     fetcher = LocalFetcher(cfg, resolver)
     stager.start()
 
+    # The tree is warmed from in here rather than by running warmup.py on a
+    # schedule: this process already holds the Telegram connection and knows
+    # when a request is waiting, and a second process would just queue behind it.
+    warmer = None
+    if cfg.warmup_auto:
+        warmer = BackgroundWarmup(resolver, interval_minutes=cfg.warmup_interval_minutes)
+        warmer.start()
+
     app = build_app(cfg, resolver, stager, fetcher)
 
     from cheroot import wsgi
 
     server = wsgi.Server((cfg.host, cfg.port), app, numthreads=16, request_queue_size=64)
+    # No keep-alive. On Windows cheroot's connection manager does not get woken
+    # when an idle connection becomes readable, so it polls instead, capped at
+    # 50ms (cheroot/connections.py, "select() does not return when a socket is
+    # ready"). Every request after the first on a reused connection therefore
+    # waits for the next poll: measured 50ms against 1ms for a fresh one, on
+    # every /rpc call the shell handlers make and every range read rclone does.
+    # A new loopback connection costs 0.2ms, so there is nothing to keep alive
+    # for.
+    server.keep_alive_conn_limit = 0
     log.info("bridge listening on http://%s:%s (game folder: /%s)", cfg.host, cfg.port, cfg.game_folder)
     # The url must be quoted: rclone splits remote from path at the first colon,
     # so an unquoted "http://" truncates the option value to "http".
@@ -997,6 +1208,8 @@ def main(argv=None) -> int:
         log.info("shutting down")
     finally:
         server.stop()
+        if warmer is not None:
+            warmer.stop()
         stager.stop()
         worker.stop()
     return 0

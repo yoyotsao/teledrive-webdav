@@ -35,8 +35,16 @@ cl /nologo /LD /O2 /EHsc /W3 /utf-8 /DUNICODE /D_UNICODE ^
    /link /DEF:TeleDriveThumb.def
 if errorlevel 1 exit /b 1
 
+:: warmshell.exe is part of the product, not a measurement tool: the warm-up
+:: needs it to get anything into Windows' own thumbnail cache, and a machine
+:: with the DLL but no warmshell.exe is stuck at 3 thumbnails a second instead
+:: of 274. Built here so there is one command to remember, and so the two
+:: cannot be at different versions.
+cl /nologo /O2 /EHsc /W3 /utf-8 /DUNICODE /D_UNICODE warmshell.cpp /Fe:warmshell.exe
+if errorlevel 1 exit /b 1
+
 del /q *.obj *.exp *.lib 2>nul
-echo [ok] TeleDriveThumb.dll
+echo [ok] TeleDriveThumb.dll + warmshell.exe
 exit /b 0
 
 :novs

@@ -25,6 +25,8 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
+import tgupload
+
 log = logging.getLogger("tgio")
 
 # MTProto upload.GetFile demands a 4096-aligned offset and a limit that is both
@@ -80,8 +82,12 @@ STREAM_BLOCK_SIZE = REQUEST_SIZE * DOWNLOAD_CONNECTIONS
 # Same split boundary as the browser uploader: MAX_PARTS (1000) x CHUNK_SIZE
 # (512 KB) = 500 MiB, see frontend/src/lib/gramjs.ts:502 and frontend config.ts.
 # Not 512 MiB — that would exceed the browser's 1000-part-per-message ceiling.
+# tgupload.PART_SIZE is now the authoritative part size for segments over
+# tgupload.BIG_FILE_THRESHOLD; UPLOAD_PART_KB only feeds Telethon's own
+# client.upload_file for the small-segment path below.
 UPLOAD_PART_KB = 512
 SEGMENT_SIZE = 1000 * UPLOAD_PART_KB * 1024
+assert SEGMENT_SIZE == tgupload.MAX_PARTS_PER_MESSAGE * tgupload.PART_SIZE
 
 DOC_CACHE_TTL = 45 * 60  # file_reference lives a few hours; refresh well before
 MAX_FLOOD_WAIT = 120
@@ -174,11 +180,20 @@ class TelegramWorker:
     every call is funnelled through ``run()`` onto the single client loop.
     """
 
-    def __init__(self, api_id: int, api_hash: str, session: str, connections: int = DOWNLOAD_CONNECTIONS):
+    def __init__(
+        self,
+        api_id: int,
+        api_hash: str,
+        session: str,
+        connections: int = DOWNLOAD_CONNECTIONS,
+        *,
+        upload_parts: int = 12,
+    ):
         self._api_id = api_id
         self._api_hash = api_hash
         self._session = session
         self._connections = max(1, int(connections))
+        self._upload_parts = max(1, int(upload_parts))
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._ready = threading.Event()
@@ -189,6 +204,8 @@ class TelegramWorker:
         self._pool: Optional[list] = None
         self._pool_lock: Optional[asyncio.Lock] = None
         self._rr = 0  # round-robin cursor over the pool, see _next_client
+        self._upload = None  # dedicated client for part sends, see _upload_client
+        self._gate: Optional[tgupload.UploadGate] = None
 
     # -- lifecycle -------------------------------------------------------- #
 
@@ -248,6 +265,33 @@ class TelegramWorker:
             self._pool = pool
             return pool
 
+    async def _upload_client(self):
+        """Extra client used only for sending upload parts, built on first upload.
+
+        Kept out of ``_pool``, so ``_next_client``'s round robin never hands it
+        download traffic, and so upload payloads never queue in front of a
+        thumbnail's ``GetFile`` or a ``get_messages`` batch on ``pool[0]``
+        (``pool[0] is self._client``, see ``_download_pool``).
+        """
+        if self._upload is not None:
+            return self._upload
+        async with self._pool_lock:
+            if self._upload is not None:
+                return self._upload
+            from telethon import TelegramClient
+            from telethon.sessions import StringSession
+
+            client = TelegramClient(StringSession(self._session), self._api_id, self._api_hash)
+            await client.connect()
+            log.info("upload connection ready")
+            self._upload = client
+            return self._upload
+
+    def _upload_gate(self) -> tgupload.UploadGate:
+        if self._gate is None:
+            self._gate = tgupload.UploadGate(self._upload_parts)
+        return self._gate
+
     def stop(self) -> None:
         if self._loop is None:
             return
@@ -258,7 +302,10 @@ class TelegramWorker:
         self._loop.call_soon_threadsafe(self._loop.stop)
 
     async def _disconnect_all(self) -> None:
-        for client in self._pool or [self._client]:
+        clients = list(self._pool or [self._client])
+        if self._upload is not None:
+            clients.append(self._upload)
+        for client in clients:
             try:
                 await client.disconnect()
             except Exception:  # pragma: no cover - best effort on shutdown
@@ -364,9 +411,12 @@ class TelegramWorker:
             except Exception as exc:
                 log.warning("media info for message %s failed: %s", message_id, exc)
                 continue
-            info = _media_attributes(doc)
-            if info:
-                out[message_id] = info
+            # Recorded even when empty. An entry here means "the document was
+            # read and it has nothing to report", which is a cacheable answer;
+            # dropping it would make a file with no dimensions look uncached
+            # forever, and the whole-tree warm-up would ask about it on every
+            # pass. A lookup that actually failed raises above and stays absent.
+            out[message_id] = _media_attributes(doc)
         return out
 
     async def _prefetch_documents(self, message_ids: List[int]) -> None:
@@ -489,21 +539,39 @@ class TelegramWorker:
         """Upload one segment as a single Telegram document message.
 
         ``stream`` is a binary file object positioned at the segment start and
-        limited to ``size`` bytes (see ``SegmentReader``).
+        limited to ``size`` bytes (see ``SegmentReader``, which also supports
+        the random-access ``seek()``+``read()`` the parallel path below uses).
         """
         return self.run(self._upload_segment(stream, size, file_name, progress), timeout=None)
 
     async def _upload_segment(self, stream, size: int, file_name: str, progress) -> dict:
         from telethon.tl.types import DocumentAttributeFilename
 
-        handle = await self._client.upload_file(
-            stream,
-            file_size=size,
-            file_name=file_name,
-            part_size_kb=UPLOAD_PART_KB,
-            progress_callback=progress,
-        )
-        msg = await self._client.send_file(
+        if size <= tgupload.BIG_FILE_THRESHOLD:
+            # A handful of parts at most: parallelism buys nothing over one
+            # round trip per part, and Telethon's own MD5-verified small-file
+            # path is worth leaving untouched.
+            client = self._client
+            handle = await client.upload_file(
+                stream,
+                file_size=size,
+                file_name=file_name,
+                part_size_kb=UPLOAD_PART_KB,
+                progress_callback=progress,
+            )
+        else:
+            client = await self._upload_client()
+            async with tgupload._PartReader(stream) as reader:
+                handle = await tgupload.upload_file_parts(
+                    client=client,
+                    gate=self._upload_gate(),
+                    reader=reader,
+                    size=size,
+                    file_name=file_name,
+                    progress=progress,
+                )
+
+        msg = await client.send_file(
             "me",
             handle,
             force_document=True,
@@ -619,6 +687,7 @@ class SeekableRemoteFile(io.RawIOBase):
         parts: Sequence[Tuple[int, int]],
         *,
         name: str = "",
+        head: bytes = b"",
         block_size: int = BLOCK_SIZE,
         blocks_cached: int = BLOCKS_CACHED,
     ):
@@ -626,6 +695,11 @@ class SeekableRemoteFile(io.RawIOBase):
         self._reader = reader
         self._table, self._total = build_part_table(parts)
         self._name = name
+        # Bytes from the start of the file that the caller already has on disk.
+        # Overlaid on the block cache rather than seeded into it, because a head
+        # is whatever length the caller chose and a partial block would make
+        # _read_at stop short in the middle of a legitimate read.
+        self._head = head[: self._total] if head else b""
         self._block_size = block_size
         self._blocks_cached = blocks_cached
         self._blocks: "OrderedDict[int, bytes]" = OrderedDict()
@@ -693,6 +767,18 @@ class SeekableRemoteFile(io.RawIOBase):
         end = min(offset + length, self._total)
         if length <= 0 or offset >= end or offset < 0:
             return b""
+        if offset < len(self._head):
+            # Explorer's thumbnail pipeline opens every JPEG and reads its first
+            # tens of KB — after the thumbnail provider has already answered, so
+            # no shell extension can head it off. Cold, that read is a Telegram
+            # round trip and costs 2-5 seconds per file; it is what makes a
+            # folder nobody has opened slow while one opened before is instant.
+            # Serving it from disk is the only place left to make it cheap.
+            take = min(end, len(self._head)) - offset
+            out = self._head[offset : offset + take]
+            if offset + take >= end:
+                return out
+            return out + self._read_at(offset + take, end - offset - take)
         first = offset // self._block_size
         last = (end - 1) // self._block_size
         blocks = self._blocks_for(first, last)
@@ -831,8 +917,12 @@ class SlicedReader(io.RawIOBase):
 class SegmentReader(io.RawIOBase):
     """Read-only view of one upload segment of a local file.
 
-    Telethon's ``upload_file`` reads sequentially from this and never sees the
-    rest of the archive, so a >512 MB zip becomes N independent messages.
+    Never sees the rest of the archive, so a >512 MB zip becomes N independent
+    messages. Read two ways depending on segment size (see
+    ``TelegramWorker._upload_segment``): Telethon's own ``upload_file`` reads
+    it sequentially for small segments; ``tgupload._PartReader`` wraps it for
+    parallel random-access ``seek()``+``read()`` on bigger ones, off the event
+    loop.
     """
 
     def __init__(self, path, start: int, size: int):

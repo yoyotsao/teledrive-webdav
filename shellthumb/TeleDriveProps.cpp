@@ -200,6 +200,14 @@ private:
                 Add(PKEY_Video_FrameHeight, static_cast<UINT>(height));
             }
         }
+        // Nothing else belongs here. Cold folders were still slow after this
+        // answered, and isolating the two halves showed why: eight cold JPEGs
+        // cost 13.0s through IShellItemImageFactory::GetImage and 0.81s through
+        // the property store, and only the first read the files. The shell goes
+        // to the file from inside the thumbnail pipeline, after
+        // IThumbnailProvider has already returned a bitmap, so no property this
+        // handler could report was ever going to stop it. Reporting
+        // System.Photo.Orientation was tried and changed nothing.
         Log(L"  props: %u values", static_cast<unsigned>(m_values.size()));
     }
 
