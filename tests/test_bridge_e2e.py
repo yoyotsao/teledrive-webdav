@@ -603,6 +603,17 @@ def test_copy_already_uploaded_file_into_game_staging_is_forbidden(rig):
     assert not (rig.cfg.staging_dir / "Temp" / "x.txt").exists()
 
 
+def test_move_already_uploaded_file_into_game_staging_is_forbidden(rig):
+    rig.request("MKCOL", "/game/Temp")
+
+    resp = rig.request(
+        "MOVE", "/photos/small.txt", headers={"Destination": rig.base + "/game/Temp/x.txt"}
+    )
+    assert resp.status_code == 403, resp.status_code
+    assert "small.txt" in rig.names("/photos")
+    assert not (rig.cfg.staging_dir / "Temp" / "x.txt").exists()
+
+
 def test_read_only_paths_are_unchanged_after_rejected_deletes(rig):
     rig.request("DELETE", "/game")
     assert rig.names("/") == ["game", "movie.mkv", "photos"]
