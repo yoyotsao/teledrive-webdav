@@ -509,6 +509,7 @@ def test_copy_already_uploaded_file_outside_game_is_forbidden(rig):
         "COPY", "/photos/small.txt", headers={"Destination": rig.base + "/photos/copy.txt"}
     )
     assert resp.status_code == 403, resp.status_code
+    assert "already uploaded" in resp.text, resp.text
     assert "copy.txt" not in rig.names("/photos")
 
 
