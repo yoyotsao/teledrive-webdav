@@ -45,6 +45,7 @@ PAGE_SIZE = 10000
 
 
 THUMB_JPEG = bytes.fromhex("ffd8ffe0") + b"fake jpeg preview" * 3 + bytes.fromhex("ffd9")
+_UNSET = object()
 
 
 class FakeWorker:
@@ -169,7 +170,10 @@ class FakeBackend:
         group=None,
         part_index=None,
         file_hash=None,
+        access_hash=_UNSET,
     ):
+        if access_hash is _UNSET:
+            access_hash = "ah" if message_id else None
         return {
             "file_id": uuid.uuid4().hex,
             "filename": name,
@@ -180,7 +184,7 @@ class FakeBackend:
             "has_thumbnail": False,
             "created_at": self._stamp(),
             "direct_url": None,
-            "access_hash": "ah" if message_id else None,
+            "access_hash": access_hash,
             "parent_id": parent_id,
             "isDir": is_dir,
             "is_split_file": is_split,
@@ -233,6 +237,7 @@ class FakeBackend:
                 group=payload.get("split_group_id"),
                 part_index=payload.get("part_index"),
                 file_hash=payload.get("file_hash"),
+                access_hash=payload.get("access_hash") if "access_hash" in payload else _UNSET,
             )
             row["file_id"] = payload["file_id"]
             self.rows.append(row)
@@ -716,6 +721,32 @@ def test_api_duplicate_of_a_split_file_copies_every_part(rig):
         assert part["file_id"] != original["file_id"]
     assert len({p["split_group_id"] for p in copy_parts}) == 1
     assert copy_parts[0]["split_group_id"] != original_parts[0]["split_group_id"]
+
+
+def test_api_duplicate_of_a_split_file_filters_duplicate_message_ids(rig):
+    """Defend against the historical dedup bug where one message was registered
+    as multiple parts. duplicate() must filter those out, not propagate them."""
+    entry = rig.entry_for("movie.mkv")
+    game = rig.entry_for("game")
+    original_parts = [r for r in rig.backend.rows if r["filename"] == "movie.mkv"]
+
+    # Inject a duplicate: copy the first part's row with a different file_id
+    # but the same message_id (simulating the historical bug).
+    dup_row = dict(original_parts[0])
+    dup_row["file_id"] = uuid.uuid4().hex
+    dup_row["part_index"] = len(original_parts)  # extra part with same message_id
+    rig.backend.rows.append(dup_row)
+
+    rig.resolver.api.duplicate(entry, filename="movie3.mkv", parent_id=game.file_id)
+
+    assert "movie3.mkv" in rig.names("/game")
+    copy_parts = sorted(
+        (r for r in rig.backend.rows if r["filename"] == "movie3.mkv"),
+        key=lambda r: r["part_index"] or 0,
+    )
+    # Dedup filter should have removed the duplicate message_id, so copy
+    # has the same count as original (not original + duplicate).
+    assert len(copy_parts) == len(original_parts)
 
 
 # --------------------------------------------------------------------------- #

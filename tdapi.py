@@ -489,9 +489,17 @@ class TeleDriveClient:
         # a copy needs each part's access_hash too, which parts_for() drops.
         data = self._call("GET", f"/files/by-split-group/{entry.split_group_id}")
         rows = sorted(data.get("files") or [], key=lambda r: r.get("part_index") or 0)
+        deduped = []
+        seen = set()
+        for row in rows:
+            message_id = row.get("telegram_message_id")
+            if message_id is None or message_id in seen:
+                continue
+            seen.add(message_id)
+            deduped.append(row)
         new_group = uuid.uuid4().hex
-        total = len(rows)
-        for index, row in enumerate(rows):
+        total = len(deduped)
+        for index, row in enumerate(deduped):
             self.register(
                 filename=filename,
                 filesize=row.get("filesize") or 0,
