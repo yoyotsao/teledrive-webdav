@@ -504,6 +504,14 @@ def test_move_into_a_read_only_path_is_forbidden(rig):
     assert resp.status_code == 403
 
 
+def test_copy_already_uploaded_file_outside_game_is_forbidden(rig):
+    resp = rig.request(
+        "COPY", "/photos/small.txt", headers={"Destination": rig.base + "/photos/copy.txt"}
+    )
+    assert resp.status_code == 403, resp.status_code
+    assert "copy.txt" not in rig.names("/photos")
+
+
 def test_read_only_paths_are_unchanged_after_rejected_deletes(rig):
     rig.request("DELETE", "/photos/small.txt")
     assert rig.names("/photos") == ["shot.png", "small.txt"]

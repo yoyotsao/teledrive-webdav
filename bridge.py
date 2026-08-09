@@ -45,19 +45,20 @@ log = logging.getLogger("bridge")
 
 # Verbs that mutate. Everything outside /game/<something> gets 403 for these,
 # rather than mounting the whole drive read-only (which would kill /game too).
-# MKCOL, PUT and DELETE are exempted below (WriteGuard) — none of the three
-# needs /game specifically. MKCOL and PUT map onto real backend endpoints
+# MKCOL, PUT, DELETE and COPY are exempted below (WriteGuard) — none of the
+# four needs /game specifically. MKCOL and PUT map onto real backend endpoints
 # (POST /folders, and the same stage-upload-register pipeline /game uses).
-# DELETE has no backend endpoint anywhere, /game included, but it does not
-# need /game either: the resources themselves already draw the real line —
-# still-staged writes (StagingFileResource, UploadFileResource) accept it as
-# a local undo, already-uploaded resources (_ReadOnlyCollection,
-# RemoteFileResource, ...) refuse it — so gating by path on top would only
-# block the /game case for no reason. MOVE/COPY/PROPPATCH/LOCK have no such
-# per-resource distinction (no rename primitive exists even for staged
-# content outside /game) and stay path-gated below.
+# DELETE and COPY have no backend endpoint anywhere, /game included, but
+# neither needs /game either: the resources themselves already draw the real
+# line — still-staged writes (StagingFileResource/StagingCollection,
+# UploadFileResource) accept them as local filesystem operations,
+# already-uploaded resources (_ReadOnlyCollection, _ReadOnlyFile) refuse them
+# — so gating by path on top would only block the /game case for no reason.
+# MOVE/PROPPATCH/LOCK have no such per-resource distinction (no rename
+# primitive exists even for staged content outside /game) and stay
+# path-gated below.
 WRITE_METHODS = {"PUT", "DELETE", "MKCOL", "MOVE", "COPY", "PROPPATCH", "LOCK", "UNLOCK"}
-UNGATED_METHODS = {"MKCOL", "PUT", "DELETE"}
+UNGATED_METHODS = {"MKCOL", "PUT", "DELETE", "COPY"}
 
 ROOT = "root"
 FOLDER = "folder"
@@ -1104,18 +1105,18 @@ def _text_response(start_response, status: str, body: str, content_type="text/pl
 
 
 class WriteGuard:
-    """Reject every mutating verb outside /game/<pack-unit> — except MKCOL, PUT and DELETE.
+    """Reject every mutating verb outside /game/<pack-unit> — except MKCOL, PUT, DELETE and COPY.
 
     MKCOL and PUT map onto a real backend endpoint that needs no packing:
     MKCOL is `POST /folders` (`RootCollection.create_collection`), and PUT is
     the same stage -> upload -> register pipeline /game uses, generalized to
     an arbitrary destination by uploadstage.py instead of a fixed /game
-    folder. DELETE has no backend endpoint anywhere, but gating it by path
-    would be the wrong axis: the actual line is staged-vs-uploaded, and the
+    folder. DELETE and COPY have no backend endpoint anywhere, but gating them
+    by path would be the wrong axis: the actual line is staged-vs-uploaded, and the
     resources enforce that themselves (StagingFileResource/UploadFileResource
-    implement delete() as a local undo; _ReadOnlyCollection/RemoteFileResource
-    refuse it via handle_delete()/the wsgidav default). MOVE, COPY, ... have
-    no such per-resource distinction, so they stay gated.
+    implement them as local undo/copy operations; _ReadOnlyCollection/_ReadOnlyFile
+    refuse them via handle_delete/copy_move_single or the wsgidav default).
+    MOVE, PROPPATCH, LOCK have no such per-resource distinction, so they stay gated.
 
     rclone's global --read-only is not usable here because it would also freeze
     /game, so the rule lives on this side of the mount.
