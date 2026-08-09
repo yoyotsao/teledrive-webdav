@@ -578,16 +578,6 @@ def test_move_already_uploaded_split_file_preserves_all_parts(rig):
     assert rig.request("GET", "/game/movie2.mkv").content == original_bytes
 
 
-def test_copy_already_uploaded_folder_outside_game_is_forbidden(rig):
-    # _ReadOnlyCollection.handle_copy() via FolderCollection, not
-    # ZipDirCollection — the only other collection coverage
-    # (test_copy_already_packed_game_folder_does_not_walk_the_archive)
-    # exercises the zip-archive subclass exclusively.
-    resp = rig.request("COPY", "/photos", headers={"Destination": rig.base + "/photos2"})
-    assert resp.status_code == 403, resp.status_code
-    assert "photos2" not in rig.names("/")
-
-
 def test_copy_already_uploaded_file_into_game_staging_is_forbidden(rig):
     # Mirror image of test_copy_already_uploaded_file_outside_game_is_forbidden:
     # that test copies already-uploaded content to another already-uploaded
@@ -612,6 +602,38 @@ def test_move_already_uploaded_file_into_game_staging_is_forbidden(rig):
     assert resp.status_code == 403, resp.status_code
     assert "small.txt" in rig.names("/photos")
     assert not (rig.cfg.staging_dir / "Temp" / "x.txt").exists()
+
+
+def test_move_already_uploaded_folder_renames_it_children_intact(rig):
+    resp = rig.request(
+        "MOVE", "/photos", headers={"Destination": rig.base + "/renamed_photos"}
+    )
+    assert resp.status_code in (201, 204), resp.status_code
+    assert "photos" not in rig.names("/")
+    assert "renamed_photos" in rig.names("/")
+    assert sorted(rig.names("/renamed_photos")) == ["shot.png", "small.txt"]
+
+
+def test_copy_already_uploaded_folder_duplicates_the_whole_subtree(rig):
+    resp = rig.request(
+        "COPY", "/photos", headers={"Destination": rig.base + "/game/photos2/"}
+    )
+    assert resp.status_code == 201, resp.status_code
+    assert sorted(rig.names("/photos")) == ["shot.png", "small.txt"]  # original untouched
+    assert sorted(rig.names("/game/photos2")) == ["shot.png", "small.txt"]
+    assert rig.request("GET", "/game/photos2/small.txt").content == rig.blob_for("photos/small.txt")
+
+
+def test_move_game_folder_itself_is_forbidden(rig):
+    resp = rig.request("MOVE", "/game", headers={"Destination": rig.base + "/renamed_game"})
+    assert resp.status_code == 403, resp.status_code
+    assert "game" in rig.names("/")
+
+
+def test_copy_game_folder_itself_is_forbidden(rig):
+    resp = rig.request("COPY", "/game", headers={"Destination": rig.base + "/game_copy"})
+    assert resp.status_code == 403, resp.status_code
+    assert "game_copy" not in rig.names("/")
 
 
 def test_read_only_paths_are_unchanged_after_rejected_deletes(rig):

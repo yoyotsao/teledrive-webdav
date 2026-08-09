@@ -875,6 +875,20 @@ class GameCollection(DAVCollection):
     def handle_delete(self):
         raise DAVError(HTTP_FORBIDDEN)
 
+    # Without these, MOVE of /game falls through to DAVCollection's default
+    # copy_move_single(), reached only after wsgidav's descendant walk visits
+    # every child — the request still ends up rejected, but as a 207
+    # Multi-Status full of per-child 403s rather than a clean top-level 403
+    # (empirically confirmed: four "/game/" 403 sub-responses, /game itself
+    # untouched). COPY already 403s cleanly today via that same walk-then-
+    # default path, but these overrides short-circuit it for COPY too rather
+    # than leaving it to accidentally work for a different reason.
+    def handle_copy(self, dest_path, *, depth_infinity):
+        raise DAVError(HTTP_FORBIDDEN)
+
+    def handle_move(self, dest_path):
+        raise DAVError(HTTP_FORBIDDEN)
+
 
 class FolderCollection(RootCollection):
     def __init__(self, path, environ, resolver: Resolver, entry: Entry):
@@ -884,6 +898,26 @@ class FolderCollection(RootCollection):
     def handle_delete(self):
         self.resolver.api.trash(self.entry.file_id)
         return True
+
+    def handle_move(self, dest_path):
+        dest_segments = split_dav_path(dest_path)
+        parent = self.resolver.api.resolve(dest_segments[:-1]) if len(dest_segments) > 1 else None
+        parent_id = parent.file_id if parent is not None else None
+        self.resolver.api.move(self.entry.file_id, parent_id=parent_id, filename=dest_segments[-1])
+        return True
+
+    # Opts back OUT of _ReadOnlyCollection's blanket handle_copy() 403: a real
+    # copy is possible now, and wsgidav's own per-node descendant walk already
+    # does the recursion for free — this class only needs to answer for
+    # itself (create the destination folder; see copy_move_single below).
+    def handle_copy(self, dest_path, *, depth_infinity):
+        return False
+
+    def copy_move_single(self, dest_path, *, is_move):
+        dest_segments = split_dav_path(dest_path)
+        parent = self.resolver.api.resolve(dest_segments[:-1]) if len(dest_segments) > 1 else None
+        parent_id = parent.file_id if parent is not None else None
+        self.resolver.api.create_folder(dest_segments[-1], parent_id=parent_id)
 
 
 class ZipDirCollection(_ReadOnlyCollection):
