@@ -851,7 +851,34 @@ class ZipDirCollection(_ReadOnlyCollection):
         raise DAVError(HTTP_FORBIDDEN, PACKED_MESSAGE)
 
 
-class StagingCollection(DAVCollection):
+class _StagingCopyMove:
+    """Shared copy/move plumbing for StagingCollection and StagingFileResource.
+
+    Both wrap a plain local path under GameStager; a file vs. a directory
+    makes no difference to GameStager.move()/copy() (os.replace and
+    shutil.copy2/mkdir already branch on that internally), so the two
+    classes need this identical regardless of which one they otherwise
+    subclass. Mixed in first so its methods win the MRO over DAVCollection's
+    own copy_move_single() default.
+    """
+
+    def support_recursive_move(self, dest_path):
+        return self.stager.path_for(split_dav_path(dest_path)[1:]) is not None
+
+    def move_recursive(self, dest_path):
+        self.stager.move(self.local, split_dav_path(dest_path))
+
+    def copy_move_single(self, dest_path, *, is_move):
+        try:
+            if is_move:
+                self.stager.move(self.local, split_dav_path(dest_path))
+            else:
+                self.stager.copy(self.local, split_dav_path(dest_path))
+        except PermissionError as exc:
+            raise DAVError(HTTP_FORBIDDEN, str(exc))
+
+
+class StagingCollection(_StagingCopyMove, DAVCollection):
     def __init__(self, path, environ, stager, local: Path, top: str):
         super().__init__(path, environ)
         self.stager = stager
@@ -894,14 +921,8 @@ class StagingCollection(DAVCollection):
         self.remove_all_properties(recursive=True)
         self.remove_all_locks(recursive=True)
 
-    def support_recursive_move(self, dest_path):
-        return self.stager.path_for(split_dav_path(dest_path)[1:]) is not None
 
-    def move_recursive(self, dest_path):
-        self.stager.move(self.local, split_dav_path(dest_path))
-
-
-class StagingFileResource(DAVNonCollection):
+class StagingFileResource(_StagingCopyMove, DAVNonCollection):
     """A file inside the /game staging tree: a real local file, writable."""
 
     def __init__(self, path, environ, stager, local: Path, name: str):
@@ -964,12 +985,6 @@ class StagingFileResource(DAVNonCollection):
         self.stager.touch(self.top)
         self.remove_all_properties(recursive=True)
         self.remove_all_locks(recursive=True)
-
-    def support_recursive_move(self, dest_path):
-        return self.stager.path_for(split_dav_path(dest_path)[1:]) is not None
-
-    def move_recursive(self, dest_path):
-        self.stager.move(self.local, split_dav_path(dest_path))
 
 
 class UploadFileResource(DAVNonCollection):

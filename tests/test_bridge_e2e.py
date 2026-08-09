@@ -827,6 +827,47 @@ def test_delete_inside_staging_is_allowed(rig):
     assert not (rig.cfg.staging_dir / "Temp").exists()
 
 
+def test_copy_inside_staging_creates_an_independent_second_file(rig):
+    rig.request("MKCOL", "/game/Temp")
+    rig.request("PUT", "/game/Temp/a.bin", data=b"junk")
+
+    resp = rig.request(
+        "COPY", "/game/Temp/a.bin", headers={"Destination": rig.base + "/game/Temp/b.bin"}
+    )
+    assert resp.status_code == 201, resp.status_code
+    assert rig.names("/game/Temp") == ["a.bin", "b.bin"]
+    assert (rig.cfg.staging_dir / "Temp" / "a.bin").read_bytes() == b"junk"
+    assert (rig.cfg.staging_dir / "Temp" / "b.bin").read_bytes() == b"junk"
+
+    # Independent afterwards: deleting one must not touch the other.
+    rig.request("DELETE", "/game/Temp/a.bin")
+    assert rig.names("/game/Temp") == ["b.bin"]
+
+
+def test_copy_a_staging_folder_creates_an_empty_destination_and_copies_files_individually(rig):
+    rig.request("MKCOL", "/game/Temp")
+    rig.request("PUT", "/game/Temp/a.bin", data=b"junk")
+
+    resp = rig.request(
+        "COPY", "/game/Temp", headers={"Destination": rig.base + "/game/Temp2/"}
+    )
+    assert resp.status_code == 201, resp.status_code
+    assert rig.names("/game/Temp2") == ["a.bin"]
+    assert (rig.cfg.staging_dir / "Temp2" / "a.bin").read_bytes() == b"junk"
+    assert (rig.cfg.staging_dir / "Temp" / "a.bin").exists(), "source must survive a COPY"
+
+
+def test_copy_out_of_game_staging_is_forbidden(rig):
+    rig.request("MKCOL", "/game/Temp")
+    rig.request("PUT", "/game/Temp/a.bin", data=b"junk")
+
+    resp = rig.request(
+        "COPY", "/game/Temp/a.bin", headers={"Destination": rig.base + "/photos/escaped.bin"}
+    )
+    assert resp.status_code == 403, resp.status_code
+    assert "escaped.bin" not in rig.names("/photos")
+
+
 def test_delete_already_packed_game_folder_is_forbidden_not_a_crash(rig):
     # MyGame is already packed and uploaded (see the rig fixture) — there is
     # no local staging copy shadowing it, so this exercises ZipDirCollection,

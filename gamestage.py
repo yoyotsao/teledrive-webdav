@@ -190,6 +190,28 @@ class GameStager:
         if rest:
             self.touch(rest[0])
 
+    def copy(self, src: Path, dest_segments: Sequence[str]) -> Path:
+        """Copy inside staging (dest_segments starts with the /game element).
+
+        Unlike move(), this has no WriteGuard destination check guaranteeing
+        dest_segments[0] is the game folder — COPY is ungated (see WriteGuard
+        in bridge.py) so this validates it itself.
+        """
+        if not dest_segments or dest_segments[0] != self.cfg.game_folder:
+            raise PermissionError("copy destination must stay under /game while staged")
+        rest = list(dest_segments)[1:]
+        dest = self.path_for(rest)
+        if dest is None:
+            raise PermissionError(f"copy destination is outside the staging area: {dest_segments}")
+        if src.is_dir():
+            dest.mkdir(parents=True, exist_ok=True)
+        else:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(_ext(src), _ext(dest))
+        if rest:
+            self.touch(rest[0])
+        return dest
+
     def touch(self, top: str) -> None:
         """Record write activity, restarting that unit's debounce window."""
         if not top or top.startswith("."):
