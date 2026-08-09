@@ -702,18 +702,34 @@ class RemoteFileResource(_ReadOnlyFile):
     def delete(self):
         self.resolver.api.trash(self.entry.file_id)
 
+    def support_recursive_move(self, dest_path):
+        # Override to enable move_recursive() instead of copy+delete fallback.
+        # move_recursive() calls api.move() which atomically reparents in place,
+        # avoiding duplicate's split-file problem: a MOVE of a split file via
+        # duplicate() creates new parts with new IDs, then delete() only trashes
+        # the part-0 representative row, leaving parts 1..N orphaned.
+        return True
+
+    def move_recursive(self, dest_path):
+        dest_segments = split_dav_path(dest_path)
+        if len(dest_segments) > 1:
+            parent_loc = self.resolver.resolve(dest_segments[:-1])
+            if parent_loc.kind in (STAGE_DIR, STAGE_FILE):
+                raise DAVError(HTTP_FORBIDDEN, "cannot move an already-uploaded file into a staging area")
+            parent = self.resolver.api.resolve(dest_segments[:-1])
+        else:
+            parent = None
+        parent_id = parent.file_id if parent is not None else None
+        filename = dest_segments[-1]
+        self.resolver.api.move(self.entry.file_id, parent_id=parent_id, filename=filename)
+
     def copy_move_single(self, dest_path, *, is_move):
         dest_segments = split_dav_path(dest_path)
         if len(dest_segments) > 1:
             parent_loc = self.resolver.resolve(dest_segments[:-1])
             if parent_loc.kind in (STAGE_DIR, STAGE_FILE):
                 raise DAVError(HTTP_FORBIDDEN, "cannot copy/move an already-uploaded file into a staging area")
-            if parent_loc.kind == GAME:
-                parent = self.resolver.api.resolve([self.resolver.cfg.game_folder])
-            elif parent_loc.kind == FOLDER:
-                parent = parent_loc.entry
-            else:
-                parent = None
+            parent = self.resolver.api.resolve(dest_segments[:-1])
         else:
             parent = None
         parent_id = parent.file_id if parent is not None else None
