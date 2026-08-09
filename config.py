@@ -51,6 +51,7 @@ class Config:
     warmup_auto: bool = True
     warmup_interval_minutes: float = 360.0
     upload_parts: int = 12
+    upload_dir: Path = Path("uploads")
 
     @property
     def api_base(self) -> str:
@@ -176,10 +177,12 @@ def load_config(path: Optional[Path] = None) -> Config:
         # rclone/ rclone's VFS cache, safe to delete
         # local/  files fetched on purpose — NOT a cache, deleting loses them
         # staging/ /game trees waiting to be packed and uploaded
+        # uploads/ plain writes anywhere else, waiting to be uploaded and registered
         cache_dir=data_root / "meta",
         local_dir=data_root / "local",
         staging_dir=data_root / "staging",
         rclone_dir=data_root / "rclone",
+        upload_dir=data_root / "uploads",
         debounce_minutes=float(get("game", "debounce_minutes", "5")),
         warmup_auto=get("warmup", "auto", "true").lower() not in ("0", "false", "no", "off"),
         warmup_interval_minutes=float(get("warmup", "interval_minutes", "360")),

@@ -34,6 +34,7 @@ from config import Config  # noqa: E402
 from fetchlocal import LocalFetcher  # noqa: E402
 from gamestage import GameStager  # noqa: E402
 from tdapi import TeleDriveClient  # noqa: E402
+from uploadstage import UploadStager  # noqa: E402
 
 PAGE_SIZE = 10000
 
@@ -276,13 +277,14 @@ BIG = bytes((i * 31) % 256 for i in range(300_000))
 
 
 class Rig:
-    def __init__(self, base, cfg, backend, worker, stager, resolver):
+    def __init__(self, base, cfg, backend, worker, stager, resolver, upload_stager=None):
         self.base = base
         self.cfg = cfg
         self.backend = backend
         self.worker = worker
         self.stager = stager
         self.resolver = resolver
+        self.upload_stager = upload_stager
 
     def request(self, method, path, **kw):
         return requests.request(method, self.base + path, timeout=30, **kw)
@@ -353,9 +355,10 @@ def rig(tmp_path):
         cache_dir=tmp_path / "cache",
         local_dir=tmp_path / "local",
         staging_dir=tmp_path / "staging",
+        upload_dir=tmp_path / "uploads",
         debounce_minutes=0.0,
     )
-    for path in (cfg.cache_dir, cfg.local_dir, cfg.staging_dir, cfg.pack_dir):
+    for path in (cfg.cache_dir, cfg.local_dir, cfg.staging_dir, cfg.pack_dir, cfg.upload_dir):
         path.mkdir(parents=True, exist_ok=True)
 
     worker = FakeWorker()
@@ -382,7 +385,9 @@ def rig(tmp_path):
     resolver = bridge.Resolver(cfg, api, worker)
     stager = GameStager(cfg, api, worker)
     resolver.stager = stager
-    app = bridge.build_app(cfg, resolver, stager, LocalFetcher(cfg, resolver))
+    upload_stager = UploadStager(cfg, api, worker)
+    resolver.upload_stager = upload_stager
+    app = bridge.build_app(cfg, resolver, stager, LocalFetcher(cfg, resolver), upload_stager)
 
     server = wsgi.Server((cfg.host, 0), app, numthreads=8)
     server.prepare()
@@ -390,7 +395,7 @@ def rig(tmp_path):
     thread.start()
     host, port = server.bind_addr[0], server.bind_addr[1]
     try:
-        yield Rig(f"http://{host}:{port}", cfg, backend, worker, stager, resolver)
+        yield Rig(f"http://{host}:{port}", cfg, backend, worker, stager, resolver, upload_stager)
     finally:
         server.stop()
         thread.join(timeout=5)
@@ -463,20 +468,33 @@ def test_missing_path_is_404(rig):
 @pytest.mark.parametrize(
     "method,path",
     [
-        ("PUT", "/hack.txt"),
-        ("PUT", "/photos/hack.txt"),
         ("DELETE", "/photos/small.txt"),
         ("DELETE", "/movie.mkv"),
-        ("MKCOL", "/newdir"),
-        ("MKCOL", "/photos/newdir"),
         ("PROPPATCH", "/photos/small.txt"),
         ("LOCK", "/photos/small.txt"),
         ("DELETE", "/game"),
     ],
 )
 def test_writes_outside_game_are_forbidden(rig, method, path):
-    resp = rig.request(method, path, data=b"x")
+    # PUT and MKCOL are not in this list — see test_uploadstage.py's write path
+    # and test_mkcol_outside_game_creates_a_real_backend_folder below. Both map
+    # onto real backend endpoints; everything here does not.
+    # DELETE carries no body over the wire (rclone/Explorer never send one);
+    # a body would earn its own 415 from wsgidav before ever reaching the
+    # resource, since DELETE is no longer intercepted by WriteGuard itself.
+    body = None if method == "DELETE" else b"x"
+    resp = rig.request(method, path, data=body)
     assert resp.status_code == 403, (method, path, resp.status_code)
+
+
+@pytest.mark.parametrize("path", ["/newdir", "/photos/newdir"])
+def test_mkcol_outside_game_creates_a_real_backend_folder(rig, path):
+    # Folder creation maps onto the backend's own POST /folders, so — unlike
+    # file PUT, which has no such endpoint — it is not limited to /game.
+    resp = rig.request("MKCOL", path)
+    assert resp.status_code == 201, (path, resp.status_code, resp.text)
+    parent, name = path.rsplit("/", 1)
+    assert name in rig.names(parent or "/")
 
 
 def test_move_into_a_read_only_path_is_forbidden(rig):
@@ -486,9 +504,96 @@ def test_move_into_a_read_only_path_is_forbidden(rig):
     assert resp.status_code == 403
 
 
-def test_read_only_paths_are_unchanged_after_rejected_writes(rig):
-    rig.request("PUT", "/photos/hack.txt", data=b"x")
+def test_read_only_paths_are_unchanged_after_rejected_deletes(rig):
+    rig.request("DELETE", "/photos/small.txt")
     assert rig.names("/photos") == ["shot.png", "small.txt"]
+
+
+# --------------------------------------------------------------------------- #
+# M1b — plain writes outside /game (uploadstage.py)
+# --------------------------------------------------------------------------- #
+
+
+def _upload_now(rig, *segments):
+    """Run what uploadstage's debounce loop would run, without waiting."""
+    key = tuple(segments)
+    due = rig.upload_stager._due(0.0)
+    assert key in due, f"{key} not due; pending={rig.upload_stager.status()}"
+    rig.upload_stager._process(key)
+
+
+def test_put_outside_game_is_visible_locally_before_upload(rig):
+    payload = b"brand new content" * 50
+    assert rig.request("PUT", "/photos/fresh.bin", data=payload).status_code == 201
+    assert "fresh.bin" in rig.names("/photos")
+    assert rig.request("GET", "/photos/fresh.bin").content == payload
+
+
+def test_put_outside_game_uploads_verbatim_and_registers_at_the_real_parent(rig):
+    import mimetypes
+
+    payload = b"plain file, no zip" * 100
+    assert rig.request("PUT", "/photos/fresh.bin", data=payload).status_code == 201
+    _upload_now(rig, "photos", "fresh.bin")
+
+    assert rig.worker.messages[rig.worker.uploads[-1]["message_id"]] == payload
+    photos_id = next(r["file_id"] for r in rig.backend.rows if r["filename"] == "photos")
+    row = next(r for r in rig.backend.rows if r["filename"] == "fresh.bin")
+    assert row["parent_id"] == photos_id
+    assert row["mime_type"] == (mimetypes.guess_type("fresh.bin")[0] or "application/octet-stream")
+    assert row["is_split_file"] is False
+    assert row["file_hash"].endswith(f":{len(payload)}")
+
+    # Staging is gone and the file now browses as a normal cloud entry.
+    assert not (rig.cfg.upload_dir / "photos" / "fresh.bin").exists()
+    assert rig.request("GET", "/photos/fresh.bin").content == payload
+
+
+def test_put_at_drive_root_registers_under_no_parent(rig):
+    payload = b"root drop" * 10
+    assert rig.request("PUT", "/fresh.bin", data=payload).status_code == 201
+    _upload_now(rig, "fresh.bin")
+    row = next(r for r in rig.backend.rows if r["filename"] == "fresh.bin")
+    assert row["parent_id"] is None
+    assert rig.request("GET", "/fresh.bin").content == payload
+
+
+def test_overwriting_an_existing_remote_file_registers_a_newer_row(rig):
+    """No backend UNIQUE(filename, parent_id) — same shadowing rule as dedup
+    registrations (CLAUDE.md plan risk #5): the newest row wins on read, the
+    old one is never deleted."""
+    new_payload = b"replacement content" * 20
+    assert rig.request("PUT", "/photos/small.txt", data=new_payload).status_code < 300
+    _upload_now(rig, "photos", "small.txt")
+
+    rows = [r for r in rig.backend.rows if r["filename"] == "small.txt"]
+    assert len(rows) == 2
+    assert rig.request("GET", "/photos/small.txt").content == new_payload
+
+
+def test_put_dedup_reuses_an_identical_upload(rig):
+    payload = b"shared bytes" * 200
+    rig.request("PUT", "/photos/one.bin", data=payload)
+    _upload_now(rig, "photos", "one.bin")
+    uploads_after_first = len(rig.worker.uploads)
+
+    rig.request("PUT", "/two.bin", data=payload)
+    _upload_now(rig, "two.bin")
+
+    assert len(rig.worker.uploads) == uploads_after_first, "identical content should not re-upload"
+    rows = [r for r in rig.backend.rows if r["filename"] in ("one.bin", "two.bin")]
+    assert len({r["telegram_message_id"] for r in rows}) == 1
+
+
+def test_upload_status_reports_pending_then_clears(rig):
+    rig.request("PUT", "/photos/pending.bin", data=b"waiting")
+    status = rig.request("GET", "/rpc/status").json()
+    assert any(p["path"] == "photos/pending.bin" for p in status["uploads"]["pending"])
+
+    _upload_now(rig, "photos", "pending.bin")
+
+    status = rig.request("GET", "/rpc/status").json()
+    assert status["uploads"]["pending"] == []
 
 
 # --------------------------------------------------------------------------- #
@@ -711,6 +816,31 @@ def test_delete_inside_staging_is_allowed(rig):
     assert rig.names("/game/Temp") == []
     assert rig.request("DELETE", "/game/Temp").status_code == 204
     assert not (rig.cfg.staging_dir / "Temp").exists()
+
+
+def test_delete_already_packed_game_folder_is_forbidden_not_a_crash(rig):
+    # MyGame is already packed and uploaded (see the rig fixture) — there is
+    # no local staging copy shadowing it, so this exercises ZipDirCollection,
+    # which relies on _ReadOnlyCollection.handle_delete() for a clean 403
+    # instead of crashing on the unimplemented support_recursive_delete().
+    resp = rig.request("DELETE", "/game/MyGame")
+    assert resp.status_code == 403
+    assert rig.names("/game") == ["MyGame"]
+
+
+def test_delete_pending_general_upload_is_allowed(rig):
+    """The same staged-vs-uploaded rule as /game, but outside it (uploadstage.py)."""
+    rig.request("PUT", "/photos/pending.bin", data=b"waiting")
+    assert "pending.bin" in rig.names("/photos")
+
+    assert rig.request("DELETE", "/photos/pending.bin").status_code == 204
+
+    assert "pending.bin" not in rig.names("/photos")
+    assert not (rig.cfg.upload_dir / "photos" / "pending.bin").exists()
+    status = rig.request("GET", "/rpc/status").json()
+    assert status["uploads"]["pending"] == []
+    # Never uploaded: the file must not have reached Telegram or the backend.
+    assert not any(r["filename"] == "pending.bin" for r in rig.backend.rows)
 
 
 # --------------------------------------------------------------------------- #

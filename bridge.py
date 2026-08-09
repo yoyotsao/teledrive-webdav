@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import unquote, urlsplit
 
-from wsgidav.dav_error import HTTP_FORBIDDEN, DAVError
+from wsgidav.dav_error import HTTP_FORBIDDEN, HTTP_INTERNAL_ERROR, DAVError
 from wsgidav.dav_provider import DAVCollection, DAVNonCollection, DAVProvider
 from wsgidav.wsgidav_app import WsgiDAVApp
 
@@ -45,7 +45,19 @@ log = logging.getLogger("bridge")
 
 # Verbs that mutate. Everything outside /game/<something> gets 403 for these,
 # rather than mounting the whole drive read-only (which would kill /game too).
+# MKCOL, PUT and DELETE are exempted below (WriteGuard) — none of the three
+# needs /game specifically. MKCOL and PUT map onto real backend endpoints
+# (POST /folders, and the same stage-upload-register pipeline /game uses).
+# DELETE has no backend endpoint anywhere, /game included, but it does not
+# need /game either: the resources themselves already draw the real line —
+# still-staged writes (StagingFileResource, UploadFileResource) accept it as
+# a local undo, already-uploaded resources (_ReadOnlyCollection,
+# RemoteFileResource, ...) refuse it — so gating by path on top would only
+# block the /game case for no reason. MOVE/COPY/PROPPATCH/LOCK have no such
+# per-resource distinction (no rename primitive exists even for staged
+# content outside /game) and stay path-gated below.
 WRITE_METHODS = {"PUT", "DELETE", "MKCOL", "MOVE", "COPY", "PROPPATCH", "LOCK", "UNLOCK"}
+UNGATED_METHODS = {"MKCOL", "PUT", "DELETE"}
 
 ROOT = "root"
 FOLDER = "folder"
@@ -55,6 +67,7 @@ ZIPDIR = "zipdir"
 ZIPFILE = "zipfile"
 STAGE_DIR = "stage_dir"
 STAGE_FILE = "stage_file"
+UPLOAD_FILE = "upload_file"
 MISSING = "missing"
 
 # Telegram stores a small preview beside every photo and video. It is served to
@@ -161,6 +174,8 @@ class Loc:
     node: Optional[zipfs.ZipNode] = None
     local: Optional[Path] = None
     top: Optional[str] = None  # first-level /game name, i.e. the pack unit
+    segments: Optional[List[str]] = None  # full path, for UPLOAD_FILE
+    parent_id: Optional[str] = None  # resolved destination folder, for UPLOAD_FILE
 
 
 class Resolver:
@@ -170,11 +185,12 @@ class Resolver:
     resolve paths without faking a WSGI environ.
     """
 
-    def __init__(self, cfg: Config, api: TeleDriveClient, worker: TelegramWorker, stager=None):
+    def __init__(self, cfg: Config, api: TeleDriveClient, worker: TelegramWorker, stager=None, upload_stager=None):
         self.cfg = cfg
         self.api = api
         self.worker = worker
         self.stager = stager
+        self.upload_stager = upload_stager
         self._zips: Dict[str, zipfs.ZipView] = {}
         self._zip_lock = threading.Lock()
         self._zip_cache = JsonStore(cfg.cache_dir / "zip_dirs.json")
@@ -533,6 +549,14 @@ class Resolver:
             return Loc(ROOT)
         if segments[0] == self.cfg.game_folder:
             return self._resolve_game(segments[1:])
+        # A pending write (not yet uploaded+registered) is the newest truth
+        # for that exact path, same priority rule as /game staging.
+        if self.upload_stager is not None:
+            pending = self.upload_stager.get(segments)
+            if pending is not None:
+                local = self.upload_stager.path_for(segments)
+                if local is not None and local.exists():
+                    return Loc(UPLOAD_FILE, local=local, segments=list(segments), parent_id=pending.parent_id)
         entry = self.api.resolve(segments)
         if entry is None:
             return Loc(MISSING)
@@ -619,6 +643,16 @@ class _ReadOnlyFile(DAVNonCollection):
     def support_ranges(self):
         return True
 
+    # Covers RemoteFileResource (an already-registered backend file, /game or
+    # not) and ZipFileResource (packed archive content). Unlike DAVCollection,
+    # wsgidav's DAVNonCollection has no default delete() — it falls back to
+    # _DAVResource's bare NotImplementedError, which do_DELETE does not catch
+    # (only DAVError is), so an unpatched already-uploaded file 500s instead
+    # of 403ing. This also runs during a recursive folder delete, where
+    # do_DELETE calls delete() directly on every descendant file.
+    def delete(self):
+        raise DAVError(HTTP_FORBIDDEN, "already uploaded — TeleDrive has no delete endpoint for this.")
+
 
 class RemoteFileResource(_ReadOnlyFile):
     def __init__(self, path, environ, resolver: Resolver, entry: Entry):
@@ -629,6 +663,24 @@ class RemoteFileResource(_ReadOnlyFile):
 
     def get_content(self):
         return self.resolver.open_remote(self.entry)
+
+    # Overwriting an existing plain file: there is no backend "replace" call,
+    # so this is a new write of the same name into the same parent — the
+    # newest row wins (tdapi.children_by_name), same as a fresh upload that
+    # happens to collide with dedup registrations (plan risk #5 in CLAUDE.md).
+    def begin_write(self, *, content_type=None):
+        if self.resolver.upload_stager is None:
+            raise DAVError(HTTP_FORBIDDEN)
+        self._upload_segments = split_dav_path(self.path)
+        parent = self.resolver.api.resolve(self._upload_segments[:-1]) if len(self._upload_segments) > 1 else None
+        self._upload_parent_id = parent.file_id if parent is not None else None
+        local = self.resolver.upload_stager.create_file(self._upload_segments, self._upload_parent_id)
+        return local.open("wb")
+
+    def end_write(self, *, with_errors):
+        if with_errors or self.resolver.upload_stager is None:
+            return
+        self.resolver.upload_stager.touch(self._upload_segments, self._upload_parent_id)
 
 
 class ZipFileResource(_ReadOnlyFile):
@@ -659,6 +711,18 @@ class _ReadOnlyCollection(DAVCollection):
     def get_display_info(self):
         return {"type": "Directory"}
 
+    # Covers RootCollection/FolderCollection (already-registered backend
+    # folders, /game or not) and ZipDirCollection (packed archive contents).
+    # wsgidav's own DAVCollection.delete() already answers HTTP_FORBIDDEN by
+    # default, so this is not strictly needed for correctness — but without
+    # it, do_DELETE first walks the whole subtree (get_descendants(depth=
+    # "infinity")) just to reject every member one by one, which for a large
+    # game archive means enumerating thousands of zip entries (or backend
+    # files) before ever reporting the 403. handle_delete() is checked first
+    # and skips straight past that walk.
+    def handle_delete(self):
+        raise DAVError(HTTP_FORBIDDEN, "already uploaded — TeleDrive has no delete endpoint for this.")
+
 
 class RootCollection(_ReadOnlyCollection):
     def __init__(self, path, environ, resolver: Resolver, parent_id: Optional[str], mtime: float):
@@ -672,7 +736,35 @@ class RootCollection(_ReadOnlyCollection):
         if self.parent_id is None and self.resolver.cfg.game_folder not in names:
             # /game must exist as a drop target even before anything is uploaded.
             names.append(self.resolver.cfg.game_folder)
+        if self.resolver.upload_stager is not None:
+            for name in self.resolver.upload_stager.names_under(split_dav_path(self.path)):
+                if name not in names:
+                    names.append(name)
         return names
+
+    def create_collection(self, name):
+        # Folder creation is real backend metadata (POST /folders), not a file
+        # upload, so it is not limited to /game the way PUT is: WriteGuard lets
+        # MKCOL through everywhere and this is where it lands.
+        try:
+            self.resolver.api.create_folder(name, parent_id=self.parent_id)
+        except ApiError as exc:
+            log.warning("create folder %r under %s failed: %s", name, self.parent_id, exc)
+            raise DAVError(HTTP_INTERNAL_ERROR, str(exc))
+        return None
+
+    def create_empty_resource(self, name):
+        # Same reasoning as create_collection: a plain write has a real
+        # backend endpoint to land on (stage -> upload -> register, the exact
+        # pipeline /game uses — see uploadstage.py), so it is not limited to
+        # /game either. WriteGuard lets PUT through everywhere for this reason.
+        if self.resolver.upload_stager is None:
+            raise DAVError(HTTP_FORBIDDEN)
+        segments = split_dav_path(self.path) + [name]
+        local = self.resolver.upload_stager.create_file(segments, self.parent_id)
+        return UploadFileResource(
+            self.path.rstrip("/") + "/" + name, self.environ, self.resolver.upload_stager, local, segments, self.parent_id
+        )
 
 
 class GameCollection(DAVCollection):
@@ -714,6 +806,10 @@ class GameCollection(DAVCollection):
             raise DAVError(HTTP_FORBIDDEN)
         path = self.stager.create_file([name])
         return StagingFileResource(self.path.rstrip("/") + "/" + name, self.environ, self.stager, path, name)
+
+    # /game itself is a drop target, never a thing to delete.
+    def handle_delete(self):
+        raise DAVError(HTTP_FORBIDDEN)
 
 
 class FolderCollection(RootCollection):
@@ -862,6 +958,81 @@ class StagingFileResource(DAVNonCollection):
         self.stager.move(self.local, split_dav_path(dest_path))
 
 
+class UploadFileResource(DAVNonCollection):
+    """A plain file outside /game: staged locally until uploadstage.py lands
+    it on Telegram and registers it at its real parent folder.
+
+    Unlike StagingFileResource, the debounce key is the file's own full path
+    rather than a name under a fixed /game/<top> — there is no packing unit
+    above single-file granularity here. DELETE is offered (see delete()) since
+    it is a purely local undo of a write that has not reached Telegram yet;
+    MOVE is not, since upload_stager has no rename primitive and, like
+    /game, the backend has nothing to rename once the file is registered.
+    """
+
+    def __init__(self, path, environ, upload_stager, local: Path, segments: List[str], parent_id: Optional[str]):
+        super().__init__(path, environ)
+        self.upload_stager = upload_stager
+        self.local = local
+        self.segments = list(segments)
+        self.parent_id = parent_id
+
+    def get_content_length(self):
+        try:
+            return self.local.stat().st_size
+        except OSError:
+            return 0
+
+    def get_last_modified(self):
+        try:
+            return self.local.stat().st_mtime
+        except OSError:
+            return time.time()
+
+    def get_etag(self):
+        try:
+            st = self.local.stat()
+            return f"upload-{int(st.st_mtime)}-{st.st_size}"
+        except OSError:
+            return None
+
+    def support_etag(self):
+        return True
+
+    def support_ranges(self):
+        return True
+
+    def get_content(self):
+        return self.local.open("rb")
+
+    def begin_write(self, *, content_type=None):
+        self.local.parent.mkdir(parents=True, exist_ok=True)
+        self.upload_stager.touch(self.segments, self.parent_id)
+        return self.local.open("wb")
+
+    def end_write(self, *, with_errors):
+        if with_errors:
+            log.warning("PUT failed for %s — leaving the partial file staged", self.local)
+        self.upload_stager.touch(self.segments, self.parent_id)
+
+    def delete(self):
+        try:
+            self.local.unlink()
+        except OSError:
+            pass
+        self.upload_stager.forget(self.segments)
+        self.remove_all_properties(recursive=True)
+        self.remove_all_locks(recursive=True)
+
+    def set_last_modified(self, dest_path, time_stamp, *, dry_run):
+        if not dry_run:
+            try:
+                os.utime(self.local, (time_stamp, time_stamp))
+            except OSError:
+                return False
+        return True
+
+
 class TeleDriveProvider(DAVProvider):
     def __init__(self, resolver: Resolver):
         super().__init__()
@@ -903,6 +1074,8 @@ class TeleDriveProvider(DAVProvider):
             return StagingCollection(path, environ, res.stager, loc.local, loc.top)
         if loc.kind == STAGE_FILE:
             return StagingFileResource(path, environ, res.stager, loc.local, loc.local.name)
+        if loc.kind == UPLOAD_FILE:
+            return UploadFileResource(path, environ, res.upload_stager, loc.local, loc.segments, loc.parent_id)
         return None
 
 
@@ -918,7 +1091,18 @@ def _text_response(start_response, status: str, body: str, content_type="text/pl
 
 
 class WriteGuard:
-    """Reject every mutating verb outside /game/<pack-unit>.
+    """Reject every mutating verb outside /game/<pack-unit> — except MKCOL, PUT and DELETE.
+
+    MKCOL and PUT map onto a real backend endpoint that needs no packing:
+    MKCOL is `POST /folders` (`RootCollection.create_collection`), and PUT is
+    the same stage -> upload -> register pipeline /game uses, generalized to
+    an arbitrary destination by uploadstage.py instead of a fixed /game
+    folder. DELETE has no backend endpoint anywhere, but gating it by path
+    would be the wrong axis: the actual line is staged-vs-uploaded, and the
+    resources enforce that themselves (StagingFileResource/UploadFileResource
+    implement delete() as a local undo; _ReadOnlyCollection/RemoteFileResource
+    refuse it via handle_delete()/the wsgidav default). MOVE, COPY, ... have
+    no such per-resource distinction, so they stay gated.
 
     rclone's global --read-only is not usable here because it would also freeze
     /game, so the rule lives on this side of the mount.
@@ -934,7 +1118,7 @@ class WriteGuard:
 
     def __call__(self, environ, start_response):
         method = environ.get("REQUEST_METHOD", "").upper()
-        if method in WRITE_METHODS:
+        if method in WRITE_METHODS and method not in UNGATED_METHODS:
             path = environ.get("PATH_INFO", "")
             if not self._allowed(path):
                 log.info("403 %s %s (read-only path)", method, path)
@@ -955,11 +1139,12 @@ class WriteGuard:
 class RpcApp:
     """Local control plane used by the Explorer verb and for diagnostics."""
 
-    def __init__(self, cfg: Config, resolver: Resolver, fetcher, stager):
+    def __init__(self, cfg: Config, resolver: Resolver, fetcher, stager, upload_stager=None):
         self.cfg = cfg
         self.resolver = resolver
         self.fetcher = fetcher
         self.stager = stager
+        self.upload_stager = upload_stager
 
     def __call__(self, environ, start_response):
         route = environ.get("PATH_INFO", "")[len("/rpc") :]
@@ -994,7 +1179,13 @@ class RpcApp:
         return _text_response(start_response, "200 OK", body, "application/json")
 
     def _status(self, start_response):
-        body = json.dumps(self.stager.status() if self.stager else {}, default=str)
+        body = json.dumps(
+            {
+                **(self.stager.status() if self.stager else {}),
+                "uploads": self.upload_stager.status() if self.upload_stager else {},
+            },
+            default=str,
+        )
         return _text_response(start_response, "200 OK", body, "application/json")
 
     def _forget(self, start_response):
@@ -1108,7 +1299,7 @@ class Dispatcher:
         return self.dav_app(environ, start_response)
 
 
-def build_app(cfg: Config, resolver: Resolver, stager, fetcher):
+def build_app(cfg: Config, resolver: Resolver, stager, fetcher, upload_stager=None):
     provider = TeleDriveProvider(resolver)
     dav_config = {
         "provider_mapping": {"/": provider},
@@ -1133,7 +1324,7 @@ def build_app(cfg: Config, resolver: Resolver, stager, fetcher):
     }
     dav_app = WsgiDAVApp(dav_config)
     guarded = WriteGuard(dav_app, cfg.game_folder)
-    return Dispatcher(guarded, RpcApp(cfg, resolver, fetcher, stager))
+    return Dispatcher(guarded, RpcApp(cfg, resolver, fetcher, stager, upload_stager))
 
 
 def main(argv=None) -> int:
@@ -1152,12 +1343,13 @@ def main(argv=None) -> int:
         level=getattr(logging, cfg.log_level, logging.INFO),
         format="%(asctime)s %(levelname)-7s %(name)-10s %(message)s",
     )
-    for path in (cfg.cache_dir, cfg.staging_dir, cfg.pack_dir, cfg.local_dir):
+    for path in (cfg.cache_dir, cfg.staging_dir, cfg.pack_dir, cfg.local_dir, cfg.upload_dir):
         path.mkdir(parents=True, exist_ok=True)
 
     # Imported here so `python bridge.py --help` works without Telethon present.
     from fetchlocal import LocalFetcher
     from gamestage import GameStager
+    from uploadstage import UploadStager
     from warmup import BackgroundWarmup
 
     worker = TelegramWorker(
@@ -1170,8 +1362,11 @@ def main(argv=None) -> int:
     resolver = Resolver(cfg, api, worker)
     stager = GameStager(cfg, api, worker)
     resolver.stager = stager
+    upload_stager = UploadStager(cfg, api, worker)
+    resolver.upload_stager = upload_stager
     fetcher = LocalFetcher(cfg, resolver)
     stager.start()
+    upload_stager.start()
 
     # The tree is warmed from in here rather than by running warmup.py on a
     # schedule: this process already holds the Telegram connection and knows
@@ -1181,7 +1376,7 @@ def main(argv=None) -> int:
         warmer = BackgroundWarmup(resolver, interval_minutes=cfg.warmup_interval_minutes)
         warmer.start()
 
-    app = build_app(cfg, resolver, stager, fetcher)
+    app = build_app(cfg, resolver, stager, fetcher, upload_stager)
 
     from cheroot import wsgi
 
@@ -1211,6 +1406,7 @@ def main(argv=None) -> int:
         if warmer is not None:
             warmer.stop()
         stager.stop()
+        upload_stager.stop()
         worker.stop()
     return 0
 

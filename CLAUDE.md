@@ -26,7 +26,8 @@ bridge 只用現有 public API，沒有為它新增任何會讀寫二進位資�
 | `tgio.py` | split 位移數學、Telethon worker（背景 event loop）、連線池、`SeekableRemoteFile`、分段上傳、縮圖與 media attributes |
 | `tgupload.py` | `/game` 大檔案的並行分 part 上傳：自算 part index、`UploadGate`（window+rate 的 AIMD 節流）、繞過 `client._call` 直送 `SaveBigFilePart` |
 | `zipfs.py` | 讀 zip central directory → 虛擬目錄樹；單一 entry 的 range 讀取 |
-| `gamestage.py` | `/game` staging + debounce 打包（`ZIP_STORED`）+ 上傳 + 去重 + 清理 |
+| `gamestage.py` | `/game` staging + debounce 打包（`ZIP_STORED`）+ 上傳 + 去重 + 清理；`upload_and_register` 給 `uploadstage.py` 共用 |
+| `uploadstage.py` | `/game` 以外任意路徑的一般檔案寫入：落地 + debounce（無打包，單位是單一檔案）+ 上傳 + 去重 + 註冊到寫入時解析到的真實 parent |
 | `fetchlocal.py` | 「儲存在本地」：伺服端複製邏輯 + 右鍵 verb 用的進度顯示 CLI |
 | `warmup.py` | 走遍整棵樹批次填滿縮圖與屬性快取、跑 Windows 縮圖快取，可續跑；`BackgroundWarmup` 讓 bridge 自己跑 |
 | `install_menu.py` | 註冊/移除 Explorer 右鍵 verb |
@@ -35,10 +36,39 @@ bridge 只用現有 public API，沒有為它新增任何會讀寫二進位資�
 | `config.py` | 讀 `config.ini`，空值回退環境變數，再回退 `env_file`；由單一 `cache_dir` 推導所有路徑 |
 | `start.bat` | 啟動 bridge + `rclone mount` |
 
-`config.ini` 只有 `cache_dir` 一個路徑設定，底下的 `meta/` `rclone/` `local/` `staging/`
+`config.ini` 只有 `cache_dir` 一個路徑設定，底下的 `meta/` `rclone/` `local/` `staging/` `uploads/`
 是程式的實作細節而非設定 —— 先前四個獨立路徑設定的結果就是它們各自漂移，
 使用者以為改了一個地方其實只改到四分之一。`start.bat` 也是問 `config.py` 要路徑，
 不自己寫死。
+
+### 一般路徑的寫入（`uploadstage.py`）
+
+`/game` 以外，`H:` 上任何資料夾都能建立子資料夾、PUT 新檔、覆寫既有檔案、刪除還沒上傳的檔案。
+`WriteGuard`（`bridge.py`）對 `MKCOL`、`PUT`、`DELETE` 全域放行，理由是這三個動詞
+各自不需要 `/game` 的打包步驟——`DELETE` 甚至不是靠一個 backend 端點放行，而是完全
+不需要看路徑：
+
+- **`MKCOL`** 直接打 `POST /folders`（`RootCollection.create_collection`），
+  沒有落地、沒有 debounce，是即時的真實寫入。
+- **`PUT`** 落地到 `uploads/`，debounce 之後走跟 `/game` 一模一樣的
+  上傳＋去重＋註冊（`gamestage.upload_and_register`，`uploadstage.py` 只補
+  「落地/debounce」那一半），差別只在兩點：單位永遠是單一檔案（資料夾是真的，
+  從不落地打包），以及 parent 是寫入當下解析到的真實資料夾，不是固定的 `/game`。
+  覆寫既有檔案也走這條路（`RemoteFileResource.begin_write`）——backend 沒有
+  `UNIQUE(filename, parent_id)`，所以覆寫就是用新內容再註冊一筆同名 row，
+  新舊都在、讀取時新的蓋掉舊的（既有的「同名檔案」規則，見「已知限制」第 5 點）。
+- **`DELETE`** 能不能做，看的是「這個名字現在解析到的是本機還沒上傳的暫存，
+  還是 backend 已經註冊過的真實資料」，跟在不在 `/game` 底下無關——`/game` 跟
+  一般路徑的差別只在上傳前有沒有先打包成 zip，不是刪除能力本身的分界。
+  `UploadFileResource.delete()`（一般路徑）跟 `StagingFileResource`/`StagingCollection.delete()`
+  （`/game`）都只是把本機暫存檔案／目錄刪掉，取消這次還沒發生的上傳；一旦真的
+  上傳註冊過，兩邊都靠 `_ReadOnlyFile.delete()` / `_ReadOnlyCollection.handle_delete()`
+  統一回 403——backend 沒有刪除端點，這點不因路徑而異。
+
+沒有做的是縮圖與 album 分組——那些是網頁上傳流程專屬的功能，這裡沒有重做；
+去重（`check_hash`，跟網頁同一套指紋）則是共用的，照樣套用。
+`/rpc/status` 的 `uploads` 欄位回報目前 debounce 中的一般寫入，跟 `/game`
+的 `units` 分開列。
 
 ## 效能：這整個專案真正的難題
 
@@ -272,7 +302,7 @@ shell 是在 `IShellItemImageFactory::GetImage` 裡、在 `IThumbnailProvider` �
 | `tests/test_sizes.py` | `filesize` 灌水的裁切（`_hash_size` / `_clip_parts` / `total_size`）、`JsonStore` 並行合併 |
 | `tests/test_upload_pace.py` | `tgupload.UploadGate`：distinct-event guard、window/rate 的 AIMD、rate cap 從量測值算出且爬回不再綁得住時拆掉、注入假時鐘 |
 | `tests/test_upload_parts.py` | `plan_parts`、`_PartReader` 的隨機讀取、`send_part` 的 flood/斷線重試（繞過 `client._call`）、`upload_file_parts` 的 segment-relative index、bytes↔offset、永久失敗時取消手足 task |
-| `tests/test_bridge_e2e.py` | 真的用 HTTP 跑整個 bridge（PROPFIND / GET / Range / 403 / MKCOL+PUT → 打包 → 上傳 → 再瀏覽 / `/rpc/*` / fetch-local / warmup sweep 的續跑與禮讓 / split part 的精確大小非灌水），只有 MTProto 與 backend 是假的 |
+| `tests/test_bridge_e2e.py` | 真的用 HTTP 跑整個 bridge（PROPFIND / GET / Range / 403 / MKCOL+PUT → 打包 → 上傳 → 再瀏覽 / `/rpc/*` / fetch-local / warmup sweep 的續跑與禮讓 / split part 的精確大小非灌水 / 一般路徑的 MKCOL、PUT 新檔、覆寫、去重、`/rpc/status` 的 `uploads` 欄位 / DELETE 在 `/game` 與一般路徑對「還在暫存」一致放行、對「已上傳」一致 403 且不因遞迴列出整棵樹而 500），只有 MTProto 與 backend 是假的 |
 
 掛載後仍需手動走一遍（測試無法代替）：
 
@@ -283,8 +313,10 @@ shell 是在 `IShellItemImageFactory::GetImage` 裡、在 `IThumbnailProvider` �
 4. 對虛擬 zip 資料夾右鍵取回 → 解壓後遊戲能執行
 5. 快取到 `--vfs-cache-max-size` 上限時淘汰正常
 6. 瀏覽器開網頁確認 `/game` 上傳的 zip 顯示、下載正常
+7. `/game` 以外的資料夾建立子資料夾、丟一個檔案進去，debounce 到期後網頁能看到、下載內容正確；
+   同名再丟一次，確認覆寫後讀到的是新內容
 
-**`/game` 上傳路徑從未對真實 TeleDrive 跑過** —— 它有副作用，測試環境只用假 backend。
+**`/game` 與一般路徑的上傳都從未對真實 TeleDrive 跑過** —— 兩者都有副作用，測試環境只用假 backend。
 
 ## 已知限制
 
@@ -302,7 +334,16 @@ shell 是在 `IShellItemImageFactory::GetImage` 裡、在 `IThumbnailProvider` �
 
 ## 明確不做
 
-- 一般檔案的 PUT / 覆寫 / 版本回收（照片影片上傳走網頁，那邊有縮圖、去重、album 分組）
+- **一般檔案的縮圖與 album 分組**：PUT/覆寫本身已支援（見「一般路徑的寫入」一節），
+  但那是網頁上傳流程專屬的加工，這裡沒有重做。去重是共用的，不算例外。
+- **版本回收**：backend 沒有這個概念，覆寫就是新增一筆同名 row，舊的還在只是被蓋掉
+  （已知限制第 5 點），不是真的版本歷史。
+- **`MOVE`/`COPY`/`PROPPATCH`/`LOCK` 限定在 `/game/<name>/...`**：
+  這些動詞在 `/game` 以外沒有對得到的 backend 端點（沒有真正的改名），也沒有
+  `DELETE` 那種「本機暫存 vs. 已上傳」的乾淨分界可以套——連還在 staging 的一般
+  路徑寫入也沒有搬移原語（`upload_stager` 不像 `gamestage.GameStager` 有
+  `move()`）。`WriteGuard`（`bridge.py`）放行 `MKCOL`（`POST /folders`）、`PUT`、
+  `DELETE`（見「一般路徑的寫入」），其餘維持 403。
 - **block 級部分更改**：WebDAV 只有整檔 PUT，rclone 也是整檔重傳。真要做得改用 WinFsp
   （`winfspy`）自己實作檔案系統才會收到 `write(offset, len)`；儲存端不用改
   （`split_group_id` + `part_index` 已是 block 結構），但整個 bridge 幾乎重做。

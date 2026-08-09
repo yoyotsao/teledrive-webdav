@@ -369,82 +369,99 @@ class GameStager:
     # -- uploading -------------------------------------------------------- #
 
     def _upload_and_register(self, archive: Path, upload_name: str) -> None:
-        size = archive.stat().st_size
-        if size == 0:
-            # Telegram rejects a 0-part file with an opaque RPC error; fail
-            # fast and readably instead of reaching that path.
-            raise ValueError(f"{upload_name} is empty (0 bytes) — nothing to upload")
         game = self.api.ensure_folder(self.cfg.game_folder)
-        file_hash = sample_hash(archive)
+        upload_and_register(self.api, self.worker, archive, upload_name, game.file_id, ZIP_MIME)
 
-        existing = self._lookup_duplicate(file_hash)
-        if existing:
-            log.info("%s already on Telegram (%s parts) — registering without uploading", upload_name, len(existing))
-            parts = existing
-        else:
-            parts = self._upload_segments(archive, size, upload_name)
 
-        split_group_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:7]}"
-        total = len(parts)
-        for index, part in enumerate(parts):
-            self.api.register(
-                filename=upload_name,
-                filesize=part["filesize"],
-                message_id=part["message_id"],
-                file_id=part.get("file_id") or f"{split_group_id}-{index}",
-                access_hash=part.get("access_hash"),
-                mime_type=ZIP_MIME,
-                parent_id=game.file_id,
-                is_split_file=total > 1,
-                original_name=upload_name,
-                part_index=index,
-                total_parts=total,
-                split_group_id=split_group_id,
-                file_hash=file_hash,
-            )
-        self.api.invalidate(game.file_id)
+# -- uploading (shared with uploadstage.py's generic, non-/game writes) --- #
 
-    def _lookup_duplicate(self, file_hash: str) -> List[dict]:
+
+def upload_and_register(
+    api, worker, archive: Path, upload_name: str, parent_id: Optional[str], mime_type: str
+) -> None:
+    """Upload one already-local file to Telegram and register it in TeleDrive.
+
+    Dedups against ``check_hash`` first, same fingerprint the browser uses, so
+    content already on Telegram is registered without a second upload.
+    """
+    size = archive.stat().st_size
+    if size == 0:
+        # Telegram rejects a 0-part file with an opaque RPC error; fail
+        # fast and readably instead of reaching that path.
+        raise ValueError(f"{upload_name} is empty (0 bytes) — nothing to upload")
+    file_hash = sample_hash(archive)
+
+    existing = _lookup_duplicate(api, file_hash)
+    if existing:
+        log.info("%s already on Telegram (%s parts) — registering without uploading", upload_name, len(existing))
+        parts = existing
+    else:
+        parts = _upload_segments(worker, archive, size, upload_name)
+
+    split_group_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:7]}"
+    total = len(parts)
+    for index, part in enumerate(parts):
+        api.register(
+            filename=upload_name,
+            filesize=part["filesize"],
+            message_id=part["message_id"],
+            file_id=part.get("file_id") or f"{split_group_id}-{index}",
+            access_hash=part.get("access_hash"),
+            mime_type=mime_type,
+            parent_id=parent_id,
+            is_split_file=total > 1,
+            original_name=upload_name,
+            part_index=index,
+            total_parts=total,
+            split_group_id=split_group_id,
+            file_hash=file_hash,
+        )
+    api.invalidate(parent_id)
+
+
+def _lookup_duplicate(api, file_hash: str) -> List[dict]:
+    try:
+        result = api.check_hash(file_hash)
+    except Exception as exc:
+        log.warning("dedup check failed (%s) — uploading anyway", exc)
+        return []
+    if not result or not result.get("found"):
+        return []
+    return canonical_existing_parts(result.get("files") or [])
+
+
+def _upload_segments(worker, archive: Path, size: int, upload_name: str) -> List[dict]:
+    segments = plan_segments(size, SEGMENT_SIZE)
+    parts: List[dict] = []
+    for index, (offset, seg_size) in enumerate(segments):
+        name = upload_name if len(segments) == 1 else f"{upload_name}.part{index + 1}"
+        log.info(
+            "uploading %s (%s/%s, %.1f MiB)", name, index + 1, len(segments), seg_size / 2**20
+        )
+        reader = SegmentReader(_ext(archive), offset, seg_size)
         try:
-            result = self.api.check_hash(file_hash)
-        except Exception as exc:
-            log.warning("dedup check failed (%s) — uploading anyway", exc)
-            return []
-        if not result or not result.get("found"):
-            return []
-        return canonical_existing_parts(result.get("files") or [])
+            result = _upload_one_segment(worker, reader, seg_size, name)
+        finally:
+            reader.close()
+        parts.append({**result, "filesize": result["size"]})
+    return parts
 
-    def _upload_segments(self, archive: Path, size: int, upload_name: str) -> List[dict]:
-        segments = plan_segments(size, SEGMENT_SIZE)
-        parts: List[dict] = []
-        for index, (offset, seg_size) in enumerate(segments):
-            name = upload_name if len(segments) == 1 else f"{upload_name}.part{index + 1}"
-            log.info(
-                "uploading %s (%s/%s, %.1f MiB)", name, index + 1, len(segments), seg_size / 2**20
+
+def _upload_one_segment(worker, reader: SegmentReader, seg_size: int, name: str) -> dict:
+    for attempt in range(SEGMENT_RETRIES + 1):
+        try:
+            return worker.upload_segment(
+                reader, seg_size, name, progress=_progress_logger(name, seg_size)
             )
-            reader = SegmentReader(_ext(archive), offset, seg_size)
-            try:
-                result = self._upload_one_segment(reader, seg_size, name)
-            finally:
-                reader.close()
-            parts.append({**result, "filesize": result["size"]})
-        return parts
-
-    def _upload_one_segment(self, reader: SegmentReader, seg_size: int, name: str) -> dict:
-        for attempt in range(SEGMENT_RETRIES + 1):
-            try:
-                return self.worker.upload_segment(
-                    reader, seg_size, name, progress=_progress_logger(name, seg_size)
-                )
-            except Exception:
-                if attempt >= SEGMENT_RETRIES:
-                    raise
-                log.warning(
-                    "segment %s failed (attempt %s/%s) — retrying in %ss",
-                    name, attempt + 1, SEGMENT_RETRIES + 1, SEGMENT_RETRY_SECONDS,
-                )
-                reader.seek(0)
-                time.sleep(SEGMENT_RETRY_SECONDS)
+        except Exception:
+            if attempt >= SEGMENT_RETRIES:
+                raise
+            log.warning(
+                "segment %s failed (attempt %s/%s) — retrying in %ss",
+                name, attempt + 1, SEGMENT_RETRIES + 1, SEGMENT_RETRY_SECONDS,
+            )
+            reader.seek(0)
+            time.sleep(SEGMENT_RETRY_SECONDS)
 
 
 def _progress_logger(name: str, total: int):
