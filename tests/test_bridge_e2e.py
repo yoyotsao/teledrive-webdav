@@ -923,6 +923,35 @@ def test_delete_pending_general_upload_is_allowed(rig):
     assert not any(r["filename"] == "pending.bin" for r in rig.backend.rows)
 
 
+def test_copy_pending_general_upload_creates_an_independent_second_file(rig):
+    rig.request("PUT", "/photos/pending.bin", data=b"waiting")
+
+    resp = rig.request(
+        "COPY", "/photos/pending.bin", headers={"Destination": rig.base + "/photos/pending2.bin"}
+    )
+    assert resp.status_code == 201, resp.status_code
+    assert rig.names("/photos") == ["pending.bin", "pending2.bin", "shot.png", "small.txt"]
+    assert (rig.cfg.upload_dir / "photos" / "pending.bin").read_bytes() == b"waiting"
+    assert (rig.cfg.upload_dir / "photos" / "pending2.bin").read_bytes() == b"waiting"
+
+    # The two uploads are independent: uploading one must not affect the other.
+    _upload_now(rig, "photos", "pending2.bin")
+    assert (rig.cfg.upload_dir / "photos" / "pending.bin").exists()
+    row = next(r for r in rig.backend.rows if r["filename"] == "pending2.bin")
+    photos_id = next(r["file_id"] for r in rig.backend.rows if r["filename"] == "photos")
+    assert row["parent_id"] == photos_id
+
+
+def test_copy_general_pending_upload_across_game_boundary_is_forbidden(rig):
+    rig.request("PUT", "/photos/pending.bin", data=b"waiting")
+
+    resp = rig.request(
+        "COPY", "/photos/pending.bin", headers={"Destination": rig.base + "/game/escaped.bin"}
+    )
+    assert resp.status_code == 403, resp.status_code
+    assert "escaped.bin" not in rig.names("/game")
+
+
 # --------------------------------------------------------------------------- #
 # M4 — RPC plane and fetch-local
 # --------------------------------------------------------------------------- #

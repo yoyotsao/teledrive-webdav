@@ -37,7 +37,7 @@ from wsgidav.dav_provider import DAVCollection, DAVNonCollection, DAVProvider
 from wsgidav.wsgidav_app import WsgiDAVApp
 
 import zipfs
-from config import Config, load_config
+from config import Config, ext_path as _ext, load_config
 from tdapi import ApiError, Entry, JsonStore, TeleDriveClient
 from tgio import REQUEST_SIZE, STREAM_BLOCK_SIZE, SeekableRemoteFile, TelegramWorker
 
@@ -995,8 +995,11 @@ class UploadFileResource(DAVNonCollection):
     rather than a name under a fixed /game/<top> — there is no packing unit
     above single-file granularity here. DELETE is offered (see delete()) since
     it is a purely local undo of a write that has not reached Telegram yet;
-    MOVE is not, since upload_stager has no rename primitive and, like
-    /game, the backend has nothing to rename once the file is registered.
+    likewise COPY (see copy_move_single()) is just a local filesystem copy
+    plus a second independent staged registration, with no backend involved
+    until each copy is uploaded on its own. MOVE is not offered, since
+    upload_stager has no rename primitive and, like /game, the backend has
+    nothing to rename once the file is registered.
     """
 
     def __init__(self, path, environ, upload_stager, local: Path, segments: List[str], parent_id: Optional[str]):
@@ -1052,6 +1055,17 @@ class UploadFileResource(DAVNonCollection):
         self.upload_stager.forget(self.segments)
         self.remove_all_properties(recursive=True)
         self.remove_all_locks(recursive=True)
+
+    def copy_move_single(self, dest_path, *, is_move):
+        if is_move:
+            raise DAVError(HTTP_FORBIDDEN, "no rename primitive for a pending upload")
+        dest_segments = split_dav_path(dest_path)
+        if not dest_segments or dest_segments[0] == self.upload_stager.cfg.game_folder:
+            raise DAVError(HTTP_FORBIDDEN, "cannot copy a pending upload into /game")
+        parent = self.upload_stager.api.resolve(dest_segments[:-1]) if len(dest_segments) > 1 else None
+        parent_id = parent.file_id if parent is not None else None
+        dest_local = self.upload_stager.create_file(dest_segments, parent_id)
+        shutil.copy2(_ext(self.local), _ext(dest_local))
 
     def set_last_modified(self, dest_path, time_stamp, *, dry_run):
         if not dry_run:
