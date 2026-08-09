@@ -682,6 +682,42 @@ def test_api_move_renames_and_reparents(rig):
     assert "renamed.txt" in rig.names("/game")
 
 
+def test_api_duplicate_registers_a_second_row_at_the_same_message(rig):
+    entry = rig.entry_for("photos/small.txt")
+    game = rig.entry_for("game")
+    rig.resolver.api.duplicate(entry, filename="copy.txt", parent_id=game.file_id)
+
+    assert "small.txt" in rig.names("/photos")  # original untouched
+    assert "copy.txt" in rig.names("/game")
+    original_row = next(r for r in rig.backend.rows if r["filename"] == "small.txt")
+    copy_row = next(r for r in rig.backend.rows if r["filename"] == "copy.txt")
+    assert copy_row["file_id"] != original_row["file_id"]
+    assert copy_row["telegram_message_id"] == original_row["telegram_message_id"]
+    assert copy_row["access_hash"] == original_row["access_hash"]
+
+
+def test_api_duplicate_of_a_split_file_copies_every_part(rig):
+    entry = rig.entry_for("movie.mkv")
+    game = rig.entry_for("game")
+    rig.resolver.api.duplicate(entry, filename="movie2.mkv", parent_id=game.file_id)
+
+    assert "movie2.mkv" in rig.names("/game")
+    original_parts = [r for r in rig.backend.rows if r["filename"] == "movie.mkv"]
+    copy_parts = sorted(
+        (r for r in rig.backend.rows if r["filename"] == "movie2.mkv"),
+        key=lambda r: r["part_index"] or 0,
+    )
+    assert len(copy_parts) == len(original_parts)
+    original_by_index = {r["part_index"] or 0: r for r in original_parts}
+    for part in copy_parts:
+        original = original_by_index[part["part_index"] or 0]
+        assert part["telegram_message_id"] == original["telegram_message_id"]
+        assert part["access_hash"] == original["access_hash"]
+        assert part["file_id"] != original["file_id"]
+    assert len({p["split_group_id"] for p in copy_parts}) == 1
+    assert copy_parts[0]["split_group_id"] != original_parts[0]["split_group_id"]
+
+
 # --------------------------------------------------------------------------- #
 # M2 — zip virtual expansion
 # --------------------------------------------------------------------------- #
