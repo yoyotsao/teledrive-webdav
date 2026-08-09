@@ -64,6 +64,13 @@ bridge 只用現有 public API，沒有為它新增任何會讀寫二進位資�
   （`/game`）都只是把本機暫存檔案／目錄刪掉，取消這次還沒發生的上傳；一旦真的
   上傳註冊過，兩邊都靠 `_ReadOnlyFile.delete()` / `_ReadOnlyCollection.handle_delete()`
   統一回 403——backend 沒有刪除端點，這點不因路徑而異。
+- **`COPY`** 跟 `DELETE` 一樣看「還在暫存 vs. 已上傳」，不看路徑：還在暫存的來源
+  （`UploadFileResource`/`StagingFileResource`/`StagingCollection`）真的用
+  `shutil.copy2`／建空目錄複製一份，來源不受影響；已上傳的來源一律 403
+  （`_ReadOnlyFile`/`_ReadOnlyCollection`）。複製目的地一旦跨過 `/game` 邊界
+  （暫存中的一般檔案複製進 `/game`，或反過來）也是 403——那不是同一個 stager，
+  沒有共通的落地邏輯可以套。`MOVE` 維持原樣只在 `/game` 放行：一般路徑的暫存
+  沒有搬移原語（`UploadStager` 沒有 `move()`）。
 
 沒有做的是縮圖與 album 分組——那些是網頁上傳流程專屬的功能，這裡沒有重做；
 去重（`check_hash`，跟網頁同一套指紋）則是共用的，照樣套用。
@@ -302,7 +309,7 @@ shell 是在 `IShellItemImageFactory::GetImage` 裡、在 `IThumbnailProvider` �
 | `tests/test_sizes.py` | `filesize` 灌水的裁切（`_hash_size` / `_clip_parts` / `total_size`）、`JsonStore` 並行合併 |
 | `tests/test_upload_pace.py` | `tgupload.UploadGate`：distinct-event guard、window/rate 的 AIMD、rate cap 從量測值算出且爬回不再綁得住時拆掉、注入假時鐘 |
 | `tests/test_upload_parts.py` | `plan_parts`、`_PartReader` 的隨機讀取、`send_part` 的 flood/斷線重試（繞過 `client._call`）、`upload_file_parts` 的 segment-relative index、bytes↔offset、永久失敗時取消手足 task |
-| `tests/test_bridge_e2e.py` | 真的用 HTTP 跑整個 bridge（PROPFIND / GET / Range / 403 / MKCOL+PUT → 打包 → 上傳 → 再瀏覽 / `/rpc/*` / fetch-local / warmup sweep 的續跑與禮讓 / split part 的精確大小非灌水 / 一般路徑的 MKCOL、PUT 新檔、覆寫、去重、`/rpc/status` 的 `uploads` 欄位 / DELETE 在 `/game` 與一般路徑對「還在暫存」一致放行、對「已上傳」一致 403 且不因遞迴列出整棵樹而 500），只有 MTProto 與 backend 是假的 |
+| `tests/test_bridge_e2e.py` | 真的用 HTTP 跑整個 bridge（PROPFIND / GET / Range / 403 / MKCOL+PUT → 打包 → 上傳 → 再瀏覽 / `/rpc/*` / fetch-local / warmup sweep 的續跑與禮讓 / split part 的精確大小非灌水 / 一般路徑的 MKCOL、PUT 新檔、覆寫、去重、`/rpc/status` 的 `uploads` 欄位 / DELETE 在 `/game` 與一般路徑對「還在暫存」一致放行、對「已上傳」一致 403 且不因遞迴列出整棵樹而 500 / COPY 對已上傳內容一致 403（檔案與資料夾兩種 resource 都不因遞迴列出整棵樹而 500）、對還在暫存的內容（`/game` 與一般路徑）做出真正的本機複製、跨 `/game` 邊界複製一律 403），只有 MTProto 與 backend 是假的 |
 
 掛載後仍需手動走一遍（測試無法代替）：
 
@@ -338,12 +345,12 @@ shell 是在 `IShellItemImageFactory::GetImage` 裡、在 `IThumbnailProvider` �
   但那是網頁上傳流程專屬的加工，這裡沒有重做。去重是共用的，不算例外。
 - **版本回收**：backend 沒有這個概念，覆寫就是新增一筆同名 row，舊的還在只是被蓋掉
   （已知限制第 5 點），不是真的版本歷史。
-- **`MOVE`/`COPY`/`PROPPATCH`/`LOCK` 限定在 `/game/<name>/...`**：
+- **`MOVE`/`PROPPATCH`/`LOCK` 限定在 `/game/<name>/...`**：
   這些動詞在 `/game` 以外沒有對得到的 backend 端點（沒有真正的改名），也沒有
-  `DELETE` 那種「本機暫存 vs. 已上傳」的乾淨分界可以套——連還在 staging 的一般
-  路徑寫入也沒有搬移原語（`upload_stager` 不像 `gamestage.GameStager` 有
-  `move()`）。`WriteGuard`（`bridge.py`）放行 `MKCOL`（`POST /folders`）、`PUT`、
-  `DELETE`（見「一般路徑的寫入」），其餘維持 403。
+  `DELETE`/`COPY` 那種「本機暫存 vs. 已上傳」的乾淨分界可以套——連還在 staging
+  的一般路徑寫入也沒有搬移原語（`upload_stager` 不像 `gamestage.GameStager`
+  有 `move()`）。`WriteGuard`（`bridge.py`）放行 `MKCOL`（`POST /folders`）、
+  `PUT`、`DELETE`、`COPY`（見「一般路徑的寫入」），其餘維持 403。
 - **block 級部分更改**：WebDAV 只有整檔 PUT，rclone 也是整檔重傳。真要做得改用 WinFsp
   （`winfspy`）自己實作檔案系統才會收到 `write(offset, len)`；儲存端不用改
   （`split_group_id` + `part_index` 已是 block 結構），但整個 bridge 幾乎重做。
