@@ -828,6 +828,19 @@ def test_delete_already_packed_game_folder_is_forbidden_not_a_crash(rig):
     assert rig.names("/game") == ["MyGame"]
 
 
+def test_copy_already_packed_game_file_is_forbidden_cleanly(rig):
+    # bin/game.exe lives inside the already-uploaded MyGame.zip (see the rig
+    # fixture) — this exercises ZipFileResource via _ReadOnlyFile, which has
+    # no backend copy endpoint to call.
+    resp = rig.request(
+        "COPY",
+        "/game/MyGame/bin/game.exe",
+        headers={"Destination": rig.base + "/game/MyGame/bin/copy.exe"},
+    )
+    assert resp.status_code == 403, resp.status_code
+    assert rig.names("/game/MyGame/bin") == ["game.exe", "pak0.pak"]
+
+
 def test_delete_pending_general_upload_is_allowed(rig):
     """The same staged-vs-uploaded rule as /game, but outside it (uploadstage.py)."""
     rig.request("PUT", "/photos/pending.bin", data=b"waiting")

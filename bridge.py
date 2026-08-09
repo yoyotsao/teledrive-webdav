@@ -653,6 +653,13 @@ class _ReadOnlyFile(DAVNonCollection):
     def delete(self):
         raise DAVError(HTTP_FORBIDDEN, "already uploaded — TeleDrive has no delete endpoint for this.")
 
+    # Same reasoning as delete() above: DAVNonCollection has no default
+    # copy_move_single() either, so COPY (and MOVE's file-by-file fallback,
+    # since these classes have no support_recursive_move()) of an
+    # already-uploaded file currently 500s instead of 403ing.
+    def copy_move_single(self, dest_path, *, is_move):
+        raise DAVError(HTTP_FORBIDDEN, "already uploaded — TeleDrive has no copy/rename endpoint for this.")
+
 
 class RemoteFileResource(_ReadOnlyFile):
     def __init__(self, path, environ, resolver: Resolver, entry: Entry):
