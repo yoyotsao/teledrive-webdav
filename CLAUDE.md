@@ -338,6 +338,11 @@ shell 是在 `IShellItemImageFactory::GetImage` 裡、在 `IThumbnailProvider` �
 7. **一機一份 bridge**：只有跑 bridge 的那台 PC 能掛磁碟。
 8. **進入未快取資料夾的第一個請求約 11 秒**（路徑解析），之後每張 15ms。
 9. Windows 11 右鍵選單只能出現在「顯示更多選項」（第一層要 MSIX + `IExplorerCommand`）。
+10. **COPY/MOVE 到已打包的 `/game/<name>` 底下不會失敗，會悄悄開一個新的 shadow staging unit**：
+    跟 PUT 不一樣（`ZipDirCollection.create_empty_resource` 會擋下並提示 `PACKED_MESSAGE`），
+    `GameStager.copy()`/`.move()` 只驗證目的地留在 `/game` 底下，不檢查該名字是不是已經打包
+    上傳過——結果是新建一筆同名 staging unit，下一輪 debounce 打包後蓋掉真正的舊封存
+    （見「同名檔案」那條限制）。解法跟 PUT 一樣：改用新名字，或先從網頁刪掉舊的 zip。
 
 ## 明確不做
 

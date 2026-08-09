@@ -654,10 +654,18 @@ class _ReadOnlyFile(DAVNonCollection):
     def delete(self):
         raise DAVError(HTTP_FORBIDDEN, "already uploaded — TeleDrive has no delete endpoint for this.")
 
-    # Same reasoning as delete() above: DAVNonCollection has no default
-    # copy_move_single() either, so COPY (and MOVE's file-by-file fallback,
-    # since these classes have no support_recursive_move()) of an
-    # already-uploaded file currently 500s instead of 403ing.
+    # wsgidav's MOVE handling calls support_recursive_move() on the source
+    # unconditionally, whether or not it is a collection. _DAVResource's
+    # inherited default is `assert self.is_collection; raise
+    # NotImplementedError` — for a file that assertion itself fails, which
+    # do_MOVE does not catch (only DAVError is), so MOVE of an
+    # already-uploaded file 500s before ever reaching copy_move_single()
+    # below. Returning False here is what routes MOVE onto the same
+    # file-by-file fallback COPY already uses; together the two overrides
+    # are what make both verbs 403 cleanly instead of 500ing.
+    def support_recursive_move(self, dest_path):
+        return False
+
     def copy_move_single(self, dest_path, *, is_move):
         raise DAVError(HTTP_FORBIDDEN, "already uploaded — TeleDrive has no copy/rename endpoint for this.")
 
@@ -727,7 +735,11 @@ class _ReadOnlyCollection(DAVCollection):
     # "infinity")) just to reject every member one by one, which for a large
     # game archive means enumerating thousands of zip entries (or backend
     # files) before ever reporting the 403. handle_delete() is checked first
-    # and skips straight past that walk.
+    # and skips straight past that walk. handle_copy()/handle_move() below
+    # exist for the same reason, and arguably need the comment more:
+    # DAVCollection.copy_move_single() already 403s by default too, so
+    # without these overrides the request would still fail correctly — just
+    # after paying for the same wasted subtree walk first.
     def handle_delete(self):
         raise DAVError(HTTP_FORBIDDEN, "already uploaded — TeleDrive has no delete endpoint for this.")
 
@@ -858,8 +870,10 @@ class _StagingCopyMove:
     makes no difference to GameStager.move()/copy() (os.replace and
     shutil.copy2/mkdir already branch on that internally), so the two
     classes need this identical regardless of which one they otherwise
-    subclass. Mixed in first so its methods win the MRO over DAVCollection's
-    own copy_move_single() default.
+    subclass. Mixed in first so its methods win the MRO over the base
+    class's own default — DAVCollection's copy_move_single() for
+    StagingCollection, and DAVNonCollection's inherited _DAVResource default
+    for StagingFileResource (DAVNonCollection has no override of its own).
     """
 
     def support_recursive_move(self, dest_path):
@@ -997,9 +1011,13 @@ class UploadFileResource(DAVNonCollection):
     it is a purely local undo of a write that has not reached Telegram yet;
     likewise COPY (see copy_move_single()) is just a local filesystem copy
     plus a second independent staged registration, with no backend involved
-    until each copy is uploaded on its own. MOVE is not offered, since
-    upload_stager has no rename primitive and, like /game, the backend has
-    nothing to rename once the file is registered.
+    until each copy is uploaded on its own. MOVE never actually reaches this
+    class outside /game: WriteGuard (bridge.py) still path-gates MOVE to
+    /game/<pack-unit>/..., so a MOVE with a general-path source is 403'd
+    before any resource is resolved. The is_move branch in
+    copy_move_single() below is defensive rather than load-bearing — it is
+    not "no rename primitive" that stops the request, it is a request that
+    never arrives.
     """
 
     def __init__(self, path, environ, upload_stager, local: Path, segments: List[str], parent_id: Optional[str]):

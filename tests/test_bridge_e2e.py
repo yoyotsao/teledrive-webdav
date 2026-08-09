@@ -513,6 +513,31 @@ def test_copy_already_uploaded_file_outside_game_is_forbidden(rig):
     assert "copy.txt" not in rig.names("/photos")
 
 
+def test_copy_already_uploaded_folder_outside_game_is_forbidden(rig):
+    # _ReadOnlyCollection.handle_copy() via FolderCollection, not
+    # ZipDirCollection — the only other collection coverage
+    # (test_copy_already_packed_game_folder_does_not_walk_the_archive)
+    # exercises the zip-archive subclass exclusively.
+    resp = rig.request("COPY", "/photos", headers={"Destination": rig.base + "/photos2"})
+    assert resp.status_code == 403, resp.status_code
+    assert "photos2" not in rig.names("/")
+
+
+def test_copy_already_uploaded_file_into_game_staging_is_forbidden(rig):
+    # Mirror image of test_copy_already_uploaded_file_outside_game_is_forbidden:
+    # that test copies already-uploaded content to another already-uploaded
+    # destination. This one crosses into /game staging instead — still the
+    # same _ReadOnlyFile.copy_move_single(), which has no special case for a
+    # staging destination.
+    rig.request("MKCOL", "/game/Temp")
+
+    resp = rig.request(
+        "COPY", "/photos/small.txt", headers={"Destination": rig.base + "/game/Temp/x.txt"}
+    )
+    assert resp.status_code == 403, resp.status_code
+    assert not (rig.cfg.staging_dir / "Temp" / "x.txt").exists()
+
+
 def test_read_only_paths_are_unchanged_after_rejected_deletes(rig):
     rig.request("DELETE", "/photos/small.txt")
     assert rig.names("/photos") == ["shot.png", "small.txt"]
@@ -865,7 +890,29 @@ def test_copy_out_of_game_staging_is_forbidden(rig):
         "COPY", "/game/Temp/a.bin", headers={"Destination": rig.base + "/photos/escaped.bin"}
     )
     assert resp.status_code == 403, resp.status_code
+    # Not just any 403: specifically GameStager.copy()'s game-folder-prefix
+    # guard, distinguishing this from the path_for()-returns-None guard
+    # exercised by test_copy_into_staging_dot_segment_is_forbidden.
+    assert "must stay under /game while staged" in resp.text, resp.text
     assert "escaped.bin" not in rig.names("/photos")
+
+
+def test_copy_into_staging_dot_segment_is_forbidden(rig):
+    # GameStager.copy() has two distinct PermissionError sources: the
+    # game-folder-prefix guard above (dest_segments[0] != game_folder), and
+    # path_for() returning None for an unsafe segment. A dot-prefixed
+    # destination segment *inside* /game exercises the second one — nothing
+    # else in the suite reaches it, since it needs a destination whose parent
+    # already resolves (so wsgidav's own dest-parent check does not 409
+    # first) but whose full path GameStager.path_for() still rejects.
+    rig.request("MKCOL", "/game/Temp")
+    rig.request("PUT", "/game/Temp/a.bin", data=b"junk")
+
+    resp = rig.request(
+        "COPY", "/game/Temp/a.bin", headers={"Destination": rig.base + "/game/Temp/.hidden"}
+    )
+    assert resp.status_code == 403, resp.status_code
+    assert not (rig.cfg.staging_dir / "Temp" / ".hidden").exists()
 
 
 def test_delete_already_packed_game_folder_is_forbidden_not_a_crash(rig):
@@ -886,6 +933,20 @@ def test_copy_already_packed_game_file_is_forbidden_cleanly(rig):
         "COPY",
         "/game/MyGame/bin/game.exe",
         headers={"Destination": rig.base + "/game/MyGame/bin/copy.exe"},
+    )
+    assert resp.status_code == 403, resp.status_code
+    assert rig.names("/game/MyGame/bin") == ["game.exe", "pak0.pak"]
+
+
+def test_move_already_packed_game_file_is_forbidden_cleanly(rig):
+    # wsgidav's MOVE handling calls support_recursive_move() on the source
+    # unconditionally, not just for collections — without _ReadOnlyFile's
+    # override, that hits _DAVResource's `assert self.is_collection` default
+    # and 500s instead of falling through to copy_move_single()'s 403.
+    resp = rig.request(
+        "MOVE",
+        "/game/MyGame/bin/game.exe",
+        headers={"Destination": rig.base + "/game/MyGame/bin/renamed.exe"},
     )
     assert resp.status_code == 403, resp.status_code
     assert rig.names("/game/MyGame/bin") == ["game.exe", "pak0.pak"]
@@ -949,6 +1010,9 @@ def test_copy_general_pending_upload_across_game_boundary_is_forbidden(rig):
         "COPY", "/photos/pending.bin", headers={"Destination": rig.base + "/game/escaped.bin"}
     )
     assert resp.status_code == 403, resp.status_code
+    # Specifically UploadFileResource.copy_move_single()'s /game guard, not
+    # some other 403 (e.g. WriteGuard, which no longer even sees COPY).
+    assert "cannot copy a pending upload into /game" in resp.text, resp.text
     assert "escaped.bin" not in rig.names("/game")
 
 
