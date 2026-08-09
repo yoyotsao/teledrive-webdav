@@ -952,6 +952,16 @@ def test_copy_general_pending_upload_across_game_boundary_is_forbidden(rig):
     assert "escaped.bin" not in rig.names("/game")
 
 
+def test_copy_pending_upload_to_unsafe_destination_segment_is_forbidden(rig):
+    rig.request("PUT", "/photos/pending.bin", data=b"waiting")
+
+    # Destination with a leading-dot segment (.hidden) is unsafe; at root level so parent exists
+    resp = rig.request(
+        "COPY", "/photos/pending.bin", headers={"Destination": rig.base + "/.hidden"}
+    )
+    assert resp.status_code == 403, resp.status_code
+
+
 # --------------------------------------------------------------------------- #
 # M4 — RPC plane and fetch-local
 # --------------------------------------------------------------------------- #

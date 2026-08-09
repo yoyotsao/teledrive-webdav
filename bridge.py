@@ -1062,10 +1062,13 @@ class UploadFileResource(DAVNonCollection):
         dest_segments = split_dav_path(dest_path)
         if not dest_segments or dest_segments[0] == self.upload_stager.cfg.game_folder:
             raise DAVError(HTTP_FORBIDDEN, "cannot copy a pending upload into /game")
-        parent = self.upload_stager.api.resolve(dest_segments[:-1]) if len(dest_segments) > 1 else None
-        parent_id = parent.file_id if parent is not None else None
-        dest_local = self.upload_stager.create_file(dest_segments, parent_id)
-        shutil.copy2(_ext(self.local), _ext(dest_local))
+        try:
+            parent = self.upload_stager.api.resolve(dest_segments[:-1]) if len(dest_segments) > 1 else None
+            parent_id = parent.file_id if parent is not None else None
+            dest_local = self.upload_stager.create_file(dest_segments, parent_id)
+            shutil.copy2(_ext(self.local), _ext(dest_local))
+        except PermissionError as exc:
+            raise DAVError(HTTP_FORBIDDEN, str(exc))
 
     def set_last_modified(self, dest_path, time_stamp, *, dry_run):
         if not dry_run:
