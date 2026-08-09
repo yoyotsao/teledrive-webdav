@@ -187,7 +187,19 @@ class FakeBackend:
             "split_group_id": group,
             "part_index": part_index,
             "file_hash": file_hash,
+            "trashed_at": None,
         }
+
+    def _subtree_ids(self, root_id: str) -> set:
+        ids = {root_id}
+        changed = True
+        while changed:
+            changed = False
+            for r in self.rows:
+                if r["parent_id"] in ids and r["file_id"] not in ids:
+                    ids.add(r["file_id"])
+                    changed = True
+        return ids
 
     # -- endpoint dispatch ------------------------------------------------ #
 
@@ -225,6 +237,20 @@ class FakeBackend:
             row["file_id"] = payload["file_id"]
             self.rows.append(row)
             return row
+        if path.startswith("/files/") and method == "DELETE" and not path.endswith("/purge"):
+            file_id = path.rsplit("/", 1)[1]
+            ids = self._subtree_ids(file_id)
+            stamp = self._stamp()
+            for r in self.rows:
+                if r["file_id"] in ids:
+                    r["trashed_at"] = stamp
+            return {"message": "Moved to trash", "file_id": file_id, "items_trashed": len(ids)}
+        if path.startswith("/files/") and method == "PATCH":
+            file_id = path.rsplit("/", 1)[1]
+            row = next(r for r in self.rows if r["file_id"] == file_id)
+            row["parent_id"] = payload.get("parent_id")
+            row["filename"] = payload.get("filename")
+            return row
         raise AssertionError(f"unexpected API call {method} {path}")
 
     def _list(self, params, want_dir):
@@ -234,6 +260,7 @@ class FakeBackend:
             for r in self.rows
             if bool(r["isDir"]) is want_dir
             and r["parent_id"] == parent
+            and not r.get("trashed_at")
             # Split parts collapse to the primary part, as the real query does.
             and (not r["is_split_file"] or (r["part_index"] or 0) == 0)
         ]
@@ -628,6 +655,31 @@ def test_upload_status_reports_pending_then_clears(rig):
 
     status = rig.request("GET", "/rpc/status").json()
     assert status["uploads"]["pending"] == []
+
+
+def test_api_trash_marks_a_row_and_excludes_it_from_listings(rig):
+    entry = rig.entry_for("photos/small.txt")
+    rig.resolver.api.trash(entry.file_id)
+    assert "small.txt" not in rig.names("/photos")
+    row = next(r for r in rig.backend.rows if r["file_id"] == entry.file_id)
+    assert row["trashed_at"] is not None
+    assert row["filename"] == "small.txt"  # still there, just excluded — a soft delete
+
+
+def test_api_trash_of_a_folder_cascades_to_its_children(rig):
+    photos = rig.entry_for("photos")
+    rig.resolver.api.trash(photos.file_id)
+    assert rig.names("/") == ["game", "movie.mkv"]
+    row = next(r for r in rig.backend.rows if r["filename"] == "small.txt")
+    assert row["trashed_at"] is not None
+
+
+def test_api_move_renames_and_reparents(rig):
+    entry = rig.entry_for("photos/small.txt")
+    game = rig.entry_for("game")
+    rig.resolver.api.move(entry.file_id, parent_id=game.file_id, filename="renamed.txt")
+    assert "small.txt" not in rig.names("/photos")
+    assert "renamed.txt" in rig.names("/game")
 
 
 # --------------------------------------------------------------------------- #

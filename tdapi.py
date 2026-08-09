@@ -448,3 +448,17 @@ class TeleDriveClient:
         data = self._call("POST", "/files/register", payload=payload)
         self.invalidate(parent_id)
         return data
+
+    def trash(self, file_id: str) -> None:
+        """Soft-delete: the backend stamps trashed_at on the whole subtree and
+        keeps every Telegram message untouched. Listings already exclude
+        trashed rows by default, so there is nothing else to filter here.
+        """
+        self._call("DELETE", f"/files/{file_id}")
+        self.invalidate()
+
+    def move(self, file_id: str, *, parent_id: Optional[str], filename: str) -> None:
+        """Rename/reparent in place — children stay attached, they key off
+        this row's stable file_id, never off its name or path."""
+        self._call("PATCH", f"/files/{file_id}", payload={"parent_id": parent_id, "filename": filename})
+        self.invalidate()
