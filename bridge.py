@@ -702,6 +702,24 @@ class RemoteFileResource(_ReadOnlyFile):
     def delete(self):
         self.resolver.api.trash(self.entry.file_id)
 
+    def copy_move_single(self, dest_path, *, is_move):
+        dest_segments = split_dav_path(dest_path)
+        if len(dest_segments) > 1:
+            parent_loc = self.resolver.resolve(dest_segments[:-1])
+            if parent_loc.kind in (STAGE_DIR, STAGE_FILE):
+                raise DAVError(HTTP_FORBIDDEN, "cannot copy/move an already-uploaded file into a staging area")
+            if parent_loc.kind == GAME:
+                parent = self.resolver.api.resolve([self.resolver.cfg.game_folder])
+            elif parent_loc.kind == FOLDER:
+                parent = parent_loc.entry
+            else:
+                parent = None
+        else:
+            parent = None
+        parent_id = parent.file_id if parent is not None else None
+        filename = dest_segments[-1]
+        self.resolver.api.duplicate(self.entry, filename=filename, parent_id=parent_id)
+
 
 class ZipFileResource(_ReadOnlyFile):
     def __init__(self, path, environ, resolver: Resolver, view: zipfs.ZipView, node: zipfs.ZipNode, entry: Entry):

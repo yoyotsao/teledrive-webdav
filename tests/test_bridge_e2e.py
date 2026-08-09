@@ -546,13 +546,36 @@ def test_move_out_of_game_staging_is_forbidden(rig):
     assert "a.bin" in rig.names("/game/Temp")
 
 
-def test_copy_already_uploaded_file_outside_game_is_forbidden(rig):
+def test_move_already_uploaded_file_renames_and_reparents(rig):
     resp = rig.request(
-        "COPY", "/photos/small.txt", headers={"Destination": rig.base + "/photos/copy.txt"}
+        "MOVE", "/photos/small.txt", headers={"Destination": rig.base + "/game/renamed.txt"}
     )
-    assert resp.status_code == 403, resp.status_code
-    assert "already uploaded" in resp.text, resp.text
-    assert "copy.txt" not in rig.names("/photos")
+    assert resp.status_code in (201, 204), resp.status_code
+    assert "small.txt" not in rig.names("/photos")
+    assert "renamed.txt" in rig.names("/game")
+
+
+def test_copy_already_uploaded_file_creates_an_independent_row(rig):
+    resp = rig.request(
+        "COPY", "/photos/small.txt", headers={"Destination": rig.base + "/game/copy.txt"}
+    )
+    assert resp.status_code == 201, resp.status_code
+    assert "small.txt" in rig.names("/photos")  # original untouched
+    assert "copy.txt" in rig.names("/game")
+    assert rig.request("GET", "/game/copy.txt").content == rig.blob_for("photos/small.txt")
+
+
+def test_move_already_uploaded_split_file_preserves_all_parts(rig):
+    # blob_for() must run BEFORE the move: it resolves the path via
+    # entry_for(), which stops working the instant the old path is gone.
+    original_bytes = rig.blob_for("movie.mkv")
+    resp = rig.request(
+        "MOVE", "/movie.mkv", headers={"Destination": rig.base + "/game/movie2.mkv"}
+    )
+    assert resp.status_code in (201, 204), resp.status_code
+    assert "movie.mkv" not in rig.names("/")
+    assert "movie2.mkv" in rig.names("/game")
+    assert rig.request("GET", "/game/movie2.mkv").content == original_bytes
 
 
 def test_copy_already_uploaded_folder_outside_game_is_forbidden(rig):
