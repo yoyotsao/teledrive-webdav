@@ -698,6 +698,9 @@ class RemoteFileResource(_ReadOnlyFile):
             return
         self.resolver.upload_stager.touch(self._upload_segments, self._upload_parent_id)
 
+    def delete(self):
+        self.resolver.api.trash(self.entry.file_id)
+
 
 class ZipFileResource(_ReadOnlyFile):
     def __init__(self, path, environ, resolver: Resolver, view: zipfs.ZipView, node: zipfs.ZipNode, entry: Entry):
@@ -842,6 +845,10 @@ class FolderCollection(RootCollection):
     def __init__(self, path, environ, resolver: Resolver, entry: Entry):
         super().__init__(path, environ, resolver, entry.file_id, entry.mtime)
         self.entry = entry
+
+    def handle_delete(self):
+        self.resolver.api.trash(self.entry.file_id)
+        return True
 
 
 class ZipDirCollection(_ReadOnlyCollection):

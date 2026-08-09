@@ -500,8 +500,6 @@ def test_missing_path_is_404(rig):
 @pytest.mark.parametrize(
     "method,path",
     [
-        ("DELETE", "/photos/small.txt"),
-        ("DELETE", "/movie.mkv"),
         ("PROPPATCH", "/photos/small.txt"),
         ("LOCK", "/photos/small.txt"),
         ("DELETE", "/game"),
@@ -571,8 +569,8 @@ def test_copy_already_uploaded_file_into_game_staging_is_forbidden(rig):
 
 
 def test_read_only_paths_are_unchanged_after_rejected_deletes(rig):
-    rig.request("DELETE", "/photos/small.txt")
-    assert rig.names("/photos") == ["shot.png", "small.txt"]
+    rig.request("DELETE", "/game")
+    assert rig.names("/") == ["game", "movie.mkv", "photos"]
 
 
 # --------------------------------------------------------------------------- #
@@ -1042,6 +1040,22 @@ def test_delete_already_packed_game_folder_is_forbidden_not_a_crash(rig):
     resp = rig.request("DELETE", "/game/MyGame")
     assert resp.status_code == 403
     assert rig.names("/game") == ["MyGame"]
+
+
+def test_delete_already_uploaded_file_really_trashes_it(rig):
+    resp = rig.request("DELETE", "/photos/small.txt")
+    assert resp.status_code == 204, resp.status_code
+    assert "small.txt" not in rig.names("/photos")
+    row = next(r for r in rig.backend.rows if r["filename"] == "small.txt")
+    assert row["trashed_at"] is not None
+
+
+def test_delete_already_uploaded_folder_trashes_the_whole_subtree(rig):
+    resp = rig.request("DELETE", "/photos")
+    assert resp.status_code == 204, resp.status_code
+    assert "photos" not in rig.names("/")
+    row = next(r for r in rig.backend.rows if r["filename"] == "small.txt")
+    assert row["trashed_at"] is not None
 
 
 def test_copy_already_packed_game_file_is_forbidden_cleanly(rig):
