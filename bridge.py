@@ -730,6 +730,12 @@ class _ReadOnlyCollection(DAVCollection):
     def handle_delete(self):
         raise DAVError(HTTP_FORBIDDEN, "already uploaded — TeleDrive has no delete endpoint for this.")
 
+    def handle_copy(self, dest_path, *, depth_infinity):
+        raise DAVError(HTTP_FORBIDDEN, "already uploaded — TeleDrive has no copy/rename endpoint for this.")
+
+    def handle_move(self, dest_path):
+        raise DAVError(HTTP_FORBIDDEN, "already uploaded — TeleDrive has no copy/rename endpoint for this.")
+
 
 class RootCollection(_ReadOnlyCollection):
     def __init__(self, path, environ, resolver: Resolver, parent_id: Optional[str], mtime: float):

@@ -841,6 +841,23 @@ def test_copy_already_packed_game_file_is_forbidden_cleanly(rig):
     assert rig.names("/game/MyGame/bin") == ["game.exe", "pak0.pak"]
 
 
+def test_copy_already_packed_game_folder_does_not_walk_the_archive(rig, monkeypatch):
+    calls = []
+    original = bridge.ZipDirCollection.get_member_names
+
+    def counting(self):
+        calls.append(self.node.zip_name)
+        return original(self)
+
+    monkeypatch.setattr(bridge.ZipDirCollection, "get_member_names", counting)
+
+    resp = rig.request(
+        "COPY", "/game/MyGame", headers={"Destination": rig.base + "/game/MyGame2"}
+    )
+    assert resp.status_code == 403, resp.status_code
+    assert calls == [], f"handle_copy should short-circuit before any member listing, got {calls}"
+
+
 def test_delete_pending_general_upload_is_allowed(rig):
     """The same staged-vs-uploaded rule as /game, but outside it (uploadstage.py)."""
     rig.request("PUT", "/photos/pending.bin", data=b"waiting")
