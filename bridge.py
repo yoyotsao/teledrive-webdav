@@ -45,20 +45,21 @@ log = logging.getLogger("bridge")
 
 # Verbs that mutate. Everything outside /game/<something> gets 403 for these,
 # rather than mounting the whole drive read-only (which would kill /game too).
-# MKCOL, PUT, DELETE and COPY are exempted below (WriteGuard) — none of the
-# four needs /game specifically. MKCOL and PUT map onto real backend endpoints
-# (POST /folders, and the same stage-upload-register pipeline /game uses).
-# DELETE and COPY have no backend endpoint anywhere, /game included, but
-# neither needs /game either: the resources themselves already draw the real
-# line — still-staged writes (StagingFileResource/StagingCollection,
+# MKCOL, PUT, DELETE, COPY and MOVE are exempted below (WriteGuard) — none of
+# the five needs /game specifically. MKCOL and PUT map onto real backend
+# endpoints (POST /folders, and the same stage-upload-register pipeline
+# /game uses). DELETE, COPY and MOVE have real backend endpoints too now
+# (trash, register-reuse, and rename/reparent respectively) but none of them
+# needs /game either: the resources themselves already draw the real line —
+# still-staged writes (StagingFileResource/StagingCollection,
 # UploadFileResource) accept them as local filesystem operations,
-# already-uploaded resources (_ReadOnlyCollection, _ReadOnlyFile) refuse them
+# already-uploaded resources (_ReadOnlyCollection, _ReadOnlyFile,
+# RemoteFileResource, FolderCollection) call the matching backend operation
 # — so gating by path on top would only block the /game case for no reason.
-# MOVE/PROPPATCH/LOCK have no such per-resource distinction (no rename
-# primitive exists even for staged content outside /game) and stay
-# path-gated below.
+# PROPPATCH/LOCK have no such per-resource distinction and stay path-gated
+# below.
 WRITE_METHODS = {"PUT", "DELETE", "MKCOL", "MOVE", "COPY", "PROPPATCH", "LOCK", "UNLOCK"}
-UNGATED_METHODS = {"MKCOL", "PUT", "DELETE", "COPY"}
+UNGATED_METHODS = {"MKCOL", "PUT", "DELETE", "COPY", "MOVE"}
 
 ROOT = "root"
 FOLDER = "folder"
@@ -887,7 +888,10 @@ class _StagingCopyMove:
         return self.stager.path_for(split_dav_path(dest_path)[1:]) is not None
 
     def move_recursive(self, dest_path):
-        self.stager.move(self.local, split_dav_path(dest_path))
+        try:
+            self.stager.move(self.local, split_dav_path(dest_path))
+        except PermissionError as exc:
+            raise DAVError(HTTP_FORBIDDEN, str(exc))
 
     def copy_move_single(self, dest_path, *, is_move):
         try:
@@ -1162,18 +1166,19 @@ def _text_response(start_response, status: str, body: str, content_type="text/pl
 
 
 class WriteGuard:
-    """Reject every mutating verb outside /game/<pack-unit> — except MKCOL, PUT, DELETE and COPY.
+    """Reject every mutating verb outside /game/<pack-unit> — except MKCOL, PUT, DELETE, COPY and MOVE.
 
     MKCOL and PUT map onto a real backend endpoint that needs no packing:
     MKCOL is `POST /folders` (`RootCollection.create_collection`), and PUT is
     the same stage -> upload -> register pipeline /game uses, generalized to
     an arbitrary destination by uploadstage.py instead of a fixed /game
-    folder. DELETE and COPY have no backend endpoint anywhere, but gating them
-    by path would be the wrong axis: the actual line is staged-vs-uploaded, and the
+    folder. DELETE, COPY and MOVE have real backend endpoints too (trash,
+    register-reuse, and rename/reparent respectively) but gating them by path
+    would be the wrong axis: the actual line is staged-vs-uploaded, and the
     resources enforce that themselves (StagingFileResource/UploadFileResource
-    implement them as local undo/copy operations; _ReadOnlyCollection/_ReadOnlyFile
-    refuse them via handle_delete/copy_move_single or the wsgidav default).
-    MOVE, PROPPATCH, LOCK have no such per-resource distinction, so they stay gated.
+    implement them as local undo/copy/move operations; _ReadOnlyCollection/_ReadOnlyFile
+    refuse them via handle_delete/copy_move_single/handle_move or the wsgidav default).
+    PROPPATCH and LOCK have no such per-resource distinction, so they stay gated.
 
     rclone's global --read-only is not usable here because it would also freeze
     /game, so the rule lives on this side of the mount.

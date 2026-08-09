@@ -534,6 +534,18 @@ def test_move_into_a_read_only_path_is_forbidden(rig):
     assert resp.status_code == 403
 
 
+def test_move_out_of_game_staging_is_forbidden(rig):
+    rig.request("MKCOL", "/game/Temp")
+    rig.request("PUT", "/game/Temp/a.bin", data=b"junk")
+
+    resp = rig.request(
+        "MOVE", "/game/Temp/a.bin", headers={"Destination": rig.base + "/photos/escaped.bin"}
+    )
+    assert resp.status_code == 403, resp.status_code
+    assert "escaped.bin" not in rig.names("/photos")
+    assert "a.bin" in rig.names("/game/Temp")
+
+
 def test_copy_already_uploaded_file_outside_game_is_forbidden(rig):
     resp = rig.request(
         "COPY", "/photos/small.txt", headers={"Destination": rig.base + "/photos/copy.txt"}

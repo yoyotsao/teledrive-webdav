@@ -181,6 +181,8 @@ class GameStager:
 
     def move(self, src: Path, dest_segments: Sequence[str]) -> None:
         """Rename inside staging (dest_segments starts with the /game element)."""
+        if not dest_segments or dest_segments[0] != self.cfg.game_folder:
+            raise PermissionError("move destination must stay under /game while staged")
         rest = list(dest_segments)[1:]
         dest = self.path_for(rest)
         if dest is None:
