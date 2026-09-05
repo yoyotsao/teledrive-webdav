@@ -59,6 +59,9 @@ IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"]
 VIDEO_EXTS = [".mp4", ".mkv", ".mov", ".m2ts", ".avi", ".webm", ".wmv", ".ts"]
 EXTENSIONS = IMAGE_EXTS + VIDEO_EXTS
 
+# The property handler is claimed for images only -- see install_props().
+PROP_EXTS = IMAGE_EXTS
+
 
 # --------------------------------------------------------------------------- #
 # registry helpers
@@ -282,6 +285,25 @@ def install_props() -> int:
     per-user view. Settings and the fallback table are written to HKLM as well,
     because the search indexer loads property handlers as a different user and
     would otherwise find neither.
+
+    Images only. Claiming the video types took every video thumbnail on the
+    machine away, mount or not: a video has no thumbnail provider of its own --
+    ``HKCR\.mp4\ShellEx\{e357fccd-...}`` names shell32's Property Thumbnail
+    Handler ``{9DBD2C50-...}``, which pulls System.ThumbnailStream out of the
+    file's *property store*. Redirect that store and the picture is gone. Worse,
+    the shell does not even load this DLL for video extensions -- with logging
+    on, a property probe of a local .mp4 wrote no line at all and came back
+    0x8007000D -- so there was nothing to fix inside the handler either.
+    Measured on one file copied under two names: as .mp4 no thumbnail at all,
+    as .m4v (an extension we never claimed, same {9DBD2C50} provider, Windows'
+    own property handler) a thumbnail in 0.19s.
+
+    Nothing is lost by staying out: the handler was never being loaded for those
+    types, so the mount's videos were not getting their duration and frame size
+    from Telegram either. Images are unaffected because their provider
+    ({C7657C4A-...}) decodes the file itself instead of asking the property
+    store -- which is also why the JPEG header reads this half exists to stop
+    were the image half all along.
     """
     if not DLL.exists():
         print(f"[error] {DLL} is missing. Build it first:")
@@ -309,7 +331,7 @@ def install_props() -> int:
         winreg.SetValueEx(key, "Port", 0, winreg.REG_DWORD, int(port))
 
     claimed = 0
-    for ext in EXTENSIONS:
+    for ext in PROP_EXTS:
         previous = _current_prop_handler(ext)
         if previous:
             for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
@@ -317,18 +339,27 @@ def install_props() -> int:
         _write(winreg.HKEY_LOCAL_MACHINE, rf"{PROP_HANDLERS}\{ext}", PROP_CLSID)
         claimed += 1
 
+    # Hand back anything an older install claimed and this one does not, so a
+    # re-run repairs the machine instead of leaving the damage in place.
+    released = _release_props([e for e in EXTENSIONS if e not in PROP_EXTS])
+    if released:
+        print(f"[ok] released {released} file types an earlier install had claimed")
+
     print(f"[ok] property handler registered for {claimed} file types (machine-wide)")
     print("     previous handlers recorded; files outside the mount are forwarded to them")
     print("     restart Explorer to pick it up: taskkill /f /im explorer.exe && start explorer")
     return 0
 
 
-def uninstall_props() -> int:
-    if not _elevated():
-        print("[error] removing the property handler needs an elevated prompt.")
-        return 1
-    restored = 0
-    for ext in EXTENSIONS:
+def _release_props(exts: List[str]) -> int:
+    """Put back the handler recorded for each of ``exts``, where we still own it.
+
+    Shared by uninstall and by install: an install that claims fewer types than
+    the one before it has to give the difference back, or the extensions dropped
+    from the list keep pointing at this DLL forever.
+    """
+    released = 0
+    for ext in exts:
         mine = _read(winreg.HKEY_LOCAL_MACHINE, rf"{PROP_HANDLERS}\{ext}")
         if not mine or mine.upper() != PROP_CLSID.upper():
             continue
@@ -339,7 +370,15 @@ def uninstall_props() -> int:
             _write(winreg.HKEY_LOCAL_MACHINE, rf"{PROP_HANDLERS}\{ext}", previous)
         else:
             _delete_tree(winreg.HKEY_LOCAL_MACHINE, rf"{PROP_HANDLERS}\{ext}")
-        restored += 1
+        released += 1
+    return released
+
+
+def uninstall_props() -> int:
+    if not _elevated():
+        print("[error] removing the property handler needs an elevated prompt.")
+        return 1
+    restored = _release_props(EXTENSIONS)
     _delete_tree(winreg.HKEY_LOCAL_MACHINE, PROP_FALLBACK_KEY)
     _delete_tree(winreg.HKEY_CURRENT_USER, PROP_FALLBACK_KEY)
     _delete_tree(winreg.HKEY_LOCAL_MACHINE, rf"SOFTWARE\Classes\CLSID\{PROP_CLSID}")

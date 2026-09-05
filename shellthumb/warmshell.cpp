@@ -15,12 +15,22 @@
 //
 // SIIGBF_THUMBNAILONLY matters: without it the shell may hand back a file-type
 // icon without ever consulting a provider, which caches nothing useful.
+//
+// stdout carries the count, once, at the end. Every file is also reported on
+// stderr as it finishes ("+ <ms> <path>" warmed, "- <ms> <path>" not), flushed
+// per line, because the interesting runs are the ones that never reach the end:
+// the caller kills a batch that overruns its budget, and without the per-file
+// lines a killed batch says nothing at all — not how many it warmed, not which
+// path it was still holding. That is exactly the state this warm-up was in for
+// weeks (every batch killed at 600s, "0 warmed", no idea why).
 
 #include <windows.h>
 #include <shlwapi.h>
 #include <shobjidl.h>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -37,6 +47,25 @@ static std::wstring Widen(const std::string& utf8) {
     std::wstring out(need, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), &out[0], need);
     return out;
+}
+
+static std::string Narrow(const std::wstring& wide) {
+    if (wide.empty())
+        return std::string();
+    int need = WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
+    std::string out(need, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()), &out[0], need, nullptr, nullptr);
+    return out;
+}
+
+// UTF-8 through the narrow stderr, not wide: fwprintf converts to the console
+// codepage on the way out, which mangles every non-ASCII path — and those are
+// most of them here. The reader decodes UTF-8.
+static void Report(bool ok, long long ms, const std::wstring& path) {
+    static std::mutex lock;
+    std::lock_guard<std::mutex> guard(lock);
+    fprintf(stderr, "%c %lld %s\n", ok ? '+' : '-', ms, Narrow(path).c_str());
+    fflush(stderr);
 }
 
 static bool WarmOne(const std::wstring& path, int px) {
@@ -90,7 +119,12 @@ int wmain(int argc, wchar_t** argv) {
                 const size_t at = next.fetch_add(1);
                 if (at >= files.size())
                     break;
-                if (WarmOne(files[at], px))
+                const auto started = std::chrono::steady_clock::now();
+                const bool ok = WarmOne(files[at], px);
+                const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - started).count();
+                Report(ok, ms, files[at]);
+                if (ok)
                     warmed.fetch_add(1);
             }
             CoUninitialize();

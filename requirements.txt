@@ -6,3 +6,9 @@ telethon>=1.40
 # the wheel lifts a single connection to several MiB/s. Not optional in practice.
 cryptg>=0.4
 requests>=2.31
+
+# Decodes the images this bridge uploads, to build the preview and dimensions
+# Telegram will not infer for a force_document upload. Without it uploads still
+# work, they just arrive with no thumbnail -- which sends Explorer off to read
+# every whole file to draw an icon (see the upload-preview note in CLAUDE.md).
+Pillow>=10.0

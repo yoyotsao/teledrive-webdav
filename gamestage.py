@@ -16,10 +16,12 @@ user who already packed their own archive should not get it double-wrapped.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
 import os
 import shutil
+import tempfile
 import threading
 import time
 import uuid
@@ -29,7 +31,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from config import ext_path as _ext
-from tgio import SEGMENT_SIZE, SegmentReader, plan_segments
+from tgio import SEGMENT_SIZE, SegmentReader, make_preview, plan_segments
 
 log = logging.getLogger("gamestage")
 
@@ -87,6 +89,9 @@ def canonical_existing_parts(rows: Sequence[dict]) -> List[dict]:
             "message_id": row.get("telegram_message_id"),
             "access_hash": row.get("access_hash"),
             "part_index": index,
+            # Dedup reuses the very same Telegram message, so whatever it has
+            # is what the new row has.
+            "has_thumbnail": bool(row.get("has_thumbnail")),
         }
 
     single = next(
@@ -418,7 +423,7 @@ def upload_and_register(
         log.info("%s already on Telegram (%s parts) — registering without uploading", upload_name, len(existing))
         parts = existing
     else:
-        parts = _upload_segments(worker, archive, size, upload_name)
+        parts = _upload_segments(worker, archive, size, upload_name, mime_type)
 
     split_group_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:7]}"
     total = len(parts)
@@ -437,6 +442,7 @@ def upload_and_register(
             total_parts=total,
             split_group_id=split_group_id,
             file_hash=file_hash,
+            has_thumbnail=bool(part.get("has_thumbnail")),
         )
     api.invalidate(parent_id)
 
@@ -452,28 +458,66 @@ def _lookup_duplicate(api, file_hash: str) -> List[dict]:
     return canonical_existing_parts(result.get("files") or [])
 
 
-def _upload_segments(worker, archive: Path, size: int, upload_name: str) -> List[dict]:
+def _upload_segments(
+    worker, archive: Path, size: int, upload_name: str, mime_type: str = ""
+) -> List[dict]:
     segments = plan_segments(size, SEGMENT_SIZE)
-    parts: List[dict] = []
-    for index, (offset, seg_size) in enumerate(segments):
-        name = upload_name if len(segments) == 1 else f"{upload_name}.part{index + 1}"
-        log.info(
-            "uploading %s (%s/%s, %.1f MiB)", name, index + 1, len(segments), seg_size / 2**20
-        )
-        reader = SegmentReader(_ext(archive), offset, seg_size)
+    # Only a whole still image gets a preview. One part of a split file is not
+    # an image, and neither is a /game zip.
+    single_image = len(segments) == 1 and mime_type.startswith("image/")
+    with _preview_file(archive if single_image else None) as preview:
+        parts: List[dict] = []
+        for index, (offset, seg_size) in enumerate(segments):
+            name = upload_name if len(segments) == 1 else f"{upload_name}.part{index + 1}"
+            log.info(
+                "uploading %s (%s/%s, %.1f MiB)", name, index + 1, len(segments), seg_size / 2**20
+            )
+            reader = SegmentReader(_ext(archive), offset, seg_size)
+            try:
+                result = _upload_one_segment(worker, reader, seg_size, name, preview)
+            finally:
+                reader.close()
+            parts.append(
+                {**result, "filesize": result["size"], "has_thumbnail": preview is not None}
+            )
+        return parts
+
+
+@contextlib.contextmanager
+def _preview_file(image: Optional[Path]):
+    """Yield ``(jpeg_path, width, height)`` for ``image``, or None.
+
+    On disk rather than in memory because Telethon uploads a thumbnail by name
+    and Telegram ignores one that does not look like a ``.jpg`` file. In the
+    system temp directory rather than beside the upload: ``uploads/`` and
+    ``staging/`` are both scanned for work, and a stray file there would be
+    read back as something the user asked to upload.
+    """
+    made = make_preview(image) if image is not None else None
+    if made is None:
+        yield None
+        return
+    data, width, height = made
+    fd, name = tempfile.mkstemp(suffix=".jpg", prefix="tdthumb-")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        log.info("preview for %s: %sx%s, %s bytes", image.name, width, height, len(data))
+        yield Path(name), width, height
+    finally:
         try:
-            result = _upload_one_segment(worker, reader, seg_size, name)
-        finally:
-            reader.close()
-        parts.append({**result, "filesize": result["size"]})
-    return parts
+            os.unlink(name)
+        except OSError:  # pragma: no cover - the upload already succeeded
+            pass
 
 
-def _upload_one_segment(worker, reader: SegmentReader, seg_size: int, name: str) -> dict:
+def _upload_one_segment(
+    worker, reader: SegmentReader, seg_size: int, name: str, preview=None
+) -> dict:
     for attempt in range(SEGMENT_RETRIES + 1):
         try:
             return worker.upload_segment(
-                reader, seg_size, name, progress=_progress_logger(name, seg_size)
+                reader, seg_size, name, progress=_progress_logger(name, seg_size), preview=preview
             )
         except Exception:
             if attempt >= SEGMENT_RETRIES:

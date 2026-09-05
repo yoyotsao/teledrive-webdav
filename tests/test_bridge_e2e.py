@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import bridge  # noqa: E402
 import gamestage  # noqa: E402
+import tgio  # noqa: E402
 from config import Config  # noqa: E402
 from fetchlocal import LocalFetcher  # noqa: E402
 from gamestage import GameStager  # noqa: E402
@@ -88,7 +89,7 @@ class FakeWorker:
         # one with nothing to report answers {} rather than going missing.
         return {m: self.media.get(m, {}) for m in message_ids if m in self.messages}
 
-    def upload_segment(self, stream, size, file_name, progress=None):
+    def upload_segment(self, stream, size, file_name, progress=None, preview=None):
         data = bytearray()
         while len(data) < size:
             chunk = stream.read(min(1 << 16, size - len(data)))
@@ -99,7 +100,15 @@ class FakeWorker:
                 progress(len(data), size)
         assert len(data) == size, f"segment short read: {len(data)} != {size}"
         message_id = self.add_message(bytes(data))
-        self.uploads.append({"name": file_name, "size": size, "message_id": message_id})
+        # Recorded, not ignored: the preview and its dimensions are the only
+        # reason /rpc/thumb and /rpc/props can answer for our own uploads, and
+        # the file it points at is deleted as soon as the upload returns.
+        if preview is not None:
+            assert preview[0].exists() and preview[0].suffix == ".jpg"
+            preview = (preview[0].read_bytes(), preview[1], preview[2])
+        self.uploads.append(
+            {"name": file_name, "size": size, "message_id": message_id, "preview": preview}
+        )
         return {"message_id": message_id, "file_id": f"doc{message_id}", "access_hash": "ah", "size": size}
 
     def stop(self):
@@ -111,6 +120,7 @@ class FakeBackend:
 
     def __init__(self):
         self.rows = []
+        self.dms = []  # (bot_username, nonce) the bridge sent over MTProto
         self._clock = datetime(2026, 7, 30, 12, 0, 0)
 
     # -- row helpers ------------------------------------------------------ #
@@ -193,7 +203,9 @@ class FakeBackend:
 
     def call(self, method, path, params, payload):
         params = params or {}
-        if path == "/auth/login":
+        if path == "/auth/challenge":
+            return {"nonce": "test-nonce", "bot_username": "TestBot", "expires_in": 120}
+        if path == "/auth/verify":
             return {"token": "test-jwt", "user_id": 4242}
         if path == "/folders" and method == "GET":
             return self._list(params, want_dir=True)
@@ -250,11 +262,16 @@ class FakeClient(TeleDriveClient):
         super().__init__(cfg)
         self.backend = backend
 
-    def login(self, force=False):
-        self._token = "test-jwt"
-        return self._token
+    def login(self, force=False, **kw):
+        # Not stubbed out: the real login() runs, so the challenge handshake is
+        # part of what this rig covers. Only the transport below is fake.
+        self.set_dm_sender(lambda username, text: self.backend.dms.append((username, text)))
+        return super().login(force=force, **kw)
 
-    def _call(self, method, path, *, params=None, payload=None, _retry=True):
+    def _post_unauth(self, path, payload, *, waiting_ok=False):
+        return self.backend.call("POST", path, None, payload)
+
+    def _call(self, method, path, *, params=None, payload=None, **kw):
         return self.backend.call(method, path, params, payload)
 
 
@@ -382,6 +399,7 @@ def rig(tmp_path):
     backend.add_file("MyGame.zip", buf.getvalue(), worker, parent_id=game["file_id"], mime="application/zip")
 
     api = FakeClient(cfg, backend)
+    api.login()  # as bridge.main does, and for the same reason: nothing works without it
     resolver = bridge.Resolver(cfg, api, worker)
     stager = GameStager(cfg, api, worker)
     resolver.stager = stager
@@ -404,6 +422,13 @@ def rig(tmp_path):
 # --------------------------------------------------------------------------- #
 # M1 — read-only browsing and reading
 # --------------------------------------------------------------------------- #
+
+
+def test_login_answered_the_bot_challenge(rig):
+    """The backend dropped /auth/login; a JWT now costs one nonce DMed to the
+    bot from this account. Browsing at all proves the handshake ran, but pin the
+    DM too -- a silent fallback here is what took H: down."""
+    assert rig.backend.dms == [("TestBot", "test-nonce")]
 
 
 def test_propfind_root_lists_the_drive(rig):
@@ -583,6 +608,29 @@ def test_put_outside_game_uploads_verbatim_and_registers_at_the_real_parent(rig)
     assert rig.request("GET", "/photos/fresh.bin").content == payload
 
 
+def test_putting_an_image_attaches_a_preview_and_its_dimensions(rig):
+    """The whole path, PUT to send_file, for the one file type H: is full of.
+
+    Without this the upload reaches Telegram as a bare document: doc.thumbs is
+    empty, there are no dimensions, /rpc/thumb answers 404, and the shell
+    handler -- which cannot tell that from a failed fetch -- delegates to the
+    built-in one, which reads the whole image back down to draw an icon.
+    """
+    pil = pytest.importorskip("PIL.Image")
+    buf = io.BytesIO()
+    pil.new("RGB", (1400, 900), (10, 120, 200)).save(buf, "JPEG")
+
+    assert rig.request("PUT", "/photos/shot.jpg", data=buf.getvalue()).status_code == 201
+    _upload_now(rig, "photos", "shot.jpg")
+
+    preview = rig.worker.uploads[-1]["preview"]
+    assert preview is not None
+    data, width, height = preview
+    assert (width, height) == (1400, 900)  # the original's, for /rpc/props
+    assert pil.open(io.BytesIO(data)).format == "JPEG"
+    assert len(data) <= tgio.PREVIEW_MAX_BYTES
+
+
 def test_put_at_drive_root_registers_under_no_parent(rig):
     payload = b"root drop" * 10
     assert rig.request("PUT", "/fresh.bin", data=payload).status_code == 201
@@ -715,6 +763,38 @@ def test_game_accepts_a_folder_and_packs_it(rig):
     assert rig.names("/game") == ["MyGame", "NewGame"]
     assert rig.names("/game/NewGame") == ["data", "run.exe", "空目錄"]
     assert rig.request("GET", "/game/NewGame/data/資料.bin").content == b"\x01\x02" * 900
+
+
+def test_writing_into_a_staged_folder_never_asks_the_backend(rig):
+    """Per-file backend round trips are what made a real copy into the mount crawl.
+
+    Measured on the live mount: bridge answers a 1 MB PUT in 3 ms, yet copying
+    300 small files took 52.6 s against 0.3 s for the same copy onto a local
+    disk. The cost was resolution, not writing — a file that does not exist yet
+    misses the staging check, and the old code then asked the backend twice
+    (game_children, then api.resolve) to confirm a name that a local directory
+    listing already rules out.
+    """
+    assert rig.request("MKCOL", "/game/NewGame").status_code == 201
+    assert rig.request("MKCOL", "/game/NewGame/data").status_code == 201
+
+    seen = []
+    original = rig.backend.call
+
+    def spy(method, path, params, payload):
+        seen.append(f"{method} {path}")
+        return original(method, path, params, payload)
+
+    rig.backend.call = spy
+    try:
+        for i in range(3):
+            assert rig.request("PUT", f"/game/NewGame/data/f{i}.bin", data=b"x" * 1024).status_code == 201
+        # MKCOL of a fresh subdirectory is the same question about a name.
+        assert rig.request("MKCOL", "/game/NewGame/data/more").status_code == 201
+    finally:
+        rig.backend.call = original
+
+    assert seen == [], f"writing under a staged folder must not touch the backend, got {seen}"
 
 
 def test_packed_zip_is_stored_not_deflated(rig):

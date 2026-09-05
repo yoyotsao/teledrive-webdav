@@ -2,8 +2,9 @@
 
 Only metadata crosses this module. Bytes are tgio.py's job.
 
-Endpoint contract (all under /api/v1, all Bearer-authenticated except login):
-    POST /auth/login                  {session_string} -> {token, user_id, ...}
+Endpoint contract (all under /api/v1, all Bearer-authenticated except the challenge):
+    POST /auth/challenge              {} -> {nonce, bot_username, expires_in}
+    POST /auth/verify                 {nonce} -> {token, ...}; 202 while waiting
     GET  /files?parent_id=&page_size=  split parts collapsed to part_index=0
     GET  /folders?parent_id=           folders only (the two listings are disjoint)
     GET  /files/{id}/download          message_id + access_hash
@@ -15,9 +16,12 @@ Endpoint contract (all under /api/v1, all Bearer-authenticated except login):
 
 from __future__ import annotations
 
+import concurrent.futures
+import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -31,6 +35,14 @@ log = logging.getLogger("tdapi")
 
 PAGE_SIZE = 10000
 TIMEOUT = 60
+
+# Bumped whenever the shape stored in meta/dirs/ changes, so an old file is
+# re-listed instead of being read as if it meant the same thing.
+DIR_CACHE_VERSION = 1
+# The backend expires a challenge nonce after 120s (bot_challenge.TTL_SECONDS);
+# give up a shade earlier rather than redeem one it has already pruned.
+CHALLENGE_TTL = 110
+CHALLENGE_POLL = 1.0
 
 
 class ApiError(RuntimeError):
@@ -204,6 +216,7 @@ class TeleDriveClient:
         self.cfg = cfg
         self._session = requests.Session()
         self._token: Optional[str] = None
+        self._dm_sender = None  # set_dm_sender(); the bot challenge needs a Telegram client
         self._auth_lock = threading.Lock()
         self._dir_cache: Dict[Optional[str], Tuple[float, List[Entry]]] = {}
         self._dir_lock = threading.Lock()
@@ -217,44 +230,121 @@ class TeleDriveClient:
 
     # -- auth ------------------------------------------------------------- #
 
-    def login(self, force: bool = False) -> str:
-        """Exchange the Telethon StringSession for a JWT.
+    def _post_unauth(self, path: str, payload: dict, *, waiting_ok: bool = False):
+        """POST without a Bearer token. The challenge handshake is the only
+        thing that runs before there is one -- and the only seam tests replace.
 
-        The backend accepts Telethon StringSessions directly (TeleDrive
-        routes.py:112), so the bridge needs no session format conversion.
+        Returns None for the backend's 202 "keep polling" when `waiting_ok`.
+        """
+        resp = self._session.post(f"{self.cfg.api_base}{path}", json=payload, timeout=TIMEOUT)
+        if waiting_ok and resp.status_code == 202:
+            return None
+        if resp.status_code != 200:
+            raise ApiError(resp.status_code, resp.text[:300])
+        return resp.json()
+
+    def set_dm_sender(self, sender) -> None:
+        """Wire in the Telegram client that will DM the login nonce.
+
+        Kept as an injected callable rather than a TelegramWorker import: this
+        module is the metadata half and has no business connecting to MTProto.
+        """
+        self._dm_sender = sender
+
+    def login(self, force: bool = False, *, _sleep=time.sleep) -> str:
+        """Get a JWT through the backend's bot challenge.
+
+        The old handshake (POST /auth/login with the Telethon StringSession) was
+        removed by TeleDrive's "restore the metadata-only boundary" change --
+        handing a backend an auth_key gives it the whole Telegram account, which
+        is exactly the boundary this bridge exists to keep. What replaced it:
+        ask for a nonce, DM it to the named bot *from the account being
+        authenticated*, and trade the nonce back for a JWT. The proof of
+        identity is the ``from`` on the update the bot receives, so nothing
+        secret crosses the wire.
+
+        That flow is interactive on the web, but not here -- the bridge already
+        holds the user's Telethon client, so it sends its own DM and the whole
+        thing stays headless. The cost is one bot DM per token; JWTs last 24h
+        and survive a restart via token.txt, so that is roughly one a day.
         """
         with self._auth_lock:
             if self._token and not force:
                 return self._token
-            url = f"{self.cfg.api_base}/auth/login"
-            resp = self._session.post(url, json={"session_string": self.cfg.session}, timeout=TIMEOUT)
-            if resp.status_code != 200:
-                raise ApiError(resp.status_code, resp.text[:300])
-            token = resp.json()["token"]
+            if self._dm_sender is None:
+                raise RuntimeError(
+                    "cannot log in: no Telegram client wired in. The backend's bot "
+                    "challenge needs the nonce DMed from the account itself — call "
+                    "set_dm_sender(worker.send_dm) with a started TelegramWorker."
+                )
+
+            challenge = self._post_unauth("/auth/challenge", {})
+            nonce = challenge["nonce"]
+            bot = challenge["bot_username"]
+            deadline = time.monotonic() + min(int(challenge.get("expires_in") or CHALLENGE_TTL), CHALLENGE_TTL)
+
+            # Exact text, no prefix: the backend matches the message body against
+            # its pending nonces (bot_challenge.ingest_updates).
+            self._dm_sender(bot, nonce)
+
+            while True:
+                verified = self._post_unauth("/auth/verify", {"nonce": nonce}, waiting_ok=True)
+                if verified is not None:
+                    break
+                # None = 202: the bot's getUpdates long-poll has not delivered
+                # our DM yet. Anything else already raised.
+                if time.monotonic() >= deadline:
+                    raise ApiError(408, f"login challenge {nonce} was never seen by @{bot}")
+                _sleep(CHALLENGE_POLL)
+
+            token = verified["token"]
             self._token = token
             try:
                 self._token_path.write_text(token, encoding="utf-8")
             except OSError:
                 pass
-            log.info("obtained JWT from %s", self.cfg.base_url)
+            log.info("obtained JWT from %s via @%s", self.cfg.base_url, bot)
             return token
 
-    def _call(self, method: str, path: str, *, params=None, payload=None, _retry=True):
+    def _call(self, method: str, path: str, *, params=None, payload=None,
+              _auth_retry=True, _conn_retry=True):
         token = self._token or self.login()
         url = f"{self.cfg.api_base}{path}"
-        resp = self._session.request(
-            method,
-            url,
-            params=params,
-            json=payload,
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=TIMEOUT,
-        )
-        if resp.status_code == 401 and _retry:
+        try:
+            resp = self._session.request(
+                method,
+                url,
+                params=params,
+                json=payload,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=TIMEOUT,
+            )
+        except requests.exceptions.ConnectionError:
+            # A pooled keep-alive socket the backend had already closed. uvicorn
+            # drops an idle connection after a few seconds, so any gap between
+            # metadata calls leaves one behind and the next request dies before
+            # the server reads a byte — which makes this safe to repeat even for
+            # a POST: nothing reached the app to be applied twice.
+            #
+            # Not cosmetic. This surfaces as a 500 on /rpc/thumb, and a 500 there
+            # is not a slow preview: the DLL cannot tell it from "no thumbnail
+            # exists", delegates to the built-in handler, and that reads the
+            # whole original off Telegram. One dropped socket was measured as a
+            # 6.8 MB sequential download, and a few of those starve the pool into
+            # FLOOD_WAIT — which is what a folder that "just spins" looks like.
+            if not _conn_retry:
+                raise
+            log.info("backend connection dropped on %s %s — retrying once", method, path)
+            # Only the connection budget is spent: a fresh socket that then comes
+            # back 401 still deserves its one re-login.
+            return self._call(method, path, params=params, payload=payload,
+                              _auth_retry=_auth_retry, _conn_retry=False)
+        if resp.status_code == 401 and _auth_retry:
             # Expired or backend-restarted JWT: log in once more, then retry.
             log.info("JWT rejected — re-authenticating")
             self.login(force=True)
-            return self._call(method, path, params=params, payload=payload, _retry=False)
+            return self._call(method, path, params=params, payload=payload,
+                              _auth_retry=False, _conn_retry=_conn_retry)
         if resp.status_code >= 400:
             raise ApiError(resp.status_code, resp.text[:300])
         if not resp.content:
@@ -277,21 +367,108 @@ class TeleDriveClient:
         return rows
 
     def list_dir(self, parent_id: Optional[str], *, fresh: bool = False) -> List[Entry]:
-        """List one folder's children (folders + files), cached for dir_cache_seconds."""
+        """List one folder's children (folders + files), cached for dir_cache_seconds.
+
+        Three layers, because the backend is the slow part and it is meant to be:
+        it is reached over the internet on purpose (so that "bridge here, backend
+        elsewhere" is what gets tested), and one call measured 0.52s steady —
+        0.36-1.2s of that connect plus TLS when the connection is new. Nothing in
+        this file can make a round trip cheaper, so all three layers are about
+        making fewer of them.
+
+        * memory, for the rest of this session
+        * disk (``meta/dirs/``), so the first click after a restart is free —
+          the sweep re-lists the whole tree every pass anyway (with ``fresh``),
+          which is what keeps these files current
+        * the backend, with ``/folders`` and ``/files`` in flight together
+
+        Both caches honour the same ``dir_cache_seconds``: they answer the same
+        question and go stale at the same rate, so a second TTL would be a
+        distinction without a difference. Web-UI changes still need
+        ``/rpc/forget`` (and ``rclone rc vfs/forget``) exactly as before.
+        """
         now = time.monotonic()
+        stamped = time.time()
         if not fresh:
             with self._dir_lock:
                 hit = self._dir_cache.get(parent_id)
             if hit and now - hit[0] < self.cfg.dir_cache_seconds:
                 return hit[1]
+            rows = self._dir_from_disk(parent_id, stamped)
+            if rows is not None:
+                entries = [_to_entry(r) for r in rows]
+                with self._dir_lock:
+                    self._dir_cache[parent_id] = (now, entries)
+                return entries
 
         params = {} if parent_id is None else {"parent_id": parent_id}
-        folders = self._list_paginated("/folders", params)
-        files = self._list_paginated("/files", params)
+        folders, files = self._list_both(params)
         entries = [_to_entry(r) for r in folders] + [_to_entry(r) for r in files]
         with self._dir_lock:
             self._dir_cache[parent_id] = (now, entries)
+        self._dir_to_disk(parent_id, folders + files, stamped)
         return entries
+
+    def _list_both(self, params: dict) -> Tuple[List[dict], List[dict]]:
+        """``/folders`` and ``/files`` at the same time rather than one after the other.
+
+        They are independent GETs against a backend that answers in about half a
+        second, so doing them in sequence is what made every folder click cost
+        1.06s — measured, and independent of how many files the folder holds
+        (2 items and 84 items cost the same), which is how you can tell it is
+        round trips and not volume.
+
+        One extra thread per listing rather than a pool: a pool sized for this
+        would serialise the wsgidav worker threads against each other, and a
+        thread costs microseconds against a half-second call.
+        """
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(self._list_paginated, "/files", params)
+            folders = self._list_paginated("/folders", params)
+            return folders, pending.result()
+
+    # -- the listing cache on disk ---------------------------------------- #
+
+    def _dir_disk_path(self, parent_id: Optional[str]) -> Path:
+        key = parent_id or "__root__"
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", key):
+            key = hashlib.sha1(key.encode("utf-8")).hexdigest()
+        return self.cfg.cache_dir / "dirs" / f"{key}.json"
+
+    def _dir_from_disk(self, parent_id: Optional[str], stamped: float) -> Optional[List[dict]]:
+        """The rows for one folder off disk, or None if missing, old or foreign.
+
+        One file per folder, like ``thumbs/``, not one shared JSON: a listing is
+        the one cached thing here that *changes*, so JsonStore's merge-on-flush
+        (last writer wins, safe only because its values never change) does not
+        apply — and a shared file would mean rewriting megabytes per folder
+        during a sweep of thousands.
+        """
+        try:
+            blob = json.loads(self._dir_disk_path(parent_id).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(blob, dict) or blob.get("v") != DIR_CACHE_VERSION:
+            return None  # written by an older shape: re-list rather than guess
+        try:
+            age = stamped - float(blob.get("at") or 0)
+        except (TypeError, ValueError):
+            return None
+        if age < 0 or age > self.cfg.dir_cache_seconds:
+            return None
+        rows = blob.get("rows")
+        return rows if isinstance(rows, list) else None
+
+    def _dir_to_disk(self, parent_id: Optional[str], rows: List[dict], stamped: float) -> None:
+        path = self._dir_disk_path(parent_id)
+        blob = {"v": DIR_CACHE_VERSION, "at": stamped, "rows": rows}
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(f".{os.getpid()}-{threading.get_ident()}.part")
+            tmp.write_text(json.dumps(blob), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as exc:  # pragma: no cover - the cache is best-effort
+            log.warning("could not cache the listing for %s: %s", parent_id, exc)
 
     def children_by_name(self, parent_id: Optional[str], *, fresh: bool = False) -> Dict[str, Entry]:
         """Name -> entry for one folder.
@@ -332,11 +509,26 @@ class TeleDriveClient:
         return entry
 
     def invalidate(self, parent_id: Optional[str] = "__all__") -> None:
+        """Forget cached listings, in memory *and* on disk.
+
+        Dropping only the memory copy would make ``/rpc/forget`` a no-op that
+        looks like it worked: the very next listing reads back off disk exactly
+        what was just forgotten, and the web-UI upload the person was trying to
+        make visible stays invisible for another hour.
+        """
         with self._dir_lock:
             if parent_id == "__all__":
                 self._dir_cache.clear()
             else:
                 self._dir_cache.pop(parent_id, None)
+        try:
+            if parent_id == "__all__":
+                for path in (self.cfg.cache_dir / "dirs").glob("*.json"):
+                    path.unlink(missing_ok=True)
+            else:
+                self._dir_disk_path(parent_id).unlink(missing_ok=True)
+        except OSError as exc:  # pragma: no cover - best effort
+            log.warning("could not clear the listing cache on disk: %s", exc)
 
     # -- split parts ------------------------------------------------------ #
 
@@ -428,6 +620,7 @@ class TeleDriveClient:
         total_parts: Optional[int] = None,
         split_group_id: Optional[str] = None,
         file_hash: Optional[str] = None,
+        has_thumbnail: bool = False,
     ) -> dict:
         payload = {
             "filename": filename,
@@ -437,7 +630,17 @@ class TeleDriveClient:
             "file_id": file_id,
             "access_hash": access_hash,
             "parent_id": parent_id,
-            "has_thumbnail": False,
+            # The backend's own definition of this field is "a thumbnail is
+            # embedded in the file's own Telegram message", which is exactly
+            # what tgio.make_preview attaches -- and exactly the question
+            # Resolver.thumbs_for asks before it will look for a preview at
+            # all. Hard-coding False meant every upload this bridge made was
+            # registered as having none, so /rpc/thumb never even tried: it
+            # answered 404 in 0.12s off the flag, the shell handler read that
+            # as "no preview", and Explorer went and read the whole image to
+            # draw its icon. Attaching the thumbnail (tgio) and admitting to it
+            # (here) are two separate fixes and both are needed.
+            "has_thumbnail": bool(has_thumbnail),
             "is_split_file": is_split_file,
             "original_name": original_name or filename,
             "part_index": part_index,

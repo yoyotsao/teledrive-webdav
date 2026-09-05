@@ -9,6 +9,13 @@ staging/
 .pytest_cache/
 .superpowers/
 
+# Local AI/tooling state and disposable worktrees
+.claude/worktrees/
+.codex-import/
+
+# Local transfer probe payload
+probe.bin
+
 # Native build output — rebuilt by shellthumb\build.bat
 *.dll
 *.exe

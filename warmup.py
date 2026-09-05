@@ -24,6 +24,7 @@ queueing on the same Telegram client loop, and the caches they write are shared.
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import sys
 import threading
@@ -53,6 +54,15 @@ SHELL_EXE = Path(__file__).resolve().parent / "shellthumb" / "warmshell.exe"
 # whole tree.
 SHELL_BATCH = 25
 SHELL_THREADS = 4
+# Seconds a batch may take before it is killed, per file handed over. Cold, the
+# shell answers about 1.5 files a second on four threads, so this is generous by
+# an order of magnitude and still bounded: the flat 600s it replaces was 24
+# seconds a file, long enough that a wedged mount looked like a slow one.
+# Measured on this machine, every batch for weeks hit that ceiling and reported
+# nothing warmed (87 of them in one log), which cost the sweep ten minutes per
+# hundred files and never put a single entry into thumbcache_*.db — the layer
+# that is worth 274 previews a second.
+SHELL_SECONDS_PER_FILE = 10.0
 # Extensions worth asking for a thumbnail. The same set the head cache uses:
 # these are the files the shell renders and then goes and reads.
 SHELL_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
@@ -73,12 +83,34 @@ DEFAULT_INTERVAL_MINUTES = 360.0
 PROGRESS_EVERY = 60.0
 
 
+
+def _shell_report(stderr: bytes) -> dict:
+    """``{path: warmed?}`` from warmshell's per-file lines.
+
+    The lines are ``+ <ms> <path>`` / ``- <ms> <path>``, UTF-8 and flushed one at
+    a time, so this reads the same whether the process finished or was killed
+    halfway. Anything unparseable is ignored rather than guessed at: a wrong
+    count here would be reported as progress the thumbnail cache never got.
+    """
+    out: dict = {}
+    for line in stderr.decode("utf-8", "replace").splitlines():
+        mark, _, rest = line.partition(" ")
+        if mark not in ("+", "-"):
+            continue
+        _, _, path = rest.partition(" ")
+        path = path.strip()
+        if path:
+            out[path] = mark == "+"
+    return out
+
+
 def walk(
     api: TeleDriveClient,
     parent_id,
     path: str,
     out: List[tuple],
     before: Optional[Callable[[], bool]] = None,
+    fresh: bool = True,
 ) -> None:
     """Collect ``(path, entry)`` for every file under ``parent_id``.
 
@@ -87,12 +119,18 @@ def walk(
     requests — the walk is HTTPS to the backend rather than Telegram, but a few
     thousand listings back to back still slow the path resolution every browse
     depends on — and giving up promptly when the bridge is shutting down.
+
+    ``fresh`` bypasses the listing caches, and defaults to doing so because this
+    walk is the *only* thing that refreshes them. Its whole purpose on a second
+    pass is to notice what was uploaded from the web UI since; reading back the
+    cache it fills would make it blind to exactly that, and would leave the
+    listings on disk (``meta/dirs/``) to expire instead of being renewed.
     """
     if before is not None and before() is False:
         return
-    for entry in api.list_dir(parent_id):
+    for entry in api.list_dir(parent_id, fresh=fresh):
         if entry.is_dir:
-            walk(api, entry.file_id, f"{path}/{entry.name}", out, before)
+            walk(api, entry.file_id, f"{path}/{entry.name}", out, before, fresh)
         elif entry.message_id is not None:
             out.append((f"{path}/{entry.name}", entry))
 
@@ -172,33 +210,97 @@ class Warmer:
         """
         if self.shell_exe is None or not self.shell_exe.exists():
             return 0
+        if not self._mount_ready():
+            return 0
         done = 0
         for at in range(0, len(paths), SHELL_BATCH):
             if not self._yield_():
                 break
             group = paths[at : at + SHELL_BATCH]
-            try:
-                out = subprocess.run(
-                    [str(self.shell_exe), str(SHELL_THREADS), "256"],
-                    input=("\n".join(group) + "\n").encode("utf-8"),
-                    capture_output=True,
-                    timeout=600,
-                )
-            except (OSError, subprocess.SubprocessError) as exc:
-                log.warning("shell warm stopped after %s/%s: %s", done, len(paths), exc)
-                break
-            # What it warmed, not what it was handed. A path that is not on the
-            # mount fails in microseconds, so counting the batch would turn the
-            # fastest possible failure into the best-looking number in the log.
-            try:
-                warmed = int(out.stdout.split()[0])
-            except (IndexError, ValueError):
-                warmed = 0
-            if warmed < len(group):
-                log.warning("shell warm: %s of %s in this batch produced nothing (%s ...)",
-                            len(group) - warmed, len(group), group[0])
+            warmed, wedged = self._warm_group(group)
             done += warmed
+            if wedged:
+                # Whatever wedged this batch — an unmounted drive, a handler that
+                # is not answering, one file the shell will not let go of — is
+                # still true for the next 24 batches. Stopping keeps a broken
+                # shell warm from eating the entire pass, which is how it came to
+                # spend 95% of a sweep's wall clock producing nothing.
+                log.warning("shell warm stopped after %s/%s paths", at + len(group), len(paths))
+                break
         return done
+
+    def _mount_ready(self) -> bool:
+        """Is the drive the shell would be asked about actually there?
+
+        The shell warm is the one warm-up that goes out through rclone, so it is
+        the one that has nothing to do when the mount is not up — and asking
+        anyway is not free: ``SHCreateItemFromParsingName`` on a missing drive
+        fails in microseconds, so 25 files "produced nothing" instantly and the
+        log line reads exactly like a handler that answered badly. Both shapes
+        are in this project's own history (``25 of 25 in this batch produced
+        nothing``, and batches that instead hung until the timeout), and telling
+        them apart afterwards is not possible from the count alone.
+        """
+        drive = getattr(self.resolver.cfg, "mount_drive", "") or ""
+        root = drive if drive.endswith("\\") else drive + "\\"
+        try:
+            if os.path.isdir(root):
+                return True
+        except OSError:
+            pass
+        log.info("shell warm skipped: %s is not mounted", drive or "the mount")
+        return False
+
+    def _warm_group(self, group: List[str]) -> Tuple[int, bool]:
+        """One warmshell run. Returns ``(warmed, wedged)``.
+
+        ``wedged`` means the batch was killed rather than finished, so the
+        caller can stop instead of queueing another one behind the same problem.
+
+        warmshell reports each file on stderr as it finishes, which is what makes
+        a killed batch legible: the count on stdout never arrives, but the lines
+        already flushed say how many were warmed and — by omission — which paths
+        the shell was still holding. Counting from the report rather than from
+        the list handed over also keeps the fastest possible failure (a path that
+        is not on the mount at all) from looking like the best result.
+        """
+        budget = max(60.0, SHELL_SECONDS_PER_FILE * len(group))
+        started = time.monotonic()
+        proc = subprocess.Popen(
+            [str(self.shell_exe), str(SHELL_THREADS), "256"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        payload = ("\n".join(group) + "\n").encode("utf-8")
+        wedged = False
+        try:
+            out, err = proc.communicate(input=payload, timeout=budget)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+            wedged = True
+        except (OSError, subprocess.SubprocessError) as exc:
+            log.warning("shell warm failed to run: %s", exc)
+            return 0, True
+        reported = _shell_report(err)
+        warmed = sum(1 for ok in reported.values() if ok)
+        if not wedged:
+            # stdout is the exe's own count; trust it when the process lived
+            # long enough to print it, and fall back to the per-file lines.
+            try:
+                warmed = int(out.split()[0])
+            except (IndexError, ValueError):
+                pass
+        if wedged:
+            unfinished = [p for p in group if p not in reported]
+            log.warning("shell warm: killed after %.0fs, %s of %s warmed, still open: %s",
+                        time.monotonic() - started, warmed, len(group),
+                        unfinished[0] if unfinished else "nothing")
+        elif warmed < len(group):
+            log.warning("shell warm: %s of %s in this batch produced nothing (%s ...)",
+                        len(group) - warmed, len(group), group[0])
+        return warmed, wedged
 
     def shell_warm(self, files: List[tuple]) -> int:
         """Ask the shell for every thumbnail, so Windows caches them itself.
@@ -347,7 +449,11 @@ def main(argv: List[str]) -> int:
     from bridge import Resolver
 
     cfg = load_config()
+    # Worker first, then login: the bot challenge is answered over MTProto.
+    worker = TelegramWorker(cfg.api_id, cfg.api_hash, cfg.session, cfg.download_connections)
+    worker.start()
     api = TeleDriveClient(cfg)
+    api.set_dm_sender(worker.send_dm)
     api.login()
 
     start_id = None
@@ -363,8 +469,6 @@ def main(argv: List[str]) -> int:
         start_id, base = entry.file_id, "/" + "/".join(parts)
         label = base
 
-    worker = TelegramWorker(cfg.api_id, cfg.api_hash, cfg.session, cfg.download_connections)
-    worker.start()
     resolver = Resolver(cfg, api, worker)
     (cfg.cache_dir / "thumbs").mkdir(parents=True, exist_ok=True)
 

@@ -17,6 +17,7 @@ Three pieces:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import io
 import logging
 import threading
@@ -55,7 +56,31 @@ DOWNLOAD_CONNECTIONS = 8
 
 # One GetFile is enough for any preview: Telegram's stored thumbnails top out
 # well under this. Like every limit it must be 4096-aligned and divide 1 MiB.
+# Cap on a photo preview. A document's `thumbs` are all small, but a photo's
+# `sizes` include near-full-resolution entries, and 2,000 of those per warm-up
+# pass is the whole-file read this module exists to avoid. 64 KB keeps the
+# 240-320px entry Telegram stores beside every photo, which is already at the
+# 256px the shell asks for.
+THUMB_PREVIEW_MAX = 64 * 1024
 THUMB_REQUEST_SIZE = 256 * 1024
+
+# Our own preview, for what this bridge uploads. Telegram keeps a
+# client-supplied document thumbnail only inside tight limits -- Telethon's
+# guidance, matching what the API actually accepts, is a .jpg under 20 kB and
+# 320x320 -- and 320 also covers the cx=256 Explorer asks for.
+PREVIEW_BOX = 320
+PREVIEW_MAX_BYTES = 20 * 1024
+
+# How many preview GetFiles may be in flight at once, across every batch.
+#
+# A folder prefetch slice is THUMB_PREFETCH_SLICE (100) ids and _thumbnails used
+# to gather all of them, so 100 GetFiles left at once over 8 connections. Telegram
+# answers that with FLOOD_WAIT, and these calls go through Telethon's ``_call``,
+# which both sleeps on the flood itself and then arms its per-request-type
+# ``_flood_waited_requests`` gate — so every *other* preview in the batch is
+# failed or delayed by the burst too (same gate described in CLAUDE.md for
+# uploads). Two per connection keeps the pool busy without the burst.
+THUMB_CONCURRENCY = DOWNLOAD_CONNECTIONS * 2
 
 # Read granularity of the block cache inside SeekableRemoteFile. wsgidav asks for
 # small blocks (config block_size) and zipfile asks for tiny ones; both get
@@ -67,7 +92,24 @@ THUMB_REQUEST_SIZE = 256 * 1024
 # read spans in one parallel batch (see _blocks_for), not from making each block
 # bigger, so this stays small without leaving the connection pool idle.
 BLOCK_SIZE = REQUEST_SIZE
-BLOCKS_CACHED = 8
+
+# How many GetFiles one pooled connection may have in flight at a time.
+#
+# The other half of DOWNLOAD_CONNECTIONS, and the cheap half: MTProto multiplexes
+# requests on a connection, so one that is waiting for a reply can already carry
+# the next request. With a single request each, every connection sits idle for a
+# whole round trip between chunks — which is why a streamed read that fills the
+# pool exactly once still leaves most of the link unused. Two per connection is
+# what the preview path has been running at all along (THUMB_CONCURRENCY) without
+# drawing FLOOD_WAIT, and unlike raising the connection count past 8 it does not
+# earn "Server closed the connection".
+READS_IN_FLIGHT = 2
+
+# Enough for one full-width streamed read (see STREAM_BLOCK_SIZE), so the blocks
+# a read just fetched are all still there when the caller comes back for the
+# second half of them. Sized off the read width rather than picked: with fewer,
+# _blocks_for trims the batch it has only just filled.
+BLOCKS_CACHED = DOWNLOAD_CONNECTIONS * READS_IN_FLIGHT
 
 # How much wsgidav pulls per read() while streaming a response body. This is the
 # opposite knob to BLOCK_SIZE and must not be tied to it: the block is the
@@ -77,7 +119,13 @@ BLOCKS_CACHED = 8
 # single connection, and 8 MiB reads got slower even though small ones improved.
 # A Range request is still served with only the bytes it asked for, so a 64 KB
 # probe does not pay this width.
-STREAM_BLOCK_SIZE = REQUEST_SIZE * DOWNLOAD_CONNECTIONS
+#
+# Wide enough for READS_IN_FLIGHT requests on every connection, not just one:
+# _read hands the whole width to the pool in a single gather, so the width is
+# also what decides how many requests are outstanding at once. One per
+# connection left each of them idle for a round trip between chunks — the
+# per-connection depth is the point, and this is where it comes from.
+STREAM_BLOCK_SIZE = REQUEST_SIZE * DOWNLOAD_CONNECTIONS * READS_IN_FLIGHT
 
 # Same split boundary as the browser uploader: MAX_PARTS (1000) x CHUNK_SIZE
 # (512 KB) = 500 MiB, see frontend/src/lib/gramjs.ts:502 and frontend config.ts.
@@ -206,6 +254,7 @@ class TelegramWorker:
         self._rr = 0  # round-robin cursor over the pool, see _next_client
         self._upload = None  # dedicated client for part sends, see _upload_client
         self._gate: Optional[tgupload.UploadGate] = None
+        self._thumb_gate: Optional[asyncio.Semaphore] = None  # see THUMB_CONCURRENCY
 
     # -- lifecycle -------------------------------------------------------- #
 
@@ -321,6 +370,18 @@ class TelegramWorker:
     def user_id(self) -> Optional[int]:
         return getattr(self._me, "id", None)
 
+    def send_dm(self, username: str, text: str) -> None:
+        """DM `text` to a bot as the logged-in user. Used for the backend's
+        login challenge (tdapi.TeleDriveClient.login) -- the nonce has to arrive
+        at the bot *from this account*, because the update's sender is the only
+        proof of identity the backend gets."""
+        self.run(self._send_dm(username, text), timeout=60)
+
+    async def _send_dm(self, username: str, text: str) -> None:
+        # Control connection, not the pool: this is one small message, and the
+        # pool clients share the session only for file transfers.
+        await self._client.send_message(username, text)
+
     # -- documents -------------------------------------------------------- #
 
     def get_document(self, message_id: int, refresh: bool = False):
@@ -350,12 +411,21 @@ class TelegramWorker:
         return doc
 
     async def _fetch_document(self, message_id: int):
+        """The message's media, which is a Document *or* a Photo.
+
+        The browser uploader sends documents, but the backend's chat-media
+        import registers messages lifted straight out of chats and those are
+        MessageMediaPhoto. Rejecting them here used to fail the read, the
+        preview and the properties all at once — see _media_size for why a photo
+        needs its own size arithmetic.
+        """
         # Files live in Saved Messages ("me"), same as the browser uploader.
         messages = await self._client.get_messages("me", ids=[message_id])
         msg = messages[0] if messages else None
-        if msg is None or msg.document is None:
-            raise FileNotFoundError(f"Telegram message {message_id} has no document")
-        return msg.document
+        media = _message_media(msg)
+        if media is None:
+            raise FileNotFoundError(f"Telegram message {message_id} has no document or photo")
+        return media
 
     # -- thumbnails ------------------------------------------------------- #
 
@@ -377,10 +447,18 @@ class TelegramWorker:
         # 30-file listing into 30 round trips.
         await self._prefetch_documents(message_ids)
 
+        # Created here rather than in __init__ so it binds to the client loop,
+        # and shared across batches: a folder prefetch and a foreground request
+        # overlapping must not add up to twice the burst.
+        if self._thumb_gate is None:
+            self._thumb_gate = asyncio.Semaphore(THUMB_CONCURRENCY)
+        gate = self._thumb_gate
+
         async def one(message_id):
             try:
                 doc = await self._document(message_id)
-                return message_id, await self._thumbnail_bytes(doc)
+                async with gate:
+                    return message_id, await self._thumbnail_bytes(doc)
             except Exception as exc:
                 log.warning("thumbnail for message %s failed: %s", message_id, exc)
                 return message_id, None
@@ -434,34 +512,72 @@ class TelegramWorker:
                 return  # per-file lookups below still work, just slower
             with self._docs_lock:
                 for msg in messages or []:
-                    if msg is not None and msg.document is not None:
-                        self._docs[msg.id] = (msg.document, now)
+                    media = _message_media(msg)
+                    if media is not None:
+                        self._docs[msg.id] = (media, now)
 
     async def _thumbnail_bytes(self, doc) -> Optional[bytes]:
         """One preview, fetched over the pool rather than the control client.
 
-        ``download_media`` would run every preview down the single control
+        ``client.download_media`` would run every preview down the single control
         connection, which is the whole reason warming a folder used to crawl: the
         downloads are tiny but there are hundreds of them, and one connection
-        serialises them all. Issued as plain GetFile calls they spread across the
-        pool like ordinary reads do.
+        serialises them all. Issued on a pooled client they spread across the pool
+        like ordinary reads do.
+
+        It has to be ``iter_download`` and not a bare ``GetFileRequest``, and
+        ``dc_id`` has to be passed. A document whose ``dc_id`` is not the
+        session's is answered with FILE_MIGRATE, and ``client._call`` only follows
+        Phone/Network/User migrations (``telethon/client/users.py``); the file case
+        is handled inside ``iter_download``, which borrows an exported sender for
+        the file's DC up front and retries on FILE_MIGRATE
+        (``telethon/client/downloads.py``). A raw call therefore failed *every*
+        preview for documents stored elsewhere — "the file to be accessed is
+        currently stored in DC 1", a whole folder at a time — and the shell
+        handler then fell back to reading whole files, which is the slow path this
+        module exists to avoid. Ordinary reads never showed it because ``_chunk``
+        was already going through ``iter_download``.
         """
         thumb = _best_thumb(doc)
         if thumb is None:
             return None
-        from telethon.tl.functions.upload import GetFileRequest
-        from telethon.tl.types import InputDocumentFileLocation
+        # Photos and documents are different constructors on the wire: a photo
+        # addressed with InputDocumentFileLocation comes back LOCATION_INVALID.
+        from telethon.tl.types import InputDocumentFileLocation, InputPhotoFileLocation
 
-        location = InputDocumentFileLocation(
+        ctor = InputPhotoFileLocation if _is_photo(doc) else InputDocumentFileLocation
+        location = ctor(
             id=doc.id,
             access_hash=doc.access_hash,
             file_reference=doc.file_reference,
             thumb_size=thumb.type,
         )
         pool = await self._download_pool()
-        client = self._next_client(pool)
-        result = await client(GetFileRequest(location, offset=0, limit=THUMB_REQUEST_SIZE, precise=True))
-        return bytes(result.bytes)
+        attempt = 0
+        while True:
+            client = self._next_client(pool)
+            try:
+                await self._pin_exported_sender(client, getattr(doc, "dc_id", None))
+                # file_size makes it one request; iterating to exhaustion (rather
+                # than breaking out) lets Telethon return the exported sender.
+                data = b""
+                async for chunk in client.iter_download(
+                    location,
+                    dc_id=getattr(doc, "dc_id", None),
+                    file_size=getattr(thumb, "size", None),
+                    request_size=THUMB_REQUEST_SIZE,
+                ):
+                    data += bytes(chunk)
+                return data or None
+            except Exception as exc:
+                wait = _flood_seconds(exc)
+                if wait is None and _is_export_race(exc):
+                    wait = 1
+                if wait is None or attempt >= 2:
+                    raise
+                attempt += 1
+                log.warning("preview retry %s after %ss: %s", attempt, wait, exc)
+                await asyncio.sleep(wait + 1)
 
     def invalidate_document(self, message_id: int) -> None:
         with self._docs_lock:
@@ -512,19 +628,79 @@ class TelegramWorker:
         self._rr = (self._rr + 1) % len(pool)
         return pool[self._rr]
 
+    async def _pin_exported_sender(self, client, dc_id) -> None:
+        """Borrow the file's DC sender once per client and never give it back.
+
+        Every byte here comes from a DC that is not the session's — the account
+        lives in one, the stored files in another — so every read and every
+        preview is answered by an *exported* sender. Telethon borrows one per
+        download and returns it when the download ends, then disconnects it 60s
+        after the last return (``_DISCONNECT_EXPORTED_AFTER`` in
+        ``telethon/client/telegrambaseclient.py``). Sixty seconds of quiet is
+        nothing here — it is one gap between warm-up batches, or a folder nobody
+        clicked for a minute — so the next batch reconnects all eight pool
+        connections to that DC at the same moment. One bridge.log has 248
+        "Disconnecting borrowed sender for DC 1", 387 reconnects, and 138 "Server
+        closed the connection": Telegram's answer to eight simultaneous
+        handshakes from one address.
+
+        Each of those closures fails whatever was in flight, and a failed preview
+        is not a slower thumbnail — the DLL cannot tell it from "this file has no
+        preview", so it delegates to the built-in handler, which reads the whole
+        original image (see CLAUDE.md). One dropped connection therefore costs a
+        multi-megabyte download, and it lands exactly when a folder is being
+        browsed.
+
+        Holding one borrow forever keeps the reference count off zero, so
+        ``should_disconnect()`` never fires and the sender stays up for the life
+        of the bridge. Nothing else changes: the per-download borrows still
+        happen on top of this one, and MTProtoSender still reconnects itself if
+        Telegram drops the connection anyway — it just no longer tears the
+        connection down on a timer and rebuild eight at once.
+
+        Same reasoning as TeleDrive's own ``senderDcFor`` (frontend commit
+        4d397f8): who answers a GetFile is worth being deliberate about, because
+        getting it wrong shows up as "this folder is cold", never as an error.
+        """
+        if not dc_id:
+            return
+        session = getattr(client, "session", None)
+        if getattr(session, "dc_id", None) == dc_id:
+            return  # home-DC media is served by the main sender, nothing to pin
+        borrow = getattr(client, "_borrow_exported_sender", None)
+        if borrow is None:  # pragma: no cover - a real client always has it
+            return
+        pinned = getattr(client, "_td_pinned_dcs", None)
+        if pinned is None:
+            pinned = set()
+            setattr(client, "_td_pinned_dcs", pinned)
+        if dc_id in pinned:
+            return
+        pinned.add(dc_id)
+        try:
+            await borrow(dc_id)
+        except Exception as exc:  # the download below can still borrow its own
+            pinned.discard(dc_id)
+            log.warning("could not pin a sender for DC %s: %s", dc_id, exc)
+
     async def _chunk(self, client, doc, offset: int) -> bytes:
         """One REQUEST_SIZE read. Short only at end of file."""
         attempt = 0
         while True:
             try:
-                async for chunk in client.iter_download(
+                await self._pin_exported_sender(client, getattr(doc, "dc_id", None))
+                pull = client.iter_download(
                     doc,
                     offset=offset,
                     request_size=REQUEST_SIZE,
-                    file_size=doc.size,
-                ):
-                    return bytes(chunk)
-                return b""
+                    file_size=_media_size(doc),
+                )
+                try:
+                    async for chunk in pull:
+                        return bytes(chunk)
+                    return b""
+                finally:
+                    await _close_download(pull)
             except Exception as exc:
                 wait = _flood_seconds(exc)
                 if wait is None or attempt >= 2:
@@ -535,17 +711,25 @@ class TelegramWorker:
 
     # -- uploading -------------------------------------------------------- #
 
-    def upload_segment(self, stream, size: int, file_name: str, progress=None) -> dict:
+    def upload_segment(self, stream, size: int, file_name: str, progress=None, preview=None) -> dict:
         """Upload one segment as a single Telegram document message.
 
         ``stream`` is a binary file object positioned at the segment start and
         limited to ``size`` bytes (see ``SegmentReader``, which also supports
         the random-access ``seek()``+``read()`` the parallel path below uses).
-        """
-        return self.run(self._upload_segment(stream, size, file_name, progress), timeout=None)
 
-    async def _upload_segment(self, stream, size: int, file_name: str, progress) -> dict:
-        from telethon.tl.types import DocumentAttributeFilename
+        ``preview`` is an optional ``(jpeg_path, width, height)`` from
+        ``make_preview`` — the thumbnail and dimensions that let /rpc/thumb and
+        /rpc/props answer for our own uploads instead of sending the shell off
+        to read the whole file. Callers pass it only for a single-segment still
+        image; a zip or one part of a split file has no preview to give.
+        """
+        return self.run(
+            self._upload_segment(stream, size, file_name, progress, preview), timeout=None
+        )
+
+    async def _upload_segment(self, stream, size: int, file_name: str, progress, preview=None) -> dict:
+        from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeImageSize
 
         if size <= tgupload.BIG_FILE_THRESHOLD:
             # A handful of parts at most: parallelism buys nothing over one
@@ -571,11 +755,21 @@ class TelegramWorker:
                     progress=progress,
                 )
 
+        attributes = [DocumentAttributeFilename(file_name)]
+        thumb = None
+        if preview is not None:
+            thumb, width, height = preview
+            # Both, or neither: Telegram drops a document thumbnail when the
+            # document does not also declare its size. And ``thumb`` has to be a
+            # path to a real .jpg — Telethon uploads it by name and Telegram
+            # ignores anything that does not look like a JPEG file.
+            attributes.append(DocumentAttributeImageSize(width, height))
         msg = await client.send_file(
             "me",
             handle,
             force_document=True,
-            attributes=[DocumentAttributeFilename(file_name)],
+            attributes=attributes,
+            thumb=thumb,
         )
         doc = msg.document
         if doc is None:
@@ -588,6 +782,56 @@ class TelegramWorker:
         }
 
 
+def make_preview(path) -> Optional[Tuple[bytes, int, int]]:
+    """A JPEG preview and the true pixel size of the still image at ``path``.
+
+    Everything uploaded through H: used to reach Telegram as a bare document
+    carrying nothing but a filename, so ``doc.thumbs`` was empty and there was
+    no ``DocumentAttributeImageSize``. That loses both halves of this project's
+    browsing story for its own uploads: ``/rpc/thumb`` answers 404,
+    ``/rpc/props`` answers ``{}``, and the shell handler -- which cannot tell
+    "no preview" from "fetch failed" -- delegates to the built-in handler,
+    which reads the whole image back down from Telegram to draw one icon. So a
+    folder of freshly uploaded photos behaves exactly like a folder this project
+    was never installed for.
+
+    Both halves are produced here together because Telegram wants them
+    together: it discards a document thumbnail when the document does not also
+    declare its dimensions.
+
+    Returns None for anything that is not a decodable still image -- a /game
+    zip, a split part, a video, a truncated file, or a machine without Pillow.
+    A preview is a nicety; it must never be the reason an upload fails.
+    """
+    try:
+        from PIL import Image, ImageOps
+    except ImportError:  # pragma: no cover - depends on the environment
+        log.warning("Pillow is not installed — uploads will have no preview")
+        return None
+    try:
+        with Image.open(path) as src:
+            width, height = src.size
+            # EXIF orientation is what a viewer shows, so it is also what the
+            # dimensions have to say; read it before draft()/transpose change
+            # the size out from under us.
+            if (src.getexif() or {}).get(274, 1) in (5, 6, 7, 8):
+                width, height = height, width
+            # JPEG can decode straight to roughly the size we want, which is
+            # most of the cost of this function on a 20 MB photo.
+            src.draft("RGB", (PREVIEW_BOX, PREVIEW_BOX))
+            img = ImageOps.exif_transpose(src) or src
+            img = img.convert("RGB")  # a PNG with alpha cannot be saved as JPEG
+            img.thumbnail((PREVIEW_BOX, PREVIEW_BOX), Image.LANCZOS)
+            for quality in (75, 60, 45):
+                buf = io.BytesIO()
+                img.save(buf, "JPEG", quality=quality, optimize=True)
+                if buf.tell() <= PREVIEW_MAX_BYTES or quality == 45:
+                    return buf.getvalue(), width, height
+    except Exception as exc:
+        log.info("no preview for %s: %s", getattr(path, "name", path), exc)
+    return None
+
+
 def _media_attributes(doc) -> dict:
     """Pixel size and duration off a Document's attributes, or ``{}``.
 
@@ -596,6 +840,17 @@ def _media_attributes(doc) -> dict:
     they carry, and a photo's DocumentAttributeImageSize has w/h exactly like a
     video's DocumentAttributeVideo does.
     """
+    if _is_photo(doc):
+        full = doc.sizes[-1] if getattr(doc, "sizes", None) else None
+        out = {}
+        if getattr(full, "w", None) and getattr(full, "h", None):
+            out["width"] = int(full.w)
+            out["height"] = int(full.h)
+        # Photos are always JPEG on Telegram's side; there is no mime_type field
+        # to read, and the shell wants one to decide it need not open the file.
+        out["mime"] = "image/jpeg"
+        return out
+
     out = {}
     for attr in getattr(doc, "attributes", None) or []:
         width = getattr(attr, "w", None)
@@ -611,6 +866,58 @@ def _media_attributes(doc) -> dict:
     return out
 
 
+def _message_media(msg):
+    """The Document or Photo a message carries, or None.
+
+    Two kinds because two upload paths: the browser sends documents, the
+    backend's chat-media import registers photos lifted out of chats.
+    """
+    if msg is None:
+        return None
+    return getattr(msg, "document", None) or getattr(msg, "photo", None)
+
+
+def _is_photo(media) -> bool:
+    """A Photo carries ``sizes``; a Document carries ``thumbs`` and ``size``.
+
+    Structural rather than isinstance so the fakes in the tests stay small and
+    a Telethon type rename cannot silently turn every photo back into a 500.
+    """
+    return getattr(media, "sizes", None) is not None and not hasattr(media, "size")
+
+
+def _photo_size_bytes(size) -> Optional[int]:
+    """Byte count of one PhotoSize-ish entry, or None if it has no concrete one.
+
+    ``PhotoSizeProgressive`` has no ``size``: it lists the cumulative length of
+    each progressive scan, so the whole image is the *last* element — summing
+    them over-reports by a factor of three and makes the client read past the
+    end.
+    """
+    concrete = getattr(size, "size", None)
+    if concrete is not None:
+        return int(concrete)
+    progressive = getattr(size, "sizes", None)
+    if progressive:
+        return int(progressive[-1])
+    return None
+
+
+def _media_size(media) -> Optional[int]:
+    """Length in bytes of the file this media *is*.
+
+    For a document that is ``size``. For a photo it is the byte count of
+    ``sizes[-1]`` — which is both what Telethon's own ``get_input_location``
+    downloads and, checked against four live messages, exactly what the backend
+    recorded as the file's size. Getting this wrong is not a rounding error: the
+    reader would either stop short or wait out a timeout on bytes that are not
+    there.
+    """
+    if _is_photo(media):
+        return _photo_size_bytes(media.sizes[-1]) if media.sizes else None
+    return getattr(media, "size", None)
+
+
 def _best_thumb(doc):
     """The largest ready-to-use thumbnail on ``doc``, or None.
 
@@ -620,13 +927,59 @@ def _best_thumb(doc):
     so picking the largest of those skips the stripped one without special-casing
     its type letter.
     """
+    if _is_photo(doc):
+        # A photo's own `sizes` are its previews, except the last, which is the
+        # full image. Unlike a document's `thumbs` — which Telegram keeps small,
+        # ~17 KB on average — these run up to near the original: on one measured
+        # message "m" was 32 KB and "x" was 150 KB of a 283 KB file. Taking the
+        # largest would make the preview cost as much as the read it exists to
+        # avoid, so cap it and take the biggest that fits.
+        best = _under_cap(doc.sizes[:-1])
+        # A photo small enough to have no intermediate size still needs an
+        # answer, and at that point the full image *is* the cheap one.
+        return best if best is not None else _under_cap(doc.sizes)
+
+    candidates = getattr(doc, "thumbs", None) or []
+    # A photo's own `sizes` are its previews, except the last, which is the full
+    # image — fetching that per file is the whole-file read the preview exists
+    # to avoid. Trimming it can leave nothing but the stripped blur, and for a
+    # photo small enough to have no intermediate size the full one *is* cheap,
+    # so fall back to the untrimmed list rather than answering 404.
+    return _largest_concrete(candidates)
+
+
+def _under_cap(sizes):
+    """Largest complete entry within THUMB_PREVIEW_MAX, else the smallest one.
+
+    The fallback matters: a photo whose every preview is over the cap still
+    wants an answer, and the smallest of them is cheaper than the original the
+    shell would otherwise read in full.
+    """
+    concrete = [(z, _photo_size_bytes(z)) for z in sizes or []]
+    concrete = [(z, n) for z, n in concrete if n is not None and getattr(z, "size", None) is not None]
+    if not concrete:
+        return None
+    fits = [(z, n) for z, n in concrete if n <= THUMB_PREVIEW_MAX]
+    if fits:
+        return max(fits, key=lambda pair: pair[1])[0]
+    return min(concrete, key=lambda pair: pair[1])[0]
+
+
+def _largest_concrete(sizes):
+    """The biggest entry that is a complete JPEG on its own.
+
+    A PhotoStrippedSize is ~100 bytes of blur that only becomes an image after a
+    standard header is re-attached; it identifies itself by having no byte count
+    of its own, so asking for one skips it without special-casing its type
+    letter. Progressive entries are skipped too — they are the full image.
+    """
     best = None
-    for thumb in getattr(doc, "thumbs", None) or []:
-        size = getattr(thumb, "size", None)
-        if size is None:
+    for size in sizes or []:
+        concrete = getattr(size, "size", None)
+        if concrete is None:
             continue
-        if best is None or size > best[1]:
-            best = (thumb, size)
+        if best is None or concrete > best[1]:
+            best = (size, concrete)
     return best[0] if best else None
 
 
@@ -639,6 +992,29 @@ def _is_file_reference_error(exc: BaseException) -> bool:
     except Exception:  # pragma: no cover
         pass
     return "FILE_REFERENCE" in str(exc).upper()
+
+
+def _is_export_race(exc: BaseException) -> bool:
+    """AUTH_BYTES_INVALID while importing an exported authorization.
+
+    The pool is eight clients built from one session string, so the first
+    cross-DC file in a batch has all of them exporting an authorization for the
+    same DC at the same moment, and Telegram rejects some of the imports.
+    Measured on one sweep: 19 previews lost inside a two-minute window at
+    startup, then 1,679 fetches with none. Telethon neither retries it nor
+    disconnects the sender it already connected before the import failed — that
+    dropped sender is where the "Task was destroyed but it is pending" pairs in
+    the log come from (76 of them, four per failure). Retrying lands on another
+    connection, by which time the burst is over.
+    """
+    try:
+        from telethon.errors import AuthBytesInvalidError
+
+        if isinstance(exc, AuthBytesInvalidError):
+            return True
+    except Exception:  # pragma: no cover
+        pass
+    return "AUTH_BYTES_INVALID" in str(exc).upper()
 
 
 def _flood_seconds(exc: BaseException) -> Optional[int]:
@@ -656,6 +1032,29 @@ def _flood_seconds(exc: BaseException) -> Optional[int]:
 # --------------------------------------------------------------------------- #
 # File objects
 # --------------------------------------------------------------------------- #
+
+
+async def _close_download(pull) -> None:
+    """Let a download iterator run its cleanup, which returns a borrowed sender.
+
+    ``async for`` that breaks out on the first chunk — which is exactly what
+    ``_chunk`` does, one chunk being the whole request — never reaches the
+    iterator's own end, and Telethon's ``RequestIter`` only returns the exported
+    sender in ``close()`` (``telethon/client/downloads.py``). Every cross-DC read
+    therefore used to record a borrow and never a return, which CLAUDE.md noted
+    and left alone. It is harmless only for as long as nothing depends on the
+    count being right, and _pin_exported_sender does depend on it: an accounting
+    that only ever counts up cannot be told apart from a deliberate pin.
+    """
+    close = getattr(pull, "close", None) or getattr(pull, "aclose", None)
+    if close is None:
+        return
+    try:
+        result = close()
+        if inspect.isawaitable(result):
+            await result
+    except Exception as exc:  # pragma: no cover - cleanup must not mask a read
+        log.debug("closing a download iterator failed: %s", exc)
 
 
 def _contiguous(indices: Sequence[int]):

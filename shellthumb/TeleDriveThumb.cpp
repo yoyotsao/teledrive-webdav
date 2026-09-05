@@ -18,6 +18,7 @@
 #include <windows.h>
 #include <shlwapi.h>
 #include <thumbcache.h>
+#include <shobjidl.h>   // IInitializeWithItem, SHCreateItemFromParsingName
 #include <wincodec.h>
 #include <winhttp.h>
 #include <propkey.h>
@@ -33,6 +34,7 @@
 #pragma comment(lib, "advapi32.lib")   // Reg*
 #pragma comment(lib, "user32.lib")     // CharUpperW
 #pragma comment(lib, "gdi32.lib")      // CreateDIBSection, DeleteObject
+#pragma comment(lib, "shell32.lib")    // SHCreateItemFromParsingName
 
 // {7A3F1C28-9B6D-4E51-8F42-C0D3E5A91B74}
 static const CLSID CLSID_TeleDriveThumb =
@@ -74,15 +76,8 @@ static std::wstring ReadString(HKEY key, const wchar_t* name) {
     return std::wstring(buf);
 }
 
-static const Settings& GetSettings() {
-    // Read once per host process: the surrogate is short-lived, and a thumbnail
-    // must not pay a registry round trip per file.
-    static Settings settings;
-    static bool loaded = false;
-    if (loaded)
-        return settings;
-    loaded = true;
-
+static Settings LoadSettings() {
+    Settings settings;
     settings.root = ReadSetting(nullptr, L"MountRoot");
     if (settings.root.empty())
         settings.root = ReadSetting(nullptr, L"MountDrive");
@@ -100,6 +95,22 @@ static const Settings& GetSettings() {
     }
     if (!settings.root.empty())
         CharUpperW(&settings.root[0]);
+    return settings;
+}
+
+static const Settings& GetSettings() {
+    // Read once per host process: the surrogate is short-lived, and a thumbnail
+    // must not pay a registry round trip per file.
+    //
+    // The one-time init has to be the *compiler's* (C++11 magic static), not a
+    // hand-rolled flag. The flag this replaced set itself before the registry
+    // reads, so the sibling threads Explorer starts for one folder took the
+    // early return and got root="" -> OnMount() said false -> those files went
+    // to the built-in handler, which reads the whole file. Measured on a fresh
+    // surrogate: of six files handed to warmshell at once, three were delegated
+    // (one logged onMount=0, two "preview fetch failed"), and the batch took
+    // 9.4s instead of the ~0.3s the three that won the race needed.
+    static const Settings settings = LoadSettings();
     return settings;
 }
 
@@ -477,11 +488,33 @@ private:
 
         // Whichever way it wants to be initialized.
         IInitializeWithFile* withFile = nullptr;
+        IInitializeWithItem* withItem = nullptr;
         IInitializeWithStream* withStream = nullptr;
         hr = E_FAIL;
         if (SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&withFile)))) {
             hr = withFile->Initialize(m_path.c_str(), m_mode);
             withFile->Release();
+        } else if (SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&withItem)))) {
+            // IInitializeWithItem is not an alternative spelling of the other
+            // two — for video it is the only one that works. A video file has no
+            // provider that decodes it: HKCR\.mp4\ShellEx\{e357fccd-...} names
+            // shell32's Property Thumbnail Handler {9DBD2C50-...}, which pulls
+            // System.ThumbnailStream out of the file's property store, and it
+            // takes a shell item because that is what a property store is opened
+            // from. It offers neither IInitializeWithFile nor
+            // IInitializeWithStream, so with only those two tried this returned
+            // E_FAIL and the shell asked nobody else: every video off the mount
+            // lost its thumbnail, machine-wide, because this handler is
+            // registered per extension. Measured on one file under two names,
+            // .mp4 (ours, forwarding) 0 of 3 answered against .m4v (never
+            // claimed, same {9DBD2C50}) 3 of 3.
+            IShellItem* item = nullptr;
+            hr = SHCreateItemFromParsingName(m_path.c_str(), nullptr, IID_PPV_ARGS(&item));
+            if (SUCCEEDED(hr)) {
+                hr = withItem->Initialize(item, m_mode);
+                item->Release();
+            }
+            withItem->Release();
         } else if (SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&withStream)))) {
             IStream* stream = nullptr;
             hr = SHCreateStreamOnFileEx(m_path.c_str(), STGM_READ | STGM_SHARE_DENY_NONE,

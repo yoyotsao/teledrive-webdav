@@ -358,3 +358,27 @@ def test_head_survives_seek_and_reread(remote):
     assert fh.read() == whole
     fh.seek(0)
     assert fh.read(64) == whole[:64]
+
+
+def test_a_full_width_streamed_read_stays_in_the_cache():
+    """The block cache has to hold one whole streamed read.
+
+    ``_blocks_for`` caches the batch it just fetched and then trims to
+    ``blocks_cached``. Hold fewer blocks than a read is wide and it throws away
+    the front of the batch it has only just filled, so the next caller — rclone
+    asking for the same region in smaller pieces, zipfile seeking backwards —
+    pays for the network a second time. Uses the real constants: this is a
+    relationship between two of them, not a number.
+    """
+    import tgio
+
+    width = tgio.STREAM_BLOCK_SIZE
+    blob = bytes((i % 251) for i in range(width * 2))
+    reader = FakeReader({1: blob})
+    fh = SeekableRemoteFile(reader, [(1, len(blob))], name="video.mp4")
+
+    assert fh.read(width) == blob[:width]
+    fetched = len(reader.calls)
+    fh.seek(0)
+    assert fh.read(width) == blob[:width]
+    assert len(reader.calls) == fetched

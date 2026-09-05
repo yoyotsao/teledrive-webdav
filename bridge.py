@@ -29,7 +29,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlsplit
 
 from wsgidav.dav_error import HTTP_FORBIDDEN, HTTP_INTERNAL_ERROR, DAVError
@@ -575,6 +575,20 @@ class Resolver:
             if local is not None and local.exists():
                 kind = STAGE_DIR if local.is_dir() else STAGE_FILE
                 return Loc(kind, local=local, top=top)
+
+            # 1b. Missing, but its parent is a staging directory — then the local
+            # listing is the complete answer and the backend cannot contradict it.
+            # This is the whole cost of a copy into /game: every file is new, so
+            # every one of them misses step 1, and asking the backend to confirm
+            # a name that a local directory already rules out put a round trip
+            # (in practice several) in front of each PUT and MKCOL.
+            # Only below the first level: /game/<top> itself must still be
+            # looked up, because <top> in staging and an uploaded <top>.zip are
+            # different names and only the backend knows about the second.
+            if len(rest) >= 2:
+                parent = self.stager.path_for(rest[:-1])
+                if parent is not None and parent.is_dir():
+                    return Loc(MISSING)
 
         children = self.game_children()
 
@@ -1391,24 +1405,94 @@ def build_app(cfg: Config, resolver: Resolver, stager, fetcher, upload_stager=No
     return Dispatcher(guarded, RpcApp(cfg, resolver, fetcher, stager, upload_stager))
 
 
+class ThrottleRepeats(logging.Filter):
+    """One line per distinct message per ``every`` seconds, plus what it held back.
+
+    Telethon narrates every single ``iter_download`` at INFO level ("Starting
+    direct file download in chunks of 524288 at 0, stride 524288"), and this
+    bridge issues one ``iter_download`` per 512 KiB request — one per preview,
+    one per block read. That makes the line's rate the read rate: a sweep's
+    shell warm (warmup.shell_warm walks every still image, and the shell reads
+    each one's header afterwards — see HEAD_SIZE) sustains ~360 a minute, so a
+    measured bridge.log held 1,993 of them out of 2,100 lines and rotated 8 MB
+    of history away in minutes. The five FLOOD_WAIT lines in that same file were
+    invisible, which is the actual damage: this log is how everything in
+    CLAUDE.md gets diagnosed.
+
+    Dropping the logger to WARNING would be shorter but it carries the download
+    diagnostics this project reads most — "File lives in another DC", "File ref
+    expired during download", the direct/indirect split that a change in read
+    alignment would first show up in. Keying on ``record.msg``, the template
+    rather than the formatted line, collapses one flooding call site and leaves
+    every other line first-class and immediate.
+    """
+
+    def __init__(self, every: float = 60.0):
+        super().__init__()
+        self.every = every
+        self._seen: Dict[str, Tuple[float, int]] = {}
+        self._lock = threading.Lock()
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        now = time.monotonic()
+        key = str(record.msg)
+        with self._lock:
+            last, held = self._seen.get(key, (0.0, 0))
+            if last and now - last < self.every:
+                self._seen[key] = (last, held + 1)
+                return False
+            self._seen[key] = (now, 0)
+        if held:
+            # Pre-format: the count belongs to this record, not to the template
+            # the next one will be keyed on.
+            record.msg = f"{record.getMessage()} (+{held} more in the last {now - last:.0f}s)"
+            record.args = ()
+        return True
+
+
 def main(argv=None) -> int:
     import argparse
 
     parser = argparse.ArgumentParser(description="TeleDrive WebDAV bridge")
     parser.add_argument("--config", type=Path, default=None)
     parser.add_argument("--port", type=int, default=None)
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="where to mirror the log (default: <cache_dir>/bridge.log; '-' disables)",
+    )
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
     if args.port:
         cfg = dataclasses.replace(cfg, port=args.port)
 
+    for path in (cfg.cache_dir, cfg.staging_dir, cfg.pack_dir, cfg.local_dir, cfg.upload_dir):
+        path.mkdir(parents=True, exist_ok=True)
+
+    # Console *and* file. The console window is where a person watches, but it
+    # scrolls away and is gone when the window closes — and the interesting
+    # failures here (FLOOD_WAIT storms, "stored in DC N", a warmup pass that
+    # stopped) are exactly the ones you go looking for afterwards. Rotating
+    # rather than truncating: a restart must not throw away the log of whatever
+    # made you restart.
+    handlers: List[logging.Handler] = [logging.StreamHandler()]
+    log_file = args.log_file if args.log_file is not None else cfg.cache_dir / "bridge.log"
+    if str(log_file) != "-":
+        from logging.handlers import RotatingFileHandler
+
+        handlers.append(
+            RotatingFileHandler(log_file, maxBytes=8 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        )
     logging.basicConfig(
         level=getattr(logging, cfg.log_level, logging.INFO),
         format="%(asctime)s %(levelname)-7s %(name)-10s %(message)s",
+        handlers=handlers,
     )
-    for path in (cfg.cache_dir, cfg.staging_dir, cfg.pack_dir, cfg.local_dir, cfg.upload_dir):
-        path.mkdir(parents=True, exist_ok=True)
+    # Per-request narration from Telethon's downloader, throttled rather than
+    # silenced; see ThrottleRepeats for why this one logger and not a level.
+    logging.getLogger("telethon.client.downloads").addFilter(ThrottleRepeats())
 
     # Imported here so `python bridge.py --help` works without Telethon present.
     from fetchlocal import LocalFetcher
@@ -1421,6 +1505,9 @@ def main(argv=None) -> int:
     )
     worker.start()
     api = TeleDriveClient(cfg)
+    # Before login(): the backend's bot challenge is answered by DMing a nonce
+    # from this very account, so auth needs the Telegram client to be up first.
+    api.set_dm_sender(worker.send_dm)
     api.login()
 
     resolver = Resolver(cfg, api, worker)

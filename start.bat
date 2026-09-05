@@ -85,7 +85,8 @@ rclone mount :webdav: %MOUNT% ^
   --vfs-read-chunk-size-limit 512M ^
   --transfers 4 ^
   --no-checksum ^
-  --rc
+  --rc ^
+  --rc-no-auth
 goto :eof
 
 :fail

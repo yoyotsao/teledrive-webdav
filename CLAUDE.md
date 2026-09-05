@@ -17,13 +17,40 @@ H:  ──rclone mount(WinFsp)──▶ http://127.0.0.1:8081  (bridge.py, Pytho
 **核心不變量**：位元組只在「本機 ↔ Telegram」之間流動，metadata 才走 TeleDrive backend。
 bridge 只用現有 public API，沒有為它新增任何會讀寫二進位資料的端點。
 
+## 改完之後自己收尾（不要留指令給使用者跑）
+
+**這個專案的產出不是 diff，是「H: 上的行為」。** 所以改完程式碼要自己做完重編／重啟，
+把它帶到「使用者直接點進 `H:` 就能看到結果」的狀態，再回報。跑完測試就交件是不算完成的：
+測試裡的 MTProto 與 backend 都是假的，而這裡幾乎每個 bug 都活在真的 shell、真的 rclone、
+真的 Telegram 上（DC 遷移、thumbcache、URL 跳脫那幾條坑沒有一條是測試抓到的）。
+
+| 改了什麼 | 收尾動作 |
+|---|---|
+| Python（`bridge.py` / `tgio.py` / `tdapi.py` / stager / warmup…） | `.venv\Scripts\python.exe -m pytest tests -q` → `restart.bat` |
+| `shellthumb/*.cpp` | `shellthumb\build.bat`（自己會叫 vcvars64），然後重新載入 handler |
+| `install_menu.py` / `install_thumb.py` | 重跑安裝；property handler 那半要管理員（只有 HKLM） |
+| `config.ini` | `restart.bat`（路徑全部由 `cache_dir` 推導，重讀才生效） |
+
+- **`restart.bat` 只重啟 bridge，不碰 rclone。** rclone 是對 127.0.0.1 講 HTTP 並且會重試，
+  所以 `H:` 不會斷、VFS 快取也還在；殺掉 rclone 等於卸載磁碟又白丟 dir cache。
+  重啟前先看 `/rpc/status`：staging/uploads 的 debounce 計時器不會續命（檔案還在，計時歸零）。
+- **DLL 正在被載著就覆寫不了。** 縮圖 handler 跑在 COM surrogate 裡，`build.bat` 會因為
+  檔案被鎖而失敗 → 先 `taskkill /f /im dllhost.exe`，必要時再重啟 `explorer.exe`。
+- **驗證縮圖／屬性的改動要換一個沒開過的資料夾。** 看過一次的資料夾由 Windows 自己的
+  `thumbcache_*.db` 回答，handler 根本不會被呼叫（見「量測會被 Windows 自己的縮圖快取騙」），
+  在舊資料夾上「看起來正常」什麼都證明不了。
+- **日誌在 `<cache_dir>\meta\bridge.log`**（`config.py` 裡的 `cfg.cache_dir` 就是那層 `meta/`；
+  rotating，8 MB × 3，同時仍印到 console）。
+  要確認一個改動在真的 Telegram 上生效，讀這個檔比問使用者貼 console 快，
+  而且 crash 之後還在。
+
 ## 檔案
 
 | 檔案 | 職責 |
 |---|---|
 | `bridge.py` | wsgidav provider、寫入保護、`/rpc/*`、cheroot 伺服器（綁 127.0.0.1） |
-| `tdapi.py` | TeleDrive REST client：JWT 取得/快取/401 自動重登、路徑解析、split part 表快取、`JsonStore` |
-| `tgio.py` | split 位移數學、Telethon worker（背景 event loop）、連線池、`SeekableRemoteFile`、分段上傳、縮圖與 media attributes |
+| `tdapi.py` | TeleDrive REST client：JWT 取得（bot challenge，見「踩過的坑」）/快取/401 自動重登、路徑解析、listing 快取（記憶體 + `meta/dirs/`，`/folders` 與 `/files` 併發，見「效能」第 7 節）、split part 表快取、`JsonStore` |
+| `tgio.py` | split 位移數學、Telethon worker（背景 event loop）、連線池、`SeekableRemoteFile`、分段上傳、縮圖與 media attributes（讀 Telegram 的預覽，以及 `make_preview` 產自己上傳的那張） |
 | `tgupload.py` | `/game` 大檔案的並行分 part 上傳：自算 part index、`UploadGate`（window+rate 的 AIMD 節流）、繞過 `client._call` 直送 `SaveBigFilePart` |
 | `zipfs.py` | 讀 zip central directory → 虛擬目錄樹；單一 entry 的 range 讀取 |
 | `gamestage.py` | `/game` staging + debounce 打包（`ZIP_STORED`）+ 上傳 + 去重 + 清理；`upload_and_register` 給 `uploadstage.py` 共用 |
@@ -35,6 +62,7 @@ bridge 只用現有 public API，沒有為它新增任何會讀寫二進位資�
 | `shellthumb/` | C++ shell 擴充：`IThumbnailProvider` + `IPropertyStore`，同一份 DLL 兩個 CLSID；`warmshell.exe` 把縮圖灌進 Windows thumbcache，`bench.exe` / `isolate.exe` 量測 |
 | `config.py` | 讀 `config.ini`，空值回退環境變數，再回退 `env_file`；由單一 `cache_dir` 推導所有路徑 |
 | `start.bat` | 啟動 bridge + `rclone mount` |
+| `restart.bat` | 只重啟 bridge（rclone 與 `H:` 不動），改完 Python 後的收尾 |
 
 `config.ini` 只有 `cache_dir` 一個路徑設定，底下的 `meta/` `rclone/` `local/` `staging/` `uploads/`
 是程式的實作細節而非設定 —— 先前四個獨立路徑設定的結果就是它們各自漂移，
@@ -72,10 +100,52 @@ bridge 只用現有 public API，沒有為它新增任何會讀寫二進位資�
   沒有共通的落地邏輯可以套。`MOVE` 維持原樣只在 `/game` 放行：一般路徑的暫存
   沒有搬移原語（`UploadStager` 沒有 `move()`）。
 
-沒有做的是縮圖與 album 分組——那些是網頁上傳流程專屬的功能，這裡沒有重做；
+沒有做的是 album 分組——那是網頁上傳流程專屬的功能，這裡沒有重做；
 去重（`check_hash`，跟網頁同一套指紋）則是共用的，照樣套用。
 `/rpc/status` 的 `uploads` 欄位回報目前 debounce 中的一般寫入，跟 `/game`
 的 `units` 分開列。
+
+**縮圖是有的，而且它不是「網頁那邊的加工」，是這個專案自己的效能前提。**
+而它壞掉的方式跟看起來的完全不一樣，所以先講量到的事實：
+
+**Telegram 自己會替 `image/*` 的 document 產縮圖，也自己補
+`DocumentAttributeImageSize`。** 拿改動之前上傳的三個檔案直接問 Telegram
+（message 80824 / 80825 / 80830）：三個都有 `PhotoSize 'm'`（23,567 / 29,980 /
+21,785 bytes），而且 `attributes` 裡就有 `DocumentAttributeImageSize` ——
+那不是 bridge 送的，那時候 `_upload_segment` 只送 `DocumentAttributeFilename`。
+**所以「上傳的圖沒有縮圖」從來不是 Telegram 上沒有縮圖。**
+
+真正的 bug 只有一個：`tdapi.register()` 把 `has_thumbnail` **寫死成 `False`**。
+而那個旗標是**兩邊**的閘門 ——
+
+- bridge：`Resolver.thumbs_for` 與 `needs_warming`（`bridge.py`）不看旗標就不去找預覽，
+  於是 `/rpc/thumb` **0.12 秒**回一個 404、根本沒問 Telegram（那時候訊息上已經有
+  `PhotoSize 320x200, 16,489 bytes`）。DLL 分不出「沒有預覽」跟「抓取失敗」，就
+  `delegating` 給內建 handler 去讀**整張原圖**（第七種「看起來只是冷資料夾慢」的假象，
+  而且這次是自己造出來的）。
+- 網頁：`ChonkyDrive.tsx` 的 `loadThumbnails` 也 filter `f.has_thumbnail`。
+
+所以症狀是「上傳的圖在 `H:` 和網頁上**都**沒有縮圖」，而 Telegram 上兩邊要的東西
+一直都在。backend 對這個欄位的定義本來就是 "a thumbnail is embedded in the file's
+own Telegram message"（`schemas.py`），跟兩邊的閘門問的是同一件事，所以修法是
+照實回報。CLAUDE.md 原本寫「那是 backend 自己有沒有產縮圖…兩件事無關」，
+那句話錯了，而它正好掩護了這個 bug。
+
+**已經註冊成 `False` 的 row 修不回來**（`PATCH /files/{id}` 只收 `parent_id` 與
+`filename`），而且**重新上傳同一份位元組也沒有用**：`check_hash` 命中舊 row 走去重，
+沿用那筆 row 的旗標（實測踩到：兩個位元組相同的測試檔，第二個 `already on Telegram
+(1 parts)`、旗標照樣 `False`，即使那則訊息上其實有 `PhotoSize`）。
+
+`tgio.make_preview()`（本機用 Pillow 解出 320px、≤ 20 KB 的 JPEG，連同**原圖的**
+寬高一起送）**不是這個 bug 的修法** —— 對 JPEG/PNG 來說它跟 Telegram 自己做的重複。
+留著的理由是 `IMAGE_EXTS` 還有 `.gif` / `.webp` / `.bmp`，Telegram 對這些不保證會做
+（前端 `ChonkyDrive.tsx` 就記著 webp 走 album 會 `MEDIA_EMPTY` 且掉縮圖，
+DB 確認 0/84），而且自己送的預覽尺寸是確定的 320px。實作上的兩個坑：
+**尺寸與縮圖要一起送**（Telegram 會把沒有宣告尺寸的 document 縮圖丟掉），
+而 `thumb` 必須是磁碟上一個真的 `.jpg` 路徑（Telethon 按檔名上傳，Telegram 不認
+不像 JPEG 的東西），所以走 `tempfile` 而不是 `uploads/`／`staging/` ——
+那兩個目錄都會被掃成待辦工作。只對「單一 segment 且 mime 是 `image/`」做，
+產不出來一律回 None：**產不出預覽永遠不能讓上傳失敗**。
 
 ## 效能：這整個專案真正的難題
 
@@ -112,6 +182,9 @@ Windows 唯一支援「不要讀檔案」的介入點就是縮圖處理常式。
   只寫 HKCU 它兩者都讀不到。
 - 回報 `PKEY_Image_HorizontalSize` / `VerticalSize` / `Dimensions`，影片再加
   `PKEY_Media_Duration` / `PKEY_Video_FrameWidth` / `FrameHeight`。
+- **property handler 只註冊影像副檔名（`install_thumb.PROP_EXTS`）**，影片那八個不碰 ——
+  碰了會把全機的影片縮圖弄掉，見「踩過的坑」最後一條。影片的 `PKEY_Media_Duration`
+  那幾行留著沒刪：H: 上的影片走的是縮圖那半，屬性這半反正從來沒被 shell 載入過。
 
 ### 3. 冷資料夾 → `warmup.py`
 
@@ -208,6 +281,93 @@ shell 是在 `IShellItemImageFactory::GetImage` 裡、在 `IThumbnailProvider` �
   所以只暖一個子樹卻不給 base，三層深的檔案會變成 `H:\photo.jpg`。shell 對這種路徑
   瞬間回答、什麼都沒暖 —— 在計時上跟成功完全一樣。`shell_warm` 因此回報 exe 真正暖成
   的數量，不是送出去的數量。
+- **這一層整個死掉幾週而沒人看得出來，因為它報不出任何東西。** 一份 log 裡 87 批
+  全是 `shell warm stopped after 0/100: ... timed out after 600 seconds` —— 每 100 個檔
+  燒掉十分鐘、一輪 sweep 的 wall clock 幾乎全在這裡，而 `thumbcache_*.db`（274 張/秒
+  那一層）**從來沒被填過一筆**。那個平坦的 600 秒等於一個檔 24 秒，所以「掛載掉了」跟
+  「一個檔案把 shell 卡住」在 log 上完全一樣，而 `capture_output` 在被 kill 之後把
+  stdout 上那個唯一的數字也丟了。三個改動：
+  - `warmshell.exe` 每個檔一結束就往 **stderr** 印 `+ <ms> <路徑>` / `- <ms> <路徑>`
+    並 flush（narrow UTF-8，不是 `fwprintf` —— 寬字元輸出會被轉成 console codepage，
+    而這裡的路徑大半是非 ASCII，那正是「URL 跳脫」那條坑的同一種死法）。
+    被 kill 的批次因此還是說得出暖成幾個、以及**還開著哪一個**。
+  - 期限按檔數算（`SHELL_SECONDS_PER_FILE`，10 秒/檔），而不是不管幾個檔都 600 秒。
+  - 卡住就**停掉這一輪的 shell warm**，不再把後面 24 批排在同一個問題後面。
+
+  修完在真的 `H:` 上量同一個 chat import 資料夾：冷的一批 25 個檔 **2.7 秒暖成 25 個**
+  （9.4 檔/秒），同一批立刻再跑 **0.1 秒**（403 檔/秒）—— 也就是 thumbcache 真的被填了。
+  對照那個平坦的 600 秒：健康的一批只花它的 0.5%，所以那個上限從來不是保護，只是
+  把「壞了」偽裝成「很慢」。
+- **`H:` 沒掛載的時候不要問 shell。** `SHCreateItemFromParsingName` 對不存在的磁碟機
+  是微秒級失敗，於是 25 個檔「一個都沒暖成」瞬間回來 —— log 上跟「handler 答錯了」
+  一模一樣（同一份歷史裡兩種形狀都有：`25 of 25 in this batch produced nothing`，
+  以及撞滿期限的那些）。`_mount_ready()` 先看磁碟機在不在，不在就跳過並說一次。
+
+### 6. 每條連線的深度（`READS_IN_FLIGHT`）
+
+前面五層都是「不要讀檔案」。真的要讀的時候（影片播放、整檔複製、`fetch-local`），
+速度由兩個數字相乘決定，而以前只有一個：
+
+- `DOWNLOAD_CONNECTIONS`（8）—— 幾條獨立連線。這個已經量過（交錯取樣，8 條比 1 條快
+  1.72 倍），而且**不能再往上加**：16 條以上開始收到 `Server closed the connection`。
+- `READS_IN_FLIGHT`（2）—— **每條連線同時有幾個未完成的 GetFile**。MTProto 是多工的，
+  一條在等回覆的連線可以先把下一個請求送出去；一條一個的話，每條連線在兩個 chunk
+  之間就是整整一個往返在閒著。
+
+`_read` 是一次 `gather` 把整個寬度發出去的，所以「同時有幾個請求」其實是由讀取寬度
+決定的 —— `STREAM_BLOCK_SIZE` 因此是 `REQUEST_SIZE × DOWNLOAD_CONNECTIONS ×
+READS_IN_FLIGHT`（8 MiB），不是只填滿連線數的 4 MiB。連帶 `BLOCKS_CACHED` 也要
+跟著寬度走（16 個 block）：block 快取比一次讀取還窄的話，`_blocks_for` 會把自己
+剛剛抓回來的那批前半段馬上丟掉，下一個要同一段的人（rclone 用更小的片段回頭問、
+zipfile 往回 seek）就要再付一次網路。
+
+預覽那條路早就是每條連線 2 個（`THUMB_CONCURRENCY = DOWNLOAD_CONNECTIONS * 2`）
+而且沒有招來 FLOOD_WAIT —— 深度跟連線數不一樣，加深度不會被 Telegram 當成新連線洪水。
+
+### 7. Metadata 的往返次數（`meta/dirs/` + 併發 listing）
+
+**後端是刻意留在遠端的**（bridge 在一個網路、backend 在另一個，經 Cloudflare），
+所以每一個 metadata 呼叫就是 **0.52 秒**，其中 0.36–1.2 秒是 connect、加上 TLS 到 2.7 秒。
+這一層沒有「讓往返變快」的辦法，只有「少跑幾次」。
+
+成本模型量出來非常乾淨 —— 一次 `resolve pixiv/user-955496` 是 **4 個循序呼叫、2.1 秒**：
+
+```
+GET /folders  0.52s ┐ 第 1 層：pixiv 在哪
+GET /files    0.52s ┘
+GET /folders  0.53s ┐ 第 2 層：pixiv 裡有什麼
+GET /files    0.52s ┘
+```
+
+**每一層路徑 = 2 個呼叫。** 所以「已經在資料夾裡、點一個子資料夾」是 2 × 0.52 = **1.06 秒**，
+而且**跟資料夾裡有幾個檔完全無關**（2 個項目和 84 個項目一樣快）—— 這是分辨
+「往返延遲」與「資料量」的關鍵證據，也是為什麼這條跟縮圖無關：縮圖會隨檔數變多。
+
+三層答案，全部只為了少跑往返：
+
+- **`/folders` 與 `/files` 併發**（`_list_both`）。兩個獨立的 GET，循序做等於每層付兩次。
+  一次 listing 開一條執行緒而不是用 pool —— pool 大小若照這裡設，wsgidav 的工作執行緒
+  會互相排隊，而一條執行緒的成本是微秒級，對面是半秒。
+- **listing 存到磁碟**（`meta/dirs/<parent_id>.json`，一個資料夾一個檔）。重啟後
+  「這個 session 第一次點」不必再付。**一個資料夾一個檔而不是共用一份 JSON**：listing 是
+  這裡唯一「會變」的快取，所以 `JsonStore` 的 merge-on-flush（last-writer-wins，只因為
+  它的值永不改變才安全）不適用；而共用一份的話，sweep 走幾千個資料夾就是幾千次
+  數十 MB 的重寫。
+- **兩層共用同一個 `dir_cache_seconds`**（預設從 60 秒改為 **3600**，對齊 rclone 的
+  `--dir-cache-time`）。它們回答同一個問題、以同樣速度過期，分兩個 TTL 是假的區分。
+
+**sweep 是唯一的更新機制**，所以 `warmup.walk` 預設 `fresh=True`：它在第二輪之後的
+全部意義就是發現網頁端新上傳的東西，讀回自己填的快取就等於對那件事失明，也會讓
+`meta/dirs/` 到期而不是被續命。`invalidate()`（`/rpc/forget`）**必須連磁碟一起刪** ——
+只清記憶體的話下一次 listing 直接把剛剛「忘掉」的東西讀回來，看起來像成功了。
+
+實測（同一批子資料夾，`/rpc/forget` 之後為冷）：
+
+| | 改之前 | 改之後 |
+|---|---|---|
+| 第一次點，什麼快取都沒有 | 1.06 s | **0.58 s**（每層一個往返） |
+| bridge 重啟後第一次點，之前列過 | 1.06 s | **0.016 s**（從 `meta/dirs/` 來） |
+| TTL 內重訪 | 0.02 s | 0.02 s（TTL 從 60 秒變 1 小時） |
 
 ## 踩過的坑
 
@@ -235,6 +395,34 @@ shell 是在 `IShellItemImageFactory::GetImage` 裡、在 `IThumbnailProvider` �
   DLL 退回內建 handler 去讀整檔，等於那些資料夾完全沒有這個專案。修法是明確列 ASCII
   範圍，連 `isalnum()` 也不用：CRT 的 locale 是宿主行程決定的，不該依賴。
   症狀跟「冷資料夾慢」一模一樣，但成因無關 —— 分辨方法是看 DLL 記錄有沒有 `delegating`。
+- **DLL 的 Settings 一次性初始化必須交給 compiler，不能自己寫旗標。** `GetSettings()` 曾經是
+  `static bool loaded; if (loaded) return settings; loaded = true;` 然後才去讀 registry ——
+  旗標在讀取**之前**就立起來了。Explorer 進一個資料夾會同時起好幾個執行緒，第一個還在讀
+  registry 的那幾百微秒內，其他執行緒看到旗標已立就拿走**還是空的** `settings`：`root` 是
+  空字串，`OnMount()` 於是回 false，那些檔案全部 delegate 給內建 handler 去**讀整個原圖**。
+  實測一個新的 COM surrogate，同一毫秒進來的 4 個檔案中了 3 個（一個記成 `onMount=0`，
+  兩個 `preview fetch failed`），6 個檔案 9.36 秒；改成 magic static
+  （`static const Settings settings = LoadSettings();`）之後 8 個檔案 0.177 秒、
+  `delegating` 0 次、`onMount` 全是 1。這是第三種「看起來只是冷資料夾慢」的假象
+  （另兩種是 URL 跳脫與 FILE_MIGRATE），而且它**只在 handler 冷載入的頭幾百微秒發作**——
+  也就是每次 Explorer 進一個新資料夾的那一刻，剛好是最需要它答對的時候，暖起來之後
+  單獨重試同一個檔案又完全正常，所以很容易被當成「就是冷」。連帶後果是 `warmshell.exe`
+  每一批都撞 600 秒 timeout 並回報 0 個暖成（log 連續 50 批全是 `shell warm stopped
+  after 0/...`），Windows 自己的 thumbcache——274 張/秒 那一層——因此從來沒被填過。
+- **寫進 `/game` 的每一個新檔，都會先問 backend 它存不存在。** `_resolve_game` 第一步查
+  staging，但**新檔案在 PUT 之前必然不在 staging**，於是往下走 `game_children()` 和
+  `api.resolve()` —— 兩條都是打 TeleDrive backend 的 HTTPS。實測複製 300 個 512 KB 的檔案
+  進 `H:\game` 要 **52.6 秒**，同一批複製到本機 E: 只要 0.2 秒，而 bridge 自己收一個 1 MB
+  的 PUT 是 **3 毫秒** —— 成本全在路徑解析，不在寫入，也不在「rclone 快取 + staging 兩份
+  寫入」（複製結束當下 staging 還是 0 個檔，第二份根本不在關鍵路徑上）。修法是 step 1b：
+  staging 未命中但**父目錄在 staging 裡**時直接回 `MISSING`，本機目錄列表已經是完整答案，
+  backend 不可能有同一條路徑的子項目。**52.6 秒 → 4.2 秒。** 只在第二層以下短路 ——
+  `/game/<top>` 自己還是要問 backend，因為 staging 裡的 `<top>` 和已上傳的 `<top>.zip`
+  是兩個不同的名字，只有 backend 知道後者。連帶效果在 rclone 的 writeback 佇列上更誇張：
+  原本 785 個檔卡著每秒排不掉一個，現在 300 個檔在複製結束後幾乎立刻排空。
+  診斷方法是看 `bridge.log` 的 stack trace 有沒有 `get_resource_inst → resolver.resolve
+  → tdapi._list_paginated`；backend 一不穩（`ConnectionError` 重試）就會把每檔的成本
+  從毫秒放大到秒。
 - **`keep_alive_conn_limit = 0`。** Windows 上 cheroot 的 connection manager 不會在
   閒置連線變成可讀時被喚醒，只能輪詢，上限寫死 50ms（`cheroot/connections.py`：
   "select() does not return when a socket is ready"）。重用連線上的每一個請求因此都要
@@ -270,6 +458,188 @@ shell 是在 `IShellItemImageFactory::GetImage` 裡、在 `IThumbnailProvider` �
   把例外傳出來，但**其他還在跑的 task 不會被取消**，會繼續吃併發額度與頻寬上傳一個
   已經不可能 commit 的 segment。`tgupload.upload_file_parts` 在 `except` 裡明確
   `t.cancel()` 每一個未完成的 task，再 `gather(..., return_exceptions=True)` 排空。
+- **縮圖不能用裸的 `client(GetFileRequest(...))`。** 文件的 `dc_id` 跟 session 的 DC 不同時，
+  Telegram 回的是 FILE_MIGRATE，而 Telethon 的 `_call`（`client/users.py:126`）只跟隨
+  Phone/Network/User 三種 migrate，**檔案那種是在 `iter_download` 裡處理的**
+  （`client/downloads.py`：開頭就依 `dc_id` 借一個 exported sender，`FileMigrateError`
+  再重試）。所以 `_thumbnail_bytes` 一律走 `client.iter_download(location, dc_id=doc.dc_id, ...)`。
+  症狀是整個資料夾的預覽同時失敗、log 刷
+  `thumbnail for message N failed: The file to be accessed is currently stored in DC 1`，
+  DLL 於是退回讀整檔 —— 又是一種「看起來只是冷資料夾慢」的假象（另一種是 URL 跳脫那條）。
+  一般讀取不會中這個坑，因為 `_chunk` 本來就走 `iter_download`。
+- **一次送整批預覽會自己招來 FLOOD_WAIT。** `_thumbnails` 曾經把整個
+  `THUMB_PREFETCH_SLICE`（100 個 id）一口氣 `gather` 出去，Telegram 回 FLOOD_WAIT，
+  而這些呼叫走的是 `_call` —— 它先自己睡（log 上一排 `Sleeping for 2s on GetFileRequest
+  flood wait`），再按請求型別把 `_flood_waited_requests` 閘門架起來，於是**同一批裡其他
+  預覽也一起被拖累或直接失敗**（跟上傳那條同一個閘門）。現在由 `THUMB_CONCURRENCY`
+  （每條連線 2 個）節流，semaphore 存在 worker 上並在 client loop 裡建立，讓資料夾預抓
+  跟前景請求共用同一個上限，不會疊加成兩倍爆量。`_thumbnail_bytes` 也補上跟 `_chunk`
+  一樣的短 FLOOD_WAIT 重試。
+- **八個 client 共用一份 session，會在第一個跨 DC 檔案上互相打掉 exported auth。**
+  `_borrow_exported_sender` 是每個 client 各自一份，所以一批裡第一個跨 DC 的檔案會讓
+  8 條連線同時 `ExportAuthorization` + `ImportAuthorization`，其中幾個被 Telegram 以
+  `AUTH_BYTES_INVALID`（「The provided authorization is invalid」）打回。實測一輪 sweep：
+  開頭兩分鐘掉 19 張預覽，之後 1,679 次抓取一次都沒有。Telethon 既不重試，也不會把
+  import 失敗前就已經連上的 sender 斷掉 —— **log 裡成對的 `Task was destroyed but it is
+  pending` 就是它**（19 次失敗 × 4 條 task = 76 條，數字對得上）。`_thumbnail_bytes` 因此
+  把 `AuthBytesInvalidError` 也當成暫時性錯誤重試（`_is_export_race`），換一條連線再試。
+- **property handler 不能碰影片副檔名 —— 影片的縮圖是從屬性來的。** 影像有自己的
+  `IThumbnailProvider`（`{C7657C4A-…}`，自己解碼檔案），影片**沒有**：
+  `HKCR\.mp4\ShellEx\{e357fccd-…}` 指的是 shell32 的 Property Thumbnail Handler
+  `{9DBD2C50-…}`，它是去 **property store 拿 `System.ThumbnailStream`**。所以把
+  `PropertyHandlers\.mp4` 換成我們的 CLSID，等於把全機（不只 H:）的影片縮圖整個拔掉 ——
+  而且不是「我們答錯」，是**這個 DLL 在影片副檔名上根本不會被載入**：開了 `LogPath`
+  去 probe 一個本機 .mp4，一行都沒有，`SHGetPropertyStoreFromParsingName` 回 0x8007000D
+  （同一顆 DLL 同一個 CLSID，換成 .jpg 就正常載入並記錄），所以 handler 裡面也沒有東西
+  可以修。同一個檔案複製成兩個名字量：`.mp4` 完全沒有縮圖，`.m4v`（我們沒註冊、同樣走
+  `{9DBD2C50}`、用 Windows 自己的 property handler）0.19 秒就有。
+  修法是 `PROP_EXTS = IMAGE_EXTS`，`install_props()` 另外把舊安裝claim過而現在不claim的
+  副檔名還回去（`_release_props`），所以重跑一次 `--install-props`（要管理員）就修好。
+  **不損失任何東西**：那八個副檔名的 handler 從來沒被載入過，H: 上的影片本來就沒從
+  Telegram 拿到 duration/寬高；而屬性這半當初量到的 12.664s → 0.036s 全部是影像的檔頭讀取。
+  症狀是第四種「看起來只是冷資料夾慢」的假象，而且它連 H: 都不在 —— 使用者看到的是
+  「其他正常資料夾的影片沒有縮圖」。診斷方式：`isolate.exe thumb <資料夾>` 看 answered
+  數，再把同一個檔案改成 `.m4v` 對照。
+
+- **轉交 fallback handler 少了 `IInitializeWithItem`，影片就一張都沒有。** `Delegate()`
+  原本只試 `IInitializeWithFile` 跟 `IInitializeWithStream`；影片的 fallback
+  `{9DBD2C50-…}`（Property Thumbnail Handler）**兩個都不支援**，它要的是 shell item
+  —— 因為它是從 item 開 property store 去拿 `System.ThumbnailStream` 的。兩個都 QI 失敗
+  時 `hr` 停在 `E_FAIL`，`Delegate()` 就把 `E_FAIL` 回給 shell，shell 不會再去問別人，
+  於是**全機**（註冊是按副檔名的）不在 H: 上的影片縮圖全部消失。修法是中間插一段
+  `SHCreateItemFromParsingName` + `IInitializeWithItem`。實測同一個檔案：修之前 `.mp4`
+  0/3 有縮圖、對照組 `.m4v`（沒被我們接手）3/3；修之後 `.mp4` 3/3。
+  這個坑跟上面那條（property handler 不要碰影片）是**兩個獨立的 bug，兩個都要修才會好**：
+  只修一個的話另一個照樣把影片縮圖擋掉，而且症狀完全一樣。
+  另外 `TeleDriveProps.cpp` 的 `InitDelegate()` **刻意不加** `IInitializeWithItem` ——
+  property handler 用 shell item 初始化會再繞回 property store 的查表，也就是繞回自己。
+
+- **不是每個檔案都是 document —— chat import 進來的是 photo，而整個 `tgio` 是照
+  document 寫的。** backend 的 chat-media import 直接把聊天室裡的訊息註冊成檔案，
+  那些是 `MessageMediaPhoto`；`_fetch_document` 只認 `msg.document`，於是那些 entry
+  的**讀取、縮圖、屬性三條路一起死**：bridge 回 500，而 DLL 分不出 500 跟「這個檔沒有
+  預覽」的差別（見上一條），照樣 `delegating` 去讀整檔 —— 那個讀取也是 500。
+  平常看不出來，直到 warmup 走到那個資料夾：實測一個 3,756 個檔的資料夾裡有 **2,066 個**
+  是 photo，一輪 sweep 下去 Telegram 把 8 條 pool 連線全部踢掉
+  （log 刷 `Connection closed while receiving data: 0 bytes read`），此後**所有**讀取停擺，
+  讀 16 bytes 要 202 秒，Explorer 整個卡死 —— 使用者看到的是「H: 打不開」，
+  第六種假象，而且這次連根目錄都還列得出來，所以更難認。
+  修法是 `tgio` 全面接受兩種 media：
+  - **`_media_size`**：document 是 `.size`；photo 是 `sizes[-1]` 的位元組數。
+    **`PhotoSizeProgressive` 沒有 `size`，它的 `sizes` 是每一遍 progressive scan 的
+    累積長度，所以整張圖是最後一個元素，不是總和** —— 加總會多報三倍，客戶端就讀過界。
+    拿四則真實訊息對過，`sizes[-1]` 的位元組數跟 backend 記的 filesize 完全相等
+    （62678 / 184878 / 283437 / 37317，四個全中）。
+  - **`_best_thumb`**：document 的 `thumbs` 全是小圖，取最大的就對；**photo 的 `sizes`
+    不是** —— 它一路排到接近原圖（實測一張 283 KB 的圖，`m` 是 32 KB 而 `x` 是 150 KB）。
+    所以 photo 走 `THUMB_PREVIEW_MAX`（64 KB）上限取最大的那個，取不到再退回整份清單，
+    寧可拿一張過大的預覽也不要回 404 把 shell 推去讀原圖。
+  - **`_thumbnail_bytes`**：photo 要用 `InputPhotoFileLocation`，用
+    `InputDocumentFileLocation` 會被回 LOCATION_INVALID。
+  - **`_media_attributes`**：photo 沒有 `attributes` 也沒有 `mime_type`，寬高從
+    `sizes[-1]` 拿，mime 固定 `image/jpeg`。
+  修完同一個資料夾：**12 個檔 0.23 秒、51.2 張/秒、`delegating` 0 次**，整檔下載的長度
+  與 backend 記錄逐位元組相符且以 `ffd9` 收尾。
+  **`entry.has_thumbnail` 不是決定這條 photo/document 分支的東西** —— 這條講的是
+  media 的**型別**，chat import 進來的旗標一樣是 `True`。但那個旗標**確實**是
+  「要不要去找預覽」的閘門（`Resolver.thumbs_for`、`needs_warming`，網頁那邊的
+  `loadThumbnails` 也一樣），而 backend 對它的定義就是「Telegram 訊息身上有沒有
+  內嵌縮圖」—— 這裡曾經寫成「跟 bridge 要的預覽兩件事無關」，那句話錯了，
+  而它正好掩護了 `register()` 把它寫死成 `False` 的那個 bug
+  （見「一般路徑的寫入」那一節）。
+
+- **重啟 bridge 會留下孤兒 `warmshell.exe`。** 那 600 秒的期限住在父行程的
+  `subprocess.run(timeout=600)` 裡，所以殺掉 bridge 之後 `warmshell` 還在跑，而且
+  再也沒有人會把它 timeout 掉。它繼續向 shell 要縮圖、繼續透過 `H:` 讀檔，正好跟
+  「重啟是為了讓瀏覽變快」對著幹。`restart.bat` 因此連 `warmshell.exe` 一起
+  `taskkill` —— 它沒有任何需要收尾的狀態。
+
+- **後端斷一條閒置的 keep-alive 連線，代價是一次整檔下載。** `tdapi._call` 用
+  `requests.Session` 對 backend 保持連線池，而 uvicorn 幾秒沒動就把閒置連線關掉 ——
+  下一個請求拿到那個死掉的 socket，在伺服器讀到任何一個位元組**之前**就
+  `RemoteDisconnected`。原本沒有重試，於是它變成 `/rpc/thumb` 的一個 500。
+  **`/rpc/thumb` 的 500 不是「縮圖慢一點」** —— DLL 分不出它跟「這個檔沒有預覽」的差別
+  （兩者都只是 fetch 失敗），於是 `delegating` 給內建 handler，內建 handler 去讀
+  **整張原圖**。實測 log 上就是一條從 offset 0 排到 6.8 MB 的循序下載，幾個這種就把
+  連線池吃光並招來 FLOOD_WAIT，`warmshell` 那一批 25 個檔於是撞滿 600 秒 timeout、
+  回報 `shell warm stopped after 0/100`，然後下一批再來一次 —— 前景瀏覽就一直轉。
+  修法是 `_call` 對 `ConnectionError` 重試一次；**因為請求根本沒抵達 app，POST 重試也是
+  安全的**。重試預算跟 401 重登的預算要**分開兩個旗標**，否則一條死 socket 會把重登的
+  額度用掉（restart 過的 backend 正好會先回 401）。
+  診斷方式：`bridge.log` 找 `rpc /thumb failed` 跟 `RemoteDisconnected`，再開
+  `HKCU\Software\TeleDriveWebDAV\LogPath` 看 DLL 有沒有 `preview fetch failed -> delegating`
+  —— 這是第五種「看起來只是冷資料夾慢」的假象。
+
+- **後端把 `POST /auth/login` 拿掉了，症狀是 `H:` 整個打不開。** TeleDrive commit
+  `22734f4 "security: restore the metadata-only boundary and harden the deployment"`
+  移除了「拿 Telethon StringSession 換 JWT」那個端點 —— 理由是對的：交出 auth_key 等於
+  把整個 Telegram 帳號交給後端，而這座 bridge 存在的意義就是守住那條界線。取而代之的是
+  bot challenge：`POST /auth/challenge` 拿一個 nonce → **由要被驗證的那個帳號**把 nonce
+  DM 給指名的 bot → `POST /auth/verify` 換 JWT（202 表示 bot 的 `getUpdates` 長輪詢還沒
+  收到，繼續等；401 是 nonce 過期或不存在）。身分證明是那則 update 的 `from`，所以線上
+  沒有任何秘密。
+  **這在網頁上是互動流程，在這裡不是** —— bridge 手上本來就有使用者的 Telethon client，
+  自己把 DM 送出去就好，全程無人介入（`TelegramWorker.send_dm`，由 `bridge.main` 用
+  `api.set_dm_sender(worker.send_dm)` 注入；`tdapi.py` 是 metadata 那一半，不該自己碰
+  MTProto）。代價是每張 token 一則 bot DM，JWT 活 24 小時又有 `token.txt` 撐過重啟，
+  大約一天一則。
+  **沒修之前的故障鏈長得完全不像 auth 問題**：`/auth/login` 404 → 拿不到 JWT →
+  每個 `/folders`、`/files` 都 401 → `_call` 以為是過期 JWT，於是無限重登（`bridge.log`
+  刷滿 `JWT rejected — re-authenticating`）→ PROPFIND `/` 回 500 → rclone 沒有樹可以掛 →
+  Explorer 說「因為 I/O 裝置錯誤，所以無法執行要求」。**先打一次
+  `curl -X PROPFIND 127.0.0.1:8081/`**：500 就是 bridge 這層，跟 rclone、WinFsp、
+  縮圖 handler 都無關，再往 `bridge.log` 找真正的 4xx。
+- **檔案的 DC 不是 session 的 DC，而 Telethon 的 exported sender 有一個 60 秒的計時器。**
+  這個帳號的 session 在 DC 5（`91.108.56.140`），而 **chat import 進來的檔案在 DC 1** ——
+  轉發進來的 media 保留來源 chat 的 DC（TeleDrive 前端 commit `4d397f8` 記的同一件事），
+  所以那些資料夾的**每一次**讀取和**每一張**預覽都是 exported sender 在答。
+  實測 `少女镇2.0版本重生/photo_20260822_222816_24239.jpg`（message 79357）：
+  `file dc 1 / session dc 5`，預覽 32,092 bytes；自己上傳的 `/game` split part
+  （message 24716）則是 `dc 5`，走主連線、不經過這條路。Telethon 每次下載借一條、下載結束還回去，
+  最後一條還回去之後 60 秒（`_DISCONNECT_EXPORTED_AFTER`）就把它斷掉
+  （`telethon/client/telegrambaseclient.py`）。60 秒在這裡什麼都不是 —— sweep 兩批之間的
+  空檔、沒人點的那一分鐘 —— 於是下一批預覽會讓 8 條 pool 連線**同時**重連同一個 DC，
+  Telegram 的回答是關連線。實測一份 `bridge.log`：248 次 `Disconnecting borrowed sender
+  for DC 1`、387 次重連、138 次 `Server closed the connection`。
+  **每一次關掉都是一張失敗的預覽，而失敗的預覽不是「慢一點的縮圖」**：DLL 分不出它跟
+  「這個檔沒有預覽」的差別，於是 `delegating` 去讀整張原圖（見上面第五種假象）。
+  修法是 `_pin_exported_sender`：每個 pool client 對那個 DC 借一次、**永遠不還**，
+  參照計數就不會回到 0，`should_disconnect()` 永遠不成立，連線活到 bridge 結束。
+  每次下載照樣在這條之上自己借還，Telegram 真的把連線關掉時 MTProtoSender 也照樣自己
+  重連 —— 差別只在不再由計時器主動拆掉再 8 條一起重建。
+  這跟 TeleDrive 前端的 `senderDcFor`（commit `4d397f8`）是同一件事的兩面：**誰來答
+  這個 GetFile 值得講清楚，因為答錯了只會表現成「這個資料夾很冷」，永遠不會表現成錯誤。**
+- **`bridge.log` 裡的 `Starting indirect file download` 不是警告，但它是一個埋著的 2 倍。**
+  Telethon 選 `_DirectDownloadIter` 的條件裡有一條 `offset % limit == 0`，而那個 `limit`
+  是**檔案的 chunk 數**（500 MiB / 512 KiB = 1000），不是 `request.limit` ——
+  拿位元組 offset 去模一個數量。512 KiB 的倍數模 1000 只有每 125 個才是 0，所以
+  **約 99% 的 chunk 讀取走的是 `_GenericDownloadIter`**。目前不多花位元組：
+  那條路徑先算 `bad = offset % request.limit`，而 `SeekableRemoteFile` 的 block 是
+  512 KiB 對齊、part 大小也是 512 KiB 的整數倍，所以 `bad` 永遠是 0，一個 chunk 還是
+  一個 GetFile。但 `bad != 0` 的時候它要**抓兩次 512 KiB 才湊得出一個 chunk** ——
+  也就是說任何一天有人讓 `_read` 收到非 512 KiB 對齊的 offset（自己算的 range、
+  改了 `BLOCK_SIZE`、part 大小不再是 512 KiB 的倍數），讀取成本就默默變兩倍。
+  要擋掉的話 `_chunk` 傳 `limit=1` 就永遠是 direct（反正只取一個 chunk），
+  但那沒有量到差別，所以沒改。
+- **Telethon 每一個 `iter_download` 都會在 INFO 印一行，而這座 bridge 每 512 KiB 一個 `iter_download`。**
+  所以 `Starting direct file download in chunks of 524288 at 0, stride 524288` 的速率
+  就是讀取速率 —— sweep 的 shell warm 走遍整棵樹的靜態圖，而 shell 每一張都要自己
+  讀一次檔頭（見「效能」第 4 節），因此持續約 **360 行/分**。實測一份 `bridge.log`：
+  2,100 行裡 **1,993 行是這一行**，8 MB 的 rotation 幾分鐘就輪完，而同一份檔裡那 5 行
+  `Sleeping for 12s on ... flood wait` 根本看不到。**代價不是難看，是這份 log 就是
+  這份文件每一條坑的診斷工具。** 修法是 `bridge.ThrottleRepeats`：按 `record.msg`
+  （模版，不是成形的那一行）每 60 秒放一行過，並把壓下的筆數接在後面
+  （`(+357 more in the last 60s)`）。**不是把 `telethon.client.downloads` 整個降到 WARNING** ——
+  同一個 logger 帶的是這裡最常讀的下載診斷：`File lives in another DC`、
+  `File ref expired during download`，以及 direct/indirect 那個埋著的 2 倍（下一條）。
+  按模版分鍵也意味著 direct 洗版擋不住第一行 indirect。
+
+- **`_chunk` 提早 `return` 會漏掉 exported sender 的歸還**（`iter_download` 只有跑到底或
+  短讀時才 `close()`；`RequestIter` 的歸還只寫在 `close()` 裡，`async for` 中途 return
+  到不了）。一個 chunk 就是整個請求，所以這條路徑**每次**都是中途離開，跨 DC 的讀取因此
+  只記 borrow 不記 return。現在由 `_close_download` 明確關掉迭代器補上 ——
+  不是為了那條閒置連線（上一條反而是刻意留著它），而是因為**只會往上加的計數跟「刻意
+  釘住」分不出來**，而上一條的正確性就建立在那個計數上。
 
 ## rclone 掛載參數
 
@@ -279,7 +649,14 @@ shell 是在 `IShellItemImageFactory::GetImage` 裡、在 `IThumbnailProvider` �
 - `--vfs-cache-max-age 8760h`：實質停用**時間**淘汰。age 到期就丟等於把還會用的資料重抓一次，
   白費頻寬又吃 SSD TBW。這個使用型態沒有別的資料競爭快取，上次用過的東西數月後很可能還在。
   SSD 壽命非問題：約 0.6 TB/年寫入，512 GB 消費級 NVMe TBW 約 300 TB。
-- `--dir-cache-time 1h`：檔案多時 10s 會反覆打 API。網頁改動後用 `rclone rc vfs/forget`。
+- `--dir-cache-time 1h`：檔案多時 10s 會反覆打 API。網頁改動後用
+  `rclone rc vfs/forget dir=<相對路徑>`（例：`dir=game`）。
+  **這需要 `--rc-no-auth`，光有 `--rc` 不夠** —— rclone 對未設定驗證的 rc server 把
+  `vfs/forget` 算成需要驗證的呼叫，回 `403 authentication must be set up`。掉了這個旗標的
+  後果是「網頁上已經有、bridge 的 PROPFIND 也看得到、但 `H:` 就是沒有」只能等一小時
+  （或重新 mount，連帶卸掉 `H:`）。診斷方式就是兩邊各列一次：`ls H:\game` 跟直接對
+  `127.0.0.1:8081/game/` 發 PROPFIND，不一致就是 rclone 這層的 dir cache，跟 bridge 的
+  `dir_cache_seconds`（1 小時，記憶體與 `meta/dirs/` 共用）和 `/rpc/forget` 那層沒關係。
 - **不套 `crypt` / `compress`**：否則網頁端下載到加密/壓縮後的內容，
   失去「瀏覽器也能直接看」這個核心價值。
 
@@ -304,12 +681,21 @@ shell 是在 `IShellItemImageFactory::GetImage` 裡、在 `IThumbnailProvider` �
 
 | 檔案 | 覆蓋 |
 |---|---|
-| `tests/test_split_math.py` | offset→(part, 內部 offset) 映射、跨界切段、`SeekableRemoteFile` 的 seek/range/block 快取 |
+| `tests/test_split_math.py` | offset→(part, 內部 offset) 映射、跨界切段、`SeekableRemoteFile` 的 seek/range/block 快取、block 快取裝得下一整個串流讀取寬度（不會把剛抓回來的那批丟掉） |
 | `tests/test_zipfs.py` | 虛擬樹結構（空目錄、非 ASCII、隱含目錄、traversal 防護）、local header 偏移、單 entry range |
 | `tests/test_sizes.py` | `filesize` 灌水的裁切（`_hash_size` / `_clip_parts` / `total_size`）、`JsonStore` 並行合併 |
+| `tests/test_photo_media.py` | photo 型 media：progressive `sizes` 取最後一個而非總和、`_fetch_document` 接受 photo、預覽受 `THUMB_PREVIEW_MAX` 上限且全部超標時仍給答案、`InputPhotoFileLocation`、寬高從 `sizes[-1]`；document 那半的行為不變 |
+| `tests/test_backend_retry.py` | backend 斷掉閒置 keep-alive 時 `_call` 重試一次（GET 與 POST 都是，因為請求沒抵達 app）、不無限重試、真正的 HTTP 錯誤不重試、連線重試與 401 重登的預算互不吃掉 |
+| `tests/test_dir_cache.py` | listing 的往返次數：`/folders` 與 `/files` 真的併發（循序會卡住測試而不是靜靜通過）、一次點擊只付新的那一層、`meta/dirs/` 撐過換 client（重啟）、與記憶體共用同一個 TTL、舊格式的檔案重列而不是誤讀、`fresh` 兩層都繞過並改寫磁碟、`invalidate` 連磁碟一起清、root 與含 `..` 的 id 都產生安全檔名 |
+| `tests/test_auth_challenge.py` | bot challenge 登入：nonce 原文 DM 給 challenge 指名的 bot、202 continue 輪詢、session string 一個位元組都不上線、token.txt 重用、沒接 Telegram client 時明確報錯、並行 401 重登只送一個 nonce |
+| `tests/test_thumbnails.py` | 預覽走 DC-aware 的 `iter_download`（跨 DC 不再 FILE_MIGRATE）、整批預覽受 `THUMB_CONCURRENCY` 節流、短 FLOOD_WAIT 重試 |
+| `tests/test_read_pace.py` | 一次串流讀取在每條連線上排 `READS_IN_FLIGHT` 個請求且全部同時在飛、窄讀取仍只付一個請求、檔案 DC 的 exported sender 每個連線只借一次且刻意不還（session 自己的 DC 不釘）、讀取成功與失敗都會關掉下載迭代器 |
+| `tests/test_upload_preview.py` | 上傳的縮圖：JPEG／帶 alpha 的 PNG／EXIF 旋轉都給得出「≤ 320px、≤ 20 KB 的 JPEG + 原圖寬高」、zip 與截斷的檔回 None（不讓上傳失敗）、只有單一 segment 的圖帶預覽（split 的每個 part 都不帶）、暫存的 `.jpg` 用完就刪；以及 `register()` 照實回報 `has_thumbnail`（圖 True、zip False、去重沿用原 row），沒有它前面那半等於沒做 |
+| `tests/test_log_noise.py` | 日誌可讀性：單一 call site 的洪水收成一行並報出壓了幾筆、同一個 logger 的其他診斷不被延遲（這就是不用 `setLevel(WARNING)` 的理由）、direct 的洪水擋不住第一行 indirect |
+| `tests/test_shell_warm.py` | shell warm 的記帳：逐檔 stderr 回報的解析（含非 ASCII 路徑）、被 kill 的批次仍報得出暖成幾個與還卡在哪一個、卡住就停掉這一輪而不是把後面幾十批排在後面、期限按檔數算、沒掛載就不去問 shell |
 | `tests/test_upload_pace.py` | `tgupload.UploadGate`：distinct-event guard、window/rate 的 AIMD、rate cap 從量測值算出且爬回不再綁得住時拆掉、注入假時鐘 |
 | `tests/test_upload_parts.py` | `plan_parts`、`_PartReader` 的隨機讀取、`send_part` 的 flood/斷線重試（繞過 `client._call`）、`upload_file_parts` 的 segment-relative index、bytes↔offset、永久失敗時取消手足 task |
-| `tests/test_bridge_e2e.py` | 真的用 HTTP 跑整個 bridge（PROPFIND / GET / Range / 403 / MKCOL+PUT → 打包 → 上傳 → 再瀏覽 / `/rpc/*` / fetch-local / warmup sweep 的續跑與禮讓 / split part 的精確大小非灌水 / 一般路徑的 MKCOL、PUT 新檔、覆寫、去重、`/rpc/status` 的 `uploads` 欄位 / DELETE 在 `/game` 與一般路徑對「還在暫存」一致放行、對「已上傳」一致 403 且不因遞迴列出整棵樹而 500 / COPY 對已上傳內容一致 403（檔案與資料夾兩種 resource 都不因遞迴列出整棵樹而 500）、對還在暫存的內容（`/game` 與一般路徑）做出真正的本機複製、跨 `/game` 邊界複製一律 403），只有 MTProto 與 backend 是假的 |
+| `tests/test_bridge_e2e.py` | 真的用 HTTP 跑整個 bridge（PROPFIND / GET / Range / 403 / MKCOL+PUT → 打包 → 上傳 → 再瀏覽 / `/rpc/*` / fetch-local / warmup sweep 的續跑與禮讓 / split part 的精確大小非灌水 / 一般路徑的 MKCOL、PUT 新檔、覆寫、去重、`/rpc/status` 的 `uploads` 欄位 / DELETE 在 `/game` 與一般路徑對「還在暫存」一致放行、對「已上傳」一致 403 且不因遞迴列出整棵樹而 500 / COPY 對已上傳內容一致 403（檔案與資料夾兩種 resource 都不因遞迴列出整棵樹而 500）、對還在暫存的內容（`/game` 與一般路徑）做出真正的本機複製、跨 `/game` 邊界複製一律 403 / 父目錄已在 staging 時的 PUT 與 MKCOL 一次 backend 都不打），只有 MTProto 與 backend 是假的 |
 
 掛載後仍需手動走一遍（測試無法代替）：
 
@@ -336,7 +722,7 @@ shell 是在 `IShellItemImageFactory::GetImage` 裡、在 `IThumbnailProvider` �
 6. **上傳中斷的檔案**：`split_group_id` 有值但只註冊了 part 0，那是真的少資料，只能刪掉重傳。
    `truncated.csv` 記著目前已知的 38 個。
 7. **一機一份 bridge**：只有跑 bridge 的那台 PC 能掛磁碟。
-8. **進入未快取資料夾的第一個請求約 11 秒**（路徑解析），之後每張 15ms。
+8. **進入未快取資料夾的第一個請求約 0.58 秒**（路徑解析：每一層一個 backend 往返，見「效能」第 7 節），之後每張 15ms。重啟後若那個資料夾之前列過，是 0.016 秒。
 9. Windows 11 右鍵選單只能出現在「顯示更多選項」（第一層要 MSIX + `IExplorerCommand`）。
 10. **COPY/MOVE 到已打包的 `/game/<name>` 底下不會失敗，會悄悄開一個新的 shadow staging unit**：
     跟 PUT 不一樣（`ZipDirCollection.create_empty_resource` 會擋下並提示 `PACKED_MESSAGE`），
@@ -346,8 +732,9 @@ shell 是在 `IShellItemImageFactory::GetImage` 裡、在 `IThumbnailProvider` �
 
 ## 明確不做
 
-- **一般檔案的縮圖與 album 分組**：PUT/覆寫本身已支援（見「一般路徑的寫入」一節），
-  但那是網頁上傳流程專屬的加工，這裡沒有重做。去重是共用的，不算例外。
+- **album 分組**：PUT/覆寫本身已支援（見「一般路徑的寫入」一節），但分組是網頁上傳
+  流程專屬的加工，這裡沒有重做。去重與縮圖都是共用的，不算例外
+  （縮圖見「一般路徑的寫入」那一節，那是效能前提不是加工）。
 - **版本回收**：backend 沒有這個概念，覆寫就是新增一筆同名 row，舊的還在只是被蓋掉
   （已知限制第 5 點），不是真的版本歷史。
 - **`MOVE`/`PROPPATCH`/`LOCK` 限定在 `/game/<name>/...`**：
