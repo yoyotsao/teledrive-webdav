@@ -227,6 +227,28 @@ def test_acquire_combines_twelve_slots_and_initial_pacing(limiter, clock):
     asyncio.run(scenario())
 
 
+def test_acquire_caps_a_larger_requested_window_at_twelve(module, clock):
+    limiter = module.AdaptiveUploadLimiter(max_window=24, clock=clock, sleeper=clock.sleep)
+
+    async def scenario():
+        release = asyncio.Event()
+        entered = []
+
+        async def worker():
+            async with limiter.acquire():
+                entered.append(clock.now)
+                await release.wait()
+
+        tasks = [asyncio.create_task(worker()) for _ in range(13)]
+        await asyncio.sleep(0)
+        assert limiter.snapshot().window == 12
+        assert len(entered) == 12
+        release.set()
+        await asyncio.gather(*tasks)
+
+    asyncio.run(scenario())
+
+
 def test_acquire_releases_slot_if_cancelled_during_pacing(module, clock):
     async def scenario():
         sleeping = asyncio.Event()
@@ -311,7 +333,7 @@ def test_persists_per_account_and_reloads_discounted_ceiling(module, clock, tmp_
     assert not list((tmp_path / "meta").glob("*.part"))
 
 
-@pytest.mark.parametrize("payload", ["not json", "[]", '{"version":99}', '{"version":1,"rate":"bad"}', '{"version":1,"rate":NaN,"updated_at":1000}'])
+@pytest.mark.parametrize("payload", ["not json", "[]", '{"version":99}', '{"version":1,"rate":"bad"}', '{"version":1,"rate":NaN,"updated_at":1000}', json.dumps({"version": 1, "rate": 10 ** 400, "updated_at": 1000})])
 def test_corrupt_state_falls_back(module, clock, tmp_path, payload):
     meta = tmp_path / "meta"
     meta.mkdir()

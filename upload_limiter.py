@@ -67,7 +67,12 @@ class LimiterSnapshot:
 
 
 def _finite_number(value) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _wait_seconds(seconds: Optional[float]) -> float:
@@ -145,7 +150,7 @@ class AdaptiveUploadLimiter:
         self.account_id = int(account_id)
         self._clock = clock
         self._sleep = sleeper or asyncio.sleep
-        self._window = max(1, int(max_window))
+        self._window = min(12, max(1, int(max_window)))
         self._slots = asyncio.Semaphore(self._window)
         self._rate = self.config.initial
         self._ceiling: Optional[float] = None
