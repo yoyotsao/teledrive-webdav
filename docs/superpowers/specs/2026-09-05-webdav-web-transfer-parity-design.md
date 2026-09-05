@@ -1,7 +1,7 @@
 # WebDAV / Web transfer parity design
 
 **Date:** 2026-09-05  
-**Status:** Draft, pending written-spec review  
+**Status:** Approved
 **Source analysis:** `UPLOAD_DOWNLOAD_COMPARISON.md`
 
 ## Goal
