@@ -197,7 +197,7 @@ class TelegramAccountPool:
         except Exception as exc:
             self.stop()
             detail = self._safe_detail(primary, exc)
-            raise AccountUnavailableError(f"primary account authentication failed: {detail}") from exc
+            raise AccountUnavailableError(f"primary account authentication failed: {detail}") from None
 
         for index, runtime in enumerate(self._runtimes):
             runtime.linked = runtime.online and (

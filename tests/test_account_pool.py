@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import traceback
 from types import SimpleNamespace
 
 import pytest
@@ -198,6 +199,8 @@ def test_primary_auth_failure_stops_workers_and_redacts_primary_session():
     message = str(raised.value)
     assert "account 1 (primary)" in message
     assert "primary-secret" not in message
+    rendered_traceback = "".join(traceback.format_exception(raised.value))
+    assert "primary-secret" not in rendered_traceback
     assert primary.stopped == secondary.stopped == 1
 
 
