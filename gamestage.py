@@ -32,6 +32,7 @@ from typing import Dict, List, Optional, Sequence
 
 from config import ext_path as _ext
 from tgio import SEGMENT_SIZE, SegmentReader, make_preview, plan_segments
+from upload_engine import UploadedPart, assert_parts_cover_file, canonical_existing_parts
 
 log = logging.getLogger("gamestage")
 
@@ -67,57 +68,6 @@ def sample_hash(path: Path) -> str:
             remaining -= len(chunk)
             digest.update(chunk)
     return f"{digest.hexdigest()}:{size}"
-
-
-def canonical_existing_parts(rows: Sequence[dict]) -> List[dict]:
-    """Collapse same-hash rows from /files/check-hash to one upload's real parts.
-
-    A port of frontend/src/lib/uploadPlanner.ts:canonicalExistingParts. The
-    endpoint returns *every* row sharing the hash, including rows created by
-    earlier dedup registrations; registering one new row per returned row makes
-    the count double on every re-upload and fabricates split groups with
-    thousands of bogus parts. Collapsing keeps a duplicate registration at
-    exactly total_parts rows.
-    """
-    if not rows:
-        return []
-
-    def to_part(row: dict, index: int) -> dict:
-        return {
-            "filesize": int(row.get("filesize") or 0),
-            "mime_type": row.get("mime_type"),
-            "message_id": row.get("telegram_message_id"),
-            "access_hash": row.get("access_hash"),
-            "part_index": index,
-            # Dedup reuses the very same Telegram message, so whatever it has
-            # is what the new row has.
-            "has_thumbnail": bool(row.get("has_thumbnail")),
-        }
-
-    single = next(
-        (r for r in rows if not r.get("is_split_file") and r.get("telegram_message_id") is not None), None
-    )
-    if single is not None:
-        return [to_part(single, 0)]
-
-    groups: Dict[str, List[dict]] = {}
-    for row in rows:
-        key = row.get("split_group_id") or row.get("file_id")
-        groups.setdefault(key, []).append(row)
-
-    best: List[dict] = []
-    best_distinct = -1
-    for group in groups.values():
-        distinct = len({(r.get("part_index") or 0) for r in group})
-        if distinct > best_distinct:
-            best_distinct, best = distinct, group
-
-    by_index: Dict[int, dict] = {}
-    for row in best:
-        index = row.get("part_index") or 0
-        if row.get("telegram_message_id") is not None and index not in by_index:
-            by_index[index] = row
-    return [to_part(by_index[i], i) for i in sorted(by_index)]
 
 
 @dataclass
@@ -418,22 +368,36 @@ def upload_and_register(
         raise ValueError(f"{upload_name} is empty (0 bytes) — nothing to upload")
     file_hash = sample_hash(archive)
 
-    existing = _lookup_duplicate(api, file_hash)
+    existing = _lookup_duplicate(api, file_hash, size)
     if existing:
         log.info("%s already on Telegram (%s parts) — registering without uploading", upload_name, len(existing))
         parts = existing
     else:
-        parts = _upload_segments(worker, archive, size, upload_name, mime_type)
+        parts = [
+            UploadedPart(
+                index=index,
+                message_id=int(part["message_id"]),
+                file_id=str(part.get("file_id") or ""),
+                access_hash=part.get("access_hash"),
+                size=int(part["filesize"]),
+                # The legacy worker is the primary account. Routed uploads
+                # provide their explicit storage account through the engine.
+                telegram_user_id=int(part.get("telegram_user_id") or 0),
+                has_thumbnail=bool(part.get("has_thumbnail")),
+            )
+            for index, part in enumerate(_upload_segments(worker, archive, size, upload_name, mime_type))
+        ]
+    assert_parts_cover_file(parts, size)
 
     split_group_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:7]}"
     total = len(parts)
     for index, part in enumerate(parts):
         api.register(
             filename=upload_name,
-            filesize=part["filesize"],
-            message_id=part["message_id"],
-            file_id=part.get("file_id") or f"{split_group_id}-{index}",
-            access_hash=part.get("access_hash"),
+            filesize=part.size,
+            message_id=part.message_id,
+            file_id=part.file_id or f"{split_group_id}-{index}",
+            access_hash=part.access_hash,
             mime_type=mime_type,
             parent_id=parent_id,
             is_split_file=total > 1,
@@ -442,12 +406,12 @@ def upload_and_register(
             total_parts=total,
             split_group_id=split_group_id,
             file_hash=file_hash,
-            has_thumbnail=bool(part.get("has_thumbnail")),
+            has_thumbnail=part.has_thumbnail,
         )
     api.invalidate(parent_id)
 
 
-def _lookup_duplicate(api, file_hash: str) -> List[dict]:
+def _lookup_duplicate(api, file_hash: str, original_size: int) -> List[UploadedPart]:
     try:
         result = api.check_hash(file_hash)
     except Exception as exc:
@@ -455,7 +419,7 @@ def _lookup_duplicate(api, file_hash: str) -> List[dict]:
         return []
     if not result or not result.get("found"):
         return []
-    return canonical_existing_parts(result.get("files") or [])
+    return canonical_existing_parts(result.get("files") or [], original_size)
 
 
 def _upload_segments(

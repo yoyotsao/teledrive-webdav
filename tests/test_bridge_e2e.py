@@ -918,9 +918,9 @@ def test_canonical_existing_parts_collapses_corrupt_groups():
         {"file_id": "d", "filesize": 10, "telegram_message_id": 9, "is_split_file": True,
          "split_group_id": "g2", "part_index": 0, "mime_type": None},
     ]
-    parts = gamestage.canonical_existing_parts(rows)
-    assert [p["part_index"] for p in parts] == [0, 1]
-    assert [p["message_id"] for p in parts] == [1, 2]
+    parts = gamestage.canonical_existing_parts(rows, original_size=15)
+    assert [p.index for p in parts] == [0, 1]
+    assert [p.message_id for p in parts] == [1, 2]
 
 
 def test_delete_inside_staging_is_allowed(rig):

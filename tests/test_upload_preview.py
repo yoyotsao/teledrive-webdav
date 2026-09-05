@@ -215,9 +215,9 @@ def test_dedup_keeps_whatever_the_reused_message_already_had(tmp_path):
         "access_hash": "ah", "is_split_file": False, "has_thumbnail": True,
     }]
 
-    (part,) = gamestage.canonical_existing_parts(rows)
+    (part,) = gamestage.canonical_existing_parts(rows, original_size=4096)
 
-    assert part["has_thumbnail"] is True
+    assert part.has_thumbnail is True
 
 
 if __name__ == "__main__":
