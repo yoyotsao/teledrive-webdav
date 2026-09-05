@@ -264,14 +264,23 @@ class TelegramWorker:
         self._thread = threading.Thread(target=self._run_loop, name="tg-loop", daemon=True)
         self._thread.start()
         self._ready.wait()
-        self.run(self._connect())
+        try:
+            self.run(self._connect())
+        except Exception:
+            # A bad or expired session must not leave a live loop behind, and
+            # the worker must remain retryable after configuration is fixed.
+            self.stop()
+            raise
         log.info("Telegram connected as %s (id=%s)", getattr(self._me, "username", None), getattr(self._me, "id", None))
 
     def _run_loop(self) -> None:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
         self._ready.set()
-        self._loop.run_forever()
+        try:
+            self._loop.run_forever()
+        finally:
+            self._loop.close()
 
     async def _connect(self) -> None:
         # Constructed on the loop thread so Telethon binds to the right loop.
@@ -342,13 +351,27 @@ class TelegramWorker:
         return self._gate
 
     def stop(self) -> None:
-        if self._loop is None:
+        loop = self._loop
+        thread = self._thread
+        if loop is None:
             return
         try:
             self.run(self._disconnect_all(), timeout=15)
         except Exception:  # pragma: no cover - best effort on shutdown
             pass
-        self._loop.call_soon_threadsafe(self._loop.stop)
+        loop.call_soon_threadsafe(loop.stop)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=15)
+        self._loop = None
+        self._thread = None
+        self._ready.clear()
+        self._client = None
+        self._me = None
+        self._pool = None
+        self._pool_lock = None
+        self._upload = None
+        self._gate = None
+        self._thumb_gate = None
 
     async def _disconnect_all(self) -> None:
         clients = list(self._pool or [self._client])
