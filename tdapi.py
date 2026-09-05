@@ -595,7 +595,13 @@ class TeleDriveClient:
                 entry.real_size,
             )
 
-        cached = self._split_cache.get(entry.split_group_id)
+        cache_key = f"{entry.telegram_user_id}:{entry.file_id}"
+        cached = self._split_cache.get(cache_key)
+        # Old single-account caches were keyed only by split group. They are
+        # safe to reuse only for legacy route zero; a nonzero account must never
+        # inherit bytes cached for another account with the same identifiers.
+        if cached is None and entry.telegram_user_id == 0:
+            cached = self._split_cache.get(entry.split_group_id)
         if cached:
             return _clip_remote_parts(_cached_remote_parts(cached, entry.file_id), entry.real_size)
 
@@ -622,7 +628,7 @@ class TeleDriveClient:
         if not parts:
             raise ApiError(404, f"split group {entry.split_group_id} has no usable parts")
         # Cache the raw table: clipping is cheap and depends on the entry.
-        self._split_cache.put(entry.split_group_id, [
+        self._split_cache.put(cache_key, [
             [part.message_id, part.size, part.telegram_user_id, part.file_id]
             for part in parts
         ])

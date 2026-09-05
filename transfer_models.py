@@ -32,12 +32,6 @@ class RemotePart:
     telegram_user_id: int
     file_id: str
 
-    def __iter__(self):
-        """Expose the historical read tuple while retaining route metadata."""
-        yield self.message_id
-        yield self.size
-
-
 @dataclass(frozen=True)
 class UploadedPart:
     index: int

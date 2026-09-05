@@ -14,6 +14,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import tgio  # noqa: E402
+from transfer_models import RemotePart  # noqa: E402
 
 
 class _Thumb:
@@ -89,9 +90,11 @@ def test_thumbnail_uses_dc_aware_download():
 def test_thumbnail_batch_caps_requests_in_flight():
     """A folder prefetch is 100 ids; firing 100 GetFiles at once earns FLOOD_WAIT."""
     worker = _worker()
-    ids = list(range(1, 101))
+    parts = [RemotePart(message_id, 1, 0, "12345") for message_id in range(1, 101)]
     now = time.monotonic()
-    worker._docs = {i: (_Doc(), now) for i in ids}
+    worker._docs = {
+        (part.message_id, part.file_id): (_Doc(), now) for part in parts
+    }
 
     state = {"live": 0, "peak": 0}
 
@@ -105,9 +108,9 @@ def test_thumbnail_batch_caps_requests_in_flight():
 
     worker._thumbnail_bytes = fake_bytes
 
-    out = asyncio.run(worker._thumbnails(ids))
+    out = asyncio.run(worker._thumbnails(parts))
 
-    assert len(out) == len(ids)
+    assert len(out) == len(parts)
     assert state["peak"] <= tgio.THUMB_CONCURRENCY
     assert state["peak"] > 1  # still concurrent, just bounded
 

@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 import tgupload
+from transfer_models import RemotePart
 
 log = logging.getLogger("tgio")
 
@@ -141,6 +142,25 @@ DOC_CACHE_TTL = 45 * 60  # file_reference lives a few hours; refresh well before
 MAX_FLOOD_WAIT = 120
 
 
+class RemoteIdentityError(RuntimeError):
+    """Telegram returned media other than the immutable file we expected."""
+
+
+def _assert_media_id(media, expected_file_id: str) -> None:
+    actual = str(getattr(media, "id", ""))
+    if actual != str(expected_file_id):
+        raise RemoteIdentityError(
+            f"Telegram file mismatch: expected {expected_file_id}, got {actual}"
+        )
+
+
+def read_part(pool, part: RemotePart, offset: int, length: int) -> bytes:
+    """Read one routed part without weakening a nonzero account identity."""
+    return pool.for_read(part.telegram_user_id).worker.read(
+        part.message_id, part.file_id, offset, length
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Pure split math
 # --------------------------------------------------------------------------- #
@@ -150,24 +170,31 @@ MAX_FLOOD_WAIT = 120
 class Part:
     """One Telegram message holding a contiguous slice of a logical file."""
 
-    message_id: int
-    size: int
+    remote: RemotePart
     start: int  # offset of this part's first byte within the logical file
 
+    @property
+    def message_id(self) -> int:
+        return self.remote.message_id
 
-def build_part_table(parts: Sequence[Tuple[int, int]]) -> Tuple[List[Part], int]:
-    """Turn ``[(message_id, size), ...]`` (ordered by part_index) into a table.
+    @property
+    def size(self) -> int:
+        return self.remote.size
+
+
+def build_part_table(parts: Sequence[RemotePart]) -> Tuple[List[Part], int]:
+    """Add logical offsets to routed remote parts ordered by part index.
 
     Returns the table plus the logical total size. Zero-sized parts are dropped:
     they carry no bytes and would only create ambiguous offset boundaries.
     """
     table: List[Part] = []
     offset = 0
-    for message_id, size in parts:
-        if size <= 0:
+    for remote in parts:
+        if remote.size <= 0:
             continue
-        table.append(Part(message_id=message_id, size=size, start=offset))
-        offset += size
+        table.append(Part(remote=remote, start=offset))
+        offset += remote.size
     return table, offset
 
 
@@ -247,7 +274,7 @@ class TelegramWorker:
         self._ready = threading.Event()
         self._client = None
         self._me = None
-        self._docs = {}  # message_id -> (document, fetched_at)
+        self._docs = {}  # (message_id, expected_file_id) -> (media, fetched_at)
         self._docs_lock = threading.Lock()
         self._pool: Optional[list] = None
         self._pool_lock: Optional[asyncio.Lock] = None
@@ -407,15 +434,17 @@ class TelegramWorker:
 
     # -- documents -------------------------------------------------------- #
 
-    def get_document(self, message_id: int, refresh: bool = False):
+    def get_document(self, message_id: int, expected_file_id: str, refresh: bool = False):
         """Resolve a message id to its Document, with a TTL cache.
 
         ``file_reference`` inside the Document expires after a few hours, so both
         the TTL and the explicit ``refresh`` path exist to re-fetch it.
         """
-        return self.run(self._document(message_id, refresh))
+        return self.run(self._document(message_id, expected_file_id, refresh))
 
-    async def _document(self, message_id: int, refresh: bool = False):
+    async def _document(
+        self, message_id: int, expected_file_id: str, refresh: bool = False
+    ):
         """Async half of get_document, so batch paths can await it directly.
 
         Calling get_document from a coroutine already on the client loop would
@@ -423,14 +452,16 @@ class TelegramWorker:
         loop comes through here instead.
         """
         now = time.monotonic()
+        key = (int(message_id), str(expected_file_id))
         if not refresh:
             with self._docs_lock:
-                hit = self._docs.get(message_id)
+                hit = self._docs.get(key)
             if hit and now - hit[1] < DOC_CACHE_TTL:
                 return hit[0]
         doc = await self._fetch_document(message_id)
+        _assert_media_id(doc, expected_file_id)
         with self._docs_lock:
-            self._docs[message_id] = (doc, now)
+            self._docs[key] = (doc, now)
         return doc
 
     async def _fetch_document(self, message_id: int):
@@ -452,23 +483,23 @@ class TelegramWorker:
 
     # -- thumbnails ------------------------------------------------------- #
 
-    def thumbnails(self, message_ids: Sequence[int]) -> dict:
-        """``{message_id: jpeg_bytes}`` for whichever messages have a thumbnail.
+    def thumbnails(self, parts: Sequence[RemotePart]) -> dict:
+        """``{(message_id, file_id): jpeg}`` for routed media with a thumbnail.
 
         Telegram already stores a small preview beside every photo and video, so
         listing a folder of previews costs a few KB per file instead of the whole
         image — measured on one pixiv folder, 120.9 MB of originals against 52 KB
         of thumbnails. Ids without a usable thumbnail are simply absent.
         """
-        ids = list(dict.fromkeys(int(m) for m in message_ids))
-        if not ids:
+        unique = list({(p.message_id, str(p.file_id)): p for p in parts}.values())
+        if not unique:
             return {}
-        return self.run(self._thumbnails(ids))
+        return self.run(self._thumbnails(unique))
 
-    async def _thumbnails(self, message_ids: List[int]) -> dict:
+    async def _thumbnails(self, parts: List[RemotePart]) -> dict:
         # One get_messages covers the whole batch; asking per file turned a
         # 30-file listing into 30 round trips.
-        await self._prefetch_documents(message_ids)
+        await self._prefetch_documents(parts)
 
         # Created here rather than in __init__ so it binds to the client loop,
         # and shared across batches: a folder prefetch and a foreground request
@@ -477,20 +508,21 @@ class TelegramWorker:
             self._thumb_gate = asyncio.Semaphore(THUMB_CONCURRENCY)
         gate = self._thumb_gate
 
-        async def one(message_id):
+        async def one(part: RemotePart):
+            key = (part.message_id, str(part.file_id))
             try:
-                doc = await self._document(message_id)
+                doc = await self._document(part.message_id, part.file_id)
                 async with gate:
-                    return message_id, await self._thumbnail_bytes(doc)
+                    return key, await self._thumbnail_bytes(doc)
             except Exception as exc:
-                log.warning("thumbnail for message %s failed: %s", message_id, exc)
-                return message_id, None
+                log.warning("thumbnail for message %s failed: %s", part.message_id, exc)
+                return key, None
 
-        pairs = await asyncio.gather(*[one(m) for m in message_ids])
-        return {message_id: data for message_id, data in pairs if data}
+        pairs = await asyncio.gather(*[one(part) for part in parts])
+        return {key: data for key, data in pairs if data}
 
-    def media_info(self, message_ids: Sequence[int]) -> dict:
-        """``{message_id: {...}}`` describing each message's media.
+    def media_info(self, parts: Sequence[RemotePart]) -> dict:
+        """``{(message_id, file_id): {...}}`` describing routed media.
 
         Pixel dimensions and duration ride along in the document's attributes, so
         this costs one ``get_messages`` per hundred files and downloads nothing.
@@ -498,46 +530,61 @@ class TelegramWorker:
         out its size (measured, 258 KB of a 2 MB JPEG), and those reads are what
         make a folder crawl.
         """
-        ids = list(dict.fromkeys(int(m) for m in message_ids))
-        if not ids:
+        unique = list({(p.message_id, str(p.file_id)): p for p in parts}.values())
+        if not unique:
             return {}
-        return self.run(self._media_info(ids))
+        return self.run(self._media_info(unique))
 
-    async def _media_info(self, message_ids: List[int]) -> dict:
-        await self._prefetch_documents(message_ids)
+    async def _media_info(self, parts: List[RemotePart]) -> dict:
+        await self._prefetch_documents(parts)
         out = {}
-        for message_id in message_ids:
+        for part in parts:
+            key = (part.message_id, str(part.file_id))
             try:
-                doc = await self._document(message_id)
+                doc = await self._document(part.message_id, part.file_id)
             except Exception as exc:
-                log.warning("media info for message %s failed: %s", message_id, exc)
+                log.warning("media info for message %s failed: %s", part.message_id, exc)
                 continue
             # Recorded even when empty. An entry here means "the document was
             # read and it has nothing to report", which is a cacheable answer;
             # dropping it would make a file with no dimensions look uncached
             # forever, and the whole-tree warm-up would ask about it on every
             # pass. A lookup that actually failed raises above and stays absent.
-            out[message_id] = _media_attributes(doc)
+            out[key] = _media_attributes(doc)
         return out
 
-    async def _prefetch_documents(self, message_ids: List[int]) -> None:
+    async def _prefetch_documents(self, parts: List[RemotePart]) -> None:
         now = time.monotonic()
         with self._docs_lock:
             wanted = [
-                m for m in message_ids
-                if not (self._docs.get(m) and now - self._docs[m][1] < DOC_CACHE_TTL)
+                part for part in parts
+                if not (
+                    self._docs.get((part.message_id, str(part.file_id)))
+                    and now - self._docs[(part.message_id, str(part.file_id))][1]
+                    < DOC_CACHE_TTL
+                )
             ]
         for batch in (wanted[i : i + 100] for i in range(0, len(wanted), 100)):
             try:
-                messages = await self._client.get_messages("me", ids=batch)
+                messages = await self._client.get_messages(
+                    "me", ids=list(dict.fromkeys(part.message_id for part in batch))
+                )
             except Exception as exc:
                 log.warning("batch document fetch failed (%s ids): %s", len(batch), exc)
                 return  # per-file lookups below still work, just slower
+            by_message = {
+                msg.id: _message_media(msg) for msg in messages or [] if msg is not None
+            }
             with self._docs_lock:
-                for msg in messages or []:
-                    media = _message_media(msg)
-                    if media is not None:
-                        self._docs[msg.id] = (media, now)
+                for part in batch:
+                    media = by_message.get(part.message_id)
+                    if media is None:
+                        continue
+                    try:
+                        _assert_media_id(media, part.file_id)
+                    except RemoteIdentityError:
+                        continue
+                    self._docs[(part.message_id, str(part.file_id))] = (media, now)
 
     async def _thumbnail_bytes(self, doc) -> Optional[bytes]:
         """One preview, fetched over the pool rather than the control client.
@@ -602,24 +649,26 @@ class TelegramWorker:
                 log.warning("preview retry %s after %ss: %s", attempt, wait, exc)
                 await asyncio.sleep(wait + 1)
 
-    def invalidate_document(self, message_id: int) -> None:
+    def invalidate_document(self, message_id: int, expected_file_id: str) -> None:
         with self._docs_lock:
-            self._docs.pop(message_id, None)
+            self._docs.pop((int(message_id), str(expected_file_id)), None)
 
     # -- reading ---------------------------------------------------------- #
 
-    def read(self, message_id: int, offset: int, length: int) -> bytes:
+    def read(
+        self, message_id: int, expected_file_id: str, offset: int, length: int
+    ) -> bytes:
         """Read ``length`` bytes at ``offset`` from one message's document."""
         if length <= 0:
             return b""
-        doc = self.get_document(message_id)
+        doc = self.get_document(message_id, expected_file_id)
         try:
             return self.run(self._read(doc, offset, length))
         except Exception as exc:
             if not _is_file_reference_error(exc):
                 raise
             log.warning("file_reference expired for message %s — refetching", message_id)
-            doc = self.get_document(message_id, refresh=True)
+            doc = self.get_document(message_id, expected_file_id, refresh=True)
             return self.run(self._read(doc, offset, length))
 
     async def _read(self, doc, offset: int, length: int) -> bytes:
@@ -1105,8 +1154,8 @@ class SeekableRemoteFile(io.RawIOBase):
 
     def __init__(
         self,
-        reader,
-        parts: Sequence[Tuple[int, int]],
+        pool,
+        parts: Sequence[RemotePart],
         *,
         name: str = "",
         head: bytes = b"",
@@ -1114,7 +1163,7 @@ class SeekableRemoteFile(io.RawIOBase):
         blocks_cached: int = BLOCKS_CACHED,
     ):
         super().__init__()
-        self._reader = reader
+        self._pool = pool
         self._table, self._total = build_part_table(parts)
         self._name = name
         # Bytes from the start of the file that the caller already has on disk.
@@ -1260,7 +1309,7 @@ class SeekableRemoteFile(io.RawIOBase):
         out = bytearray()
         for index, inner, nbytes in map_range(self._table, self._total, offset, length):
             part = self._table[index]
-            out += self._reader.read(part.message_id, inner, nbytes)
+            out += read_part(self._pool, part.remote, inner, nbytes)
         return bytes(out)
 
 

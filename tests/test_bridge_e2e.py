@@ -22,6 +22,7 @@ import uuid
 import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import requests
@@ -66,7 +67,7 @@ class FakeWorker:
         self.messages[self._next_id] = blob
         return self._next_id
 
-    def read(self, message_id: int, offset: int, length: int) -> bytes:
+    def read(self, message_id: int, expected_file_id: str, offset: int, length: int) -> bytes:
         self.reads.append((message_id, offset, length))
         blob = self.messages[message_id]
         return blob[offset : offset + length]
@@ -74,20 +75,26 @@ class FakeWorker:
     def set_thumb(self, message_id: int, data: bytes) -> None:
         self.thumbs[message_id] = data
 
-    def thumbnails(self, message_ids):
+    def thumbnails(self, parts):
         self.thumb_batches = getattr(self, "thumb_batches", [])
-        self.thumb_batches.append(list(message_ids))
-        return {m: self.thumbs[m] for m in message_ids if m in self.thumbs}
+        self.thumb_batches.append(list(parts))
+        return {
+            (part.message_id, str(part.file_id)): self.thumbs[part.message_id]
+            for part in parts if part.message_id in self.thumbs
+        }
 
     def set_media(self, message_id: int, info: dict) -> None:
         self.media[message_id] = info
 
-    def media_info(self, message_ids):
+    def media_info(self, parts):
         self.media_batches = getattr(self, "media_batches", [])
-        self.media_batches.append(list(message_ids))
+        self.media_batches.append(list(parts))
         # Like the real one: every message that could be read gets an entry, and
         # one with nothing to report answers {} rather than going missing.
-        return {m: self.media.get(m, {}) for m in message_ids if m in self.messages}
+        return {
+            (part.message_id, str(part.file_id)): self.media.get(part.message_id, {})
+            for part in parts if part.message_id in self.messages
+        }
 
     def upload_segment(self, stream, size, file_name, progress=None, preview=None):
         data = bytearray()
@@ -320,7 +327,10 @@ class Rig:
         than the file.
         """
         entry = self.entry_for(path)
-        whole = b"".join(self.worker.messages[mid] for mid, _ in self.resolver.api.parts_for(entry))
+        whole = b"".join(
+            self.worker.messages[part.message_id]
+            for part in self.resolver.api.parts_for(entry)
+        )
         return whole[: self.resolver.api.total_size(entry)]
 
     def prop(self, path, name, depth="0"):
@@ -400,7 +410,18 @@ def rig(tmp_path):
 
     api = FakeClient(cfg, backend)
     api.login()  # as bridge.main does, and for the same reason: nothing works without it
-    resolver = bridge.Resolver(cfg, api, worker)
+    class FakePool:
+        def __init__(self, worker):
+            self.primary = SimpleNamespace(worker=worker)
+
+        def for_read(self, account_id):
+            assert account_id == 0
+            return self.primary
+
+        def status(self):
+            return {"accounts": [], "eligible_upload_ids": []}
+
+    resolver = bridge.Resolver(cfg, api, FakePool(worker))
     stager = GameStager(cfg, api, worker)
     resolver.stager = stager
     upload_stager = UploadStager(cfg, api, worker)
@@ -713,9 +734,9 @@ def test_browsing_a_zip_does_not_download_it(rig):
     read = {"bytes": 0}
     original = rig.worker.read
 
-    def counting(message_id, offset, length):
+    def counting(message_id, expected_file_id, offset, length):
         read["bytes"] += length
-        return original(message_id, offset, length)
+        return original(message_id, expected_file_id, offset, length)
 
     rig.worker.read = counting
     rig.resolver._zips.clear()  # force a fresh central-directory parse
@@ -1498,7 +1519,7 @@ def test_needs_warming_does_not_check_for_a_head(rig):
     _, todo = warmer.pending()
     warmer.fill(todo)
     png = rig.entry_for("photos/shot.png")
-    assert not (rig.cfg.cache_dir / "heads" / f"{png.file_id}.head").exists()
+    assert not rig.resolver._head_path(png).exists()
     assert rig.resolver.needs_warming(png) is False
 
 

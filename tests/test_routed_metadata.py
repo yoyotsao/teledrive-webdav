@@ -53,14 +53,6 @@ def test_missing_storage_account_normalizes_to_zero(api):
     assert api.parts_for(entry) == [RemotePart(77, 8, 0, "9001")]
 
 
-def test_routed_part_remains_unpackable_by_legacy_readers(api):
-    part = RemotePart(77, 8, 42, "9001")
-
-    message_id, size = part
-
-    assert (message_id, size) == (77, 8)
-
-
 def test_split_parts_keep_each_part_storage_identity_and_cache_it(api):
     entry = tdapi._to_entry({"file_id": "9001", "filename": "x.bin", "filesize": 8,
                              "telegram_message_id": 77, "is_split_file": True,
@@ -74,7 +66,7 @@ def test_split_parts_keep_each_part_storage_identity_and_cache_it(api):
 
     assert api.parts_for(entry) == [RemotePart(77, 8, 42, "9001"),
                                     RemotePart(78, 3, 9, "9002")]
-    assert api._split_cache.get("group") == [[77, 8, 42, "9001"], [78, 3, 9, "9002"]]
+    assert api._split_cache.get("42:9001") == [[77, 8, 42, "9001"], [78, 3, 9, "9002"]]
     assert api.parts_for(entry) == [RemotePart(77, 8, 42, "9001"),
                                     RemotePart(78, 3, 9, "9002")]
 

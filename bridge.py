@@ -39,7 +39,9 @@ from wsgidav.wsgidav_app import WsgiDAVApp
 import zipfs
 from config import Config, ext_path as _ext, load_config
 from tdapi import ApiError, Entry, JsonStore, TeleDriveClient
-from tgio import REQUEST_SIZE, STREAM_BLOCK_SIZE, SeekableRemoteFile, TelegramWorker
+from telegram_accounts import TelegramAccountPool
+from tgio import REQUEST_SIZE, STREAM_BLOCK_SIZE, SeekableRemoteFile
+from transfer_models import RemotePart
 
 log = logging.getLogger("bridge")
 
@@ -186,10 +188,10 @@ class Resolver:
     resolve paths without faking a WSGI environ.
     """
 
-    def __init__(self, cfg: Config, api: TeleDriveClient, worker: TelegramWorker, stager=None, upload_stager=None):
+    def __init__(self, cfg: Config, api: TeleDriveClient, pool: TelegramAccountPool, stager=None, upload_stager=None):
         self.cfg = cfg
         self.api = api
-        self.worker = worker
+        self.pool = pool
         self.stager = stager
         self.upload_stager = upload_stager
         self._zips: Dict[str, zipfs.ZipView] = {}
@@ -207,34 +209,47 @@ class Resolver:
         """A fresh seekable reader over a cloud file (split parts concatenated)."""
         self.note_demand()
         return SeekableRemoteFile(
-            self.worker,
+            self.pool,
             self.api.parts_for(entry),
             name=entry.name,
             head=self.cached_head(entry),
         )
 
     def zip_view(self, entry: Entry) -> zipfs.ZipView:
+        cache_key = self._cache_key(entry)
         with self._zip_lock:
-            view = self._zips.get(entry.file_id)
+            view = self._zips.get(cache_key)
             if view is None:
                 view = zipfs.ZipView(
                     lambda e=entry: self.open_remote(e),
                     name=zipfs.strip_zip_suffix(entry.name),
                     cache=self._zip_cache,
-                    cache_key=entry.file_id,
+                    cache_key=cache_key,
                 )
-                self._zips[entry.file_id] = view
+                self._zips[cache_key] = view
             return view
 
     # -- thumbnails ------------------------------------------------------- #
 
-    def _thumb_path(self, file_id: str) -> Path:
-        return self.cfg.cache_dir / "thumbs" / f"{file_id}{THUMB_SUFFIX}"
+    @staticmethod
+    def _cache_key(entry: Entry) -> str:
+        return f"{entry.telegram_user_id}-{entry.file_id}"
+
+    @staticmethod
+    def _remote_part(entry: Entry) -> RemotePart:
+        if entry.message_id is None:
+            raise ValueError(f"{entry.name} has no Telegram message")
+        return RemotePart(
+            int(entry.message_id), entry.size, entry.telegram_user_id, entry.file_id
+        )
+
+    def _thumb_path(self, entry: Entry) -> Path:
+        return self.cfg.cache_dir / "thumbs" / f"{self._cache_key(entry)}{THUMB_SUFFIX}"
 
     def cached_thumb(self, entry: Entry) -> Optional[bytes]:
         """The preview already on disk, or None. Never touches the network."""
         try:
-            return self._thumb_path(entry.file_id).read_bytes()
+            return self._thumb_path(entry).read_bytes()
         except OSError:
             return None
 
@@ -260,17 +275,22 @@ class Resolver:
         if not missing:
             return found
 
-        fetched = self.worker.thumbnails([e.message_id for e in missing])
+        by_account: Dict[int, List[Entry]] = {}
         for entry in missing:
-            data = fetched.get(entry.message_id)
-            if not data:
-                continue
-            found[entry.file_id] = data
-            path = self._thumb_path(entry.file_id)
-            try:
-                _write_atomic(path, data)
-            except OSError as exc:  # pragma: no cover - cache is best-effort
-                log.warning("could not cache thumbnail %s: %s", path.name, exc)
+            by_account.setdefault(entry.telegram_user_id, []).append(entry)
+        for account_id, routed_entries in by_account.items():
+            parts = [self._remote_part(entry) for entry in routed_entries]
+            fetched = self.pool.for_read(account_id).worker.thumbnails(parts)
+            for entry in routed_entries:
+                data = fetched.get((entry.message_id, str(entry.file_id)))
+                if not data:
+                    continue
+                found[entry.file_id] = data
+                path = self._thumb_path(entry)
+                try:
+                    _write_atomic(path, data)
+                except OSError as exc:  # pragma: no cover - cache is best-effort
+                    log.warning("could not cache thumbnail %s: %s", path.name, exc)
         return found
 
     def thumb_bytes(self, entry: Entry) -> Optional[bytes]:
@@ -278,8 +298,8 @@ class Resolver:
 
     # -- file heads -------------------------------------------------------- #
 
-    def _head_path(self, file_id: str) -> Path:
-        return self.cfg.cache_dir / "heads" / f"{file_id}{HEAD_SUFFIX}"
+    def _head_path(self, entry: Entry) -> Path:
+        return self.cfg.cache_dir / "heads" / f"{self._cache_key(entry)}{HEAD_SUFFIX}"
 
     def wants_head(self, entry: Entry) -> bool:
         """Whether this file is one the shell will go and read the front of.
@@ -299,7 +319,7 @@ class Resolver:
     def cached_head(self, entry: Entry) -> bytes:
         """The first bytes of this file if they are on disk, else empty."""
         try:
-            return self._head_path(entry.file_id).read_bytes()
+            return self._head_path(entry).read_bytes()
         except OSError:
             return b""
 
@@ -311,7 +331,7 @@ class Resolver:
         that looks warm and still reads off the end into Telegram.
         """
         try:
-            have = self._head_path(entry.file_id).stat().st_size
+            have = self._head_path(entry).stat().st_size
         except OSError:
             return False
         return have >= min(HEAD_SIZE, self.api.total_size(entry))
@@ -339,10 +359,13 @@ class Resolver:
 
         def one(entry: Entry) -> bool:
             try:
-                data = self.worker.read(entry.message_id, 0, HEAD_SIZE)
+                part = self._remote_part(entry)
+                data = self.pool.for_read(part.telegram_user_id).worker.read(
+                    part.message_id, part.file_id, 0, HEAD_SIZE
+                )
                 if not data:
                     return False
-                _write_atomic(self._head_path(entry.file_id), data)
+                _write_atomic(self._head_path(entry), data)
                 return True
             except Exception as exc:  # pragma: no cover - cache is best-effort
                 log.warning("could not cache head of %s: %s", entry.name, exc)
@@ -366,7 +389,7 @@ class Resolver:
         """
         for entry in entries:
             try:
-                self._head_path(entry.file_id).unlink(missing_ok=True)
+                self._head_path(entry).unlink(missing_ok=True)
             except OSError as exc:  # pragma: no cover - best-effort cleanup
                 log.warning("could not drop head of %s: %s", entry.name, exc)
 
@@ -404,7 +427,7 @@ class Resolver:
         for entry in entries:
             if entry.is_dir or entry.message_id is None:
                 continue
-            hit = self._prop_cache.get(entry.file_id)
+            hit = self._prop_cache.get(self._cache_key(entry))
             if hit is None:
                 missing.append(entry)
             else:
@@ -414,13 +437,18 @@ class Resolver:
 
         if demand:
             self.note_demand()
-        fetched = self.worker.media_info([e.message_id for e in missing])
+        by_account: Dict[int, List[Entry]] = {}
         for entry in missing:
-            info = fetched.get(entry.message_id)
-            if info is None:
-                continue
-            found[entry.file_id] = info
-            self._prop_cache.put(entry.file_id, info, defer=True)
+            by_account.setdefault(entry.telegram_user_id, []).append(entry)
+        for account_id, routed_entries in by_account.items():
+            parts = [self._remote_part(entry) for entry in routed_entries]
+            fetched = self.pool.for_read(account_id).worker.media_info(parts)
+            for entry in routed_entries:
+                info = fetched.get((entry.message_id, str(entry.file_id)))
+                if info is None:
+                    continue
+                found[entry.file_id] = info
+                self._prop_cache.put(self._cache_key(entry), info, defer=True)
         self._prop_cache.flush()
         return found
 
@@ -470,9 +498,9 @@ class Resolver:
         """
         if entry.is_dir or entry.message_id is None:
             return False
-        if entry.has_thumbnail and not self._thumb_path(entry.file_id).exists():
+        if entry.has_thumbnail and not self._thumb_path(entry).exists():
             return True
-        return self._prop_cache.get(entry.file_id) is None
+        return self._prop_cache.get(self._cache_key(entry)) is None
 
     def await_thumb(self, entry: Entry, timeout: float = THUMB_WAIT) -> Optional[bytes]:
         """Wait briefly for a running warm-up to produce this preview."""
@@ -1248,7 +1276,7 @@ class RpcApp:
         body = json.dumps(
             {
                 "ok": True,
-                "telegram_user_id": self.resolver.worker.user_id,
+                "telegram_user_id": self.resolver.pool.primary.worker.user_id,
                 "base_url": self.cfg.base_url,
                 "mount_drive": self.cfg.mount_drive,
                 "game_folder": self.cfg.game_folder,
@@ -1261,6 +1289,7 @@ class RpcApp:
             {
                 **(self.stager.status() if self.stager else {}),
                 "uploads": self.upload_stager.status() if self.upload_stager else {},
+                "telegram": self.resolver.pool.status(),
             },
             default=str,
         )
@@ -1500,17 +1529,12 @@ def main(argv=None) -> int:
     from uploadstage import UploadStager
     from warmup import BackgroundWarmup
 
-    worker = TelegramWorker(
-        cfg.api_id, cfg.api_hash, cfg.session, cfg.download_connections, upload_parts=cfg.upload_parts
-    )
-    worker.start()
     api = TeleDriveClient(cfg)
-    # Before login(): the backend's bot challenge is answered by DMing a nonce
-    # from this very account, so auth needs the Telegram client to be up first.
-    api.set_dm_sender(worker.send_dm)
-    api.login()
+    pool = TelegramAccountPool.from_config(cfg)
+    pool.start(api)
+    worker = pool.primary.worker
 
-    resolver = Resolver(cfg, api, worker)
+    resolver = Resolver(cfg, api, pool)
     stager = GameStager(cfg, api, worker)
     resolver.stager = stager
     upload_stager = UploadStager(cfg, api, worker)
@@ -1558,7 +1582,7 @@ def main(argv=None) -> int:
             warmer.stop()
         stager.stop()
         upload_stager.stop()
-        worker.stop()
+        pool.stop()
     return 0
 
 
