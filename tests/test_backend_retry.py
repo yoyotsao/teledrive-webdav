@@ -19,6 +19,7 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import tdapi  # noqa: E402
 from tdapi import ApiError, TeleDriveClient  # noqa: E402
 
 
@@ -66,9 +67,10 @@ class Cfg:
 
 def client(tmp_path, script):
     api = TeleDriveClient(Cfg(tmp_path))
-    api._session = Session(script)
+    session = Session(script)
+    api._http_session = lambda: session
     api._token = "JWT"  # skip the challenge; this file is about the transport
-    return api
+    return api, session
 
 
 def dropped():
@@ -78,29 +80,29 @@ def dropped():
 
 
 def test_a_dropped_idle_connection_is_retried(tmp_path):
-    api = client(tmp_path, [dropped(), Reply(200, {"items": [1]})])
+    api, session = client(tmp_path, [dropped(), Reply(200, {"items": [1]})])
     assert api._call("GET", "/files") == {"items": [1]}
-    assert len(api._session.calls) == 2
+    assert len(session.calls) == 2
 
 
 def test_the_retry_is_not_infinite(tmp_path):
     """A backend that is actually down must fail fast, not hold the shell."""
-    api = client(tmp_path, [dropped(), dropped()])
+    api, session = client(tmp_path, [dropped(), dropped()])
     with pytest.raises(requests.exceptions.ConnectionError):
         api._call("GET", "/files")
-    assert len(api._session.calls) == 2
+    assert len(session.calls) == 2
 
 
 def test_a_write_is_retried_too(tmp_path):
     """Safe by construction: RemoteDisconnected here means the request never
     reached the app, so nothing was registered twice."""
-    api = client(tmp_path, [dropped(), Reply(200, {"file_id": "f1"})])
+    api, session = client(tmp_path, [dropped(), Reply(200, {"file_id": "f1"})])
     assert api._call("POST", "/files/register", payload={"n": 1}) == {"file_id": "f1"}
-    assert len(api._session.calls) == 2
+    assert len(session.calls) == 2
 
 
 def test_the_401_relogin_still_works_alongside_it(tmp_path):
-    api = client(tmp_path, [
+    api, _ = client(tmp_path, [
         Reply(401, text="Authentication required"),
         Reply(200, {"nonce": "n", "bot_username": "b", "expires_in": 120}),  # challenge
         Reply(200, {"token": "JWT2"}),                                       # verify
@@ -112,16 +114,16 @@ def test_the_401_relogin_still_works_alongside_it(tmp_path):
 
 def test_a_real_http_error_is_not_retried(tmp_path):
     """403 is an answer, not a dropped socket -- retrying only doubles the cost."""
-    api = client(tmp_path, [Reply(403, text="nope")])
+    api, session = client(tmp_path, [Reply(403, text="nope")])
     with pytest.raises(ApiError):
         api._call("GET", "/files")
-    assert len(api._session.calls) == 1
+    assert len(session.calls) == 1
 
 
 def test_a_dropped_socket_does_not_spend_the_relogin_budget(tmp_path):
     """The two retries are independent. A fresh socket that then answers 401 --
     which is exactly what a restarted backend does -- still gets its re-login."""
-    api = client(tmp_path, [
+    api, _ = client(tmp_path, [
         dropped(),                                                            # dead pooled socket
         Reply(401, text="Authentication required"),                           # fresh socket, stale JWT
         Reply(200, {"nonce": "n", "bot_username": "b", "expires_in": 120}),
@@ -135,7 +137,7 @@ def test_a_dropped_socket_does_not_spend_the_relogin_budget(tmp_path):
 def test_a_relogin_does_not_spend_the_connection_budget(tmp_path):
     """And the other way round: re-authenticating must not leave the retried
     request one dropped socket away from a 500."""
-    api = client(tmp_path, [
+    api, _ = client(tmp_path, [
         Reply(401, text="Authentication required"),
         Reply(200, {"nonce": "n", "bot_username": "b", "expires_in": 120}),
         Reply(200, {"token": "JWT2"}),
@@ -144,3 +146,30 @@ def test_a_relogin_does_not_spend_the_connection_budget(tmp_path):
     ])
     api.set_dm_sender(lambda u, t: None)
     assert api._call("GET", "/files") == {"items": ["ok"]}
+
+
+def test_each_thread_gets_its_own_http_session(tmp_path, monkeypatch):
+    sessions = []
+
+    class NewSession:
+        pass
+
+    def create_session():
+        session = NewSession()
+        sessions.append(session)
+        return session
+
+    monkeypatch.setattr(tdapi.requests, "Session", create_session)
+    api = TeleDriveClient(Cfg(tmp_path))
+    main_session = api._http_session()
+    from_thread = []
+
+    import threading
+
+    thread = threading.Thread(target=lambda: from_thread.append(api._http_session()))
+    thread.start()
+    thread.join()
+
+    assert from_thread == [sessions[1]]
+    assert main_session is sessions[0]
+    assert from_thread[0] is not main_session

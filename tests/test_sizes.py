@@ -16,6 +16,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tdapi import Entry, _clip_parts, _hash_size  # noqa: E402
+from transfer_models import RemotePart  # noqa: E402
 
 PART = 512 * 1024
 SEG = 1000 * PART  # 524288000
@@ -158,7 +159,7 @@ def test_total_size_clips_a_split_file_tail():
     api = FakeApi(rows)
     e = entry(SEG, "h:6291278706", is_split=True, group="g1")
     assert api.total_size(e) == 6291278706
-    assert sum(s for _, s in api.parts_for(e)) == 6291278706
+    assert sum(part.size for part in api.parts_for(e)) == 6291278706
 
 
 def test_total_size_reports_what_exists_for_an_under_registered_split():
@@ -167,7 +168,7 @@ def test_total_size_reports_what_exists_for_an_under_registered_split():
     api = FakeApi(rows)
     e = entry(SEG, "h:2657828026", is_split=True, group="g2")
     assert api.total_size(e) == SEG  # not 2657828026 — those bytes are gone
-    assert api.parts_for(e) == [(1859, SEG)]
+    assert api.parts_for(e) == [RemotePart(1859, SEG, 0, "f1")]
 
 
 def test_clipping_survives_the_disk_cache():
@@ -180,7 +181,9 @@ def test_clipping_survives_the_disk_cache():
     first = api.parts_for(e)
     second = api.parts_for(e)  # served from _split_cache this time
     assert api.calls == 1
-    assert first == second == [(100, SEG), (101, SEG), (102, 100)]
+    assert first == second == [RemotePart(100, SEG, 0, "f1"),
+                               RemotePart(101, SEG, 0, "f1"),
+                               RemotePart(102, 100, 0, "f1")]
 
 
 # --------------------------------------------------------------------------- #

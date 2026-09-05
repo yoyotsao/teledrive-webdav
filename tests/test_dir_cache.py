@@ -32,7 +32,7 @@ import tdapi  # noqa: E402
 from tdapi import TeleDriveClient  # noqa: E402
 
 
-def row(file_id, name, is_dir=False, message_id=None):
+def row(file_id, name, is_dir=False, message_id=None, telegram_user_id=0):
     return {
         "file_id": file_id,
         "filename": name,
@@ -40,6 +40,7 @@ def row(file_id, name, is_dir=False, message_id=None):
         "filesize": 1024,
         "created_at": "2026-08-22T14:29:07Z",
         "telegram_message_id": message_id,
+        "telegram_user_id": telegram_user_id,
         "has_thumbnail": not is_dir,
     }
 
@@ -144,6 +145,18 @@ def test_a_listing_survives_a_new_client(tmp_path):
 
     assert [e.file_id for e in again] == [e.file_id for e in first]
     assert fresh_process._call.calls == []  # answered entirely off disk
+
+
+def test_directory_cache_preserves_storage_identity(tmp_path):
+    tree = {"pixiv": [row("f1", "cover.jpg", message_id=5, telegram_user_id=42)]}
+    api = client(tmp_path, Backend(tree))
+    api.list_dir("pixiv")
+
+    fresh_process = client(tmp_path, Backend(tree))
+    cached = fresh_process.list_dir("pixiv")
+
+    assert [(entry.file_id, entry.telegram_user_id) for entry in cached] == [("f1", 42)]
+    assert fresh_process._call.calls == []
 
 
 def test_the_disk_copy_expires_with_the_same_ttl(tmp_path):
