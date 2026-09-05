@@ -20,6 +20,7 @@ import asyncio
 import inspect
 import io
 import logging
+import mimetypes
 import threading
 import time
 from collections import OrderedDict
@@ -27,6 +28,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 import tgupload
+from media_thumbnail import PREVIEW_BOX, PREVIEW_MAX_BYTES, capture_thumbnail
 from transfer_models import RemotePart
 
 log = logging.getLogger("tgio")
@@ -69,8 +71,6 @@ THUMB_REQUEST_SIZE = 256 * 1024
 # client-supplied document thumbnail only inside tight limits -- Telethon's
 # guidance, matching what the API actually accepts, is a .jpg under 20 kB and
 # 320x320 -- and 320 also covers the cx=256 Explorer asks for.
-PREVIEW_BOX = 320
-PREVIEW_MAX_BYTES = 20 * 1024
 
 # How many preview GetFiles may be in flight at once, across every batch.
 #
@@ -852,54 +852,23 @@ class TelegramWorker:
         }
 
 
-def make_preview(path) -> Optional[Tuple[bytes, int, int]]:
-    """A JPEG preview and the true pixel size of the still image at ``path``.
+def make_preview(
+    path, mime_type: str = "", ffmpeg: Optional[str] = None
+) -> Optional[Tuple[bytes, int, int]]:
+    """Adapt classified media thumbnails to Telethon's document-thumb tuple.
 
-    Everything uploaded through H: used to reach Telegram as a bare document
-    carrying nothing but a filename, so ``doc.thumbs`` was empty and there was
-    no ``DocumentAttributeImageSize``. That loses both halves of this project's
-    browsing story for its own uploads: ``/rpc/thumb`` answers 404,
-    ``/rpc/props`` answers ``{}``, and the shell handler -- which cannot tell
-    "no preview" from "fetch failed" -- delegates to the built-in handler,
-    which reads the whole image back down from Telegram to draw one icon. So a
-    folder of freshly uploaded photos behaves exactly like a folder this project
-    was never installed for.
-
-    Both halves are produced here together because Telegram wants them
-    together: it discards a document thumbnail when the document does not also
-    declare its dimensions.
-
-    Returns None for anything that is not a decodable still image -- a /game
-    zip, a split part, a video, a truncated file, or a machine without Pillow.
-    A preview is a nicety; it must never be the reason an upload fails.
+    ``not_media`` and ``undecodable`` files deliberately upload without a
+    preview. A ``ThumbnailError`` is allowed to propagate: it means a decoder
+    accepted media but failed to produce a usable frame, which must not be
+    silently registered as an ordinary no-thumbnail upload.
     """
-    try:
-        from PIL import Image, ImageOps
-    except ImportError:  # pragma: no cover - depends on the environment
-        log.warning("Pillow is not installed — uploads will have no preview")
+    mime = mime_type or mimetypes.guess_type(str(path))[0] or ""
+    result = capture_thumbnail(path, mime, ffmpeg)
+    if result.kind != "ready":
+        if result.error:
+            log.info("no preview for %s: %s", getattr(path, "name", path), result.error)
         return None
-    try:
-        with Image.open(path) as src:
-            width, height = src.size
-            # EXIF orientation is what a viewer shows, so it is also what the
-            # dimensions have to say; read it before draft()/transpose change
-            # the size out from under us.
-            if (src.getexif() or {}).get(274, 1) in (5, 6, 7, 8):
-                width, height = height, width
-            # JPEG can decode straight to roughly the size we want, which is
-            # most of the cost of this function on a 20 MB photo.
-            src.draft("RGB", (PREVIEW_BOX, PREVIEW_BOX))
-            img = ImageOps.exif_transpose(src) or src
-            img = img.convert("RGB")  # a PNG with alpha cannot be saved as JPEG
-            img.thumbnail((PREVIEW_BOX, PREVIEW_BOX), Image.LANCZOS)
-            for quality in (75, 60, 45):
-                buf = io.BytesIO()
-                img.save(buf, "JPEG", quality=quality, optimize=True)
-                if buf.tell() <= PREVIEW_MAX_BYTES or quality == 45:
-                    return buf.getvalue(), width, height
-    except Exception as exc:
-        log.info("no preview for %s: %s", getattr(path, "name", path), exc)
-    return None
+    return result.jpeg, result.width, result.height
 
 
 def _media_attributes(doc) -> dict:

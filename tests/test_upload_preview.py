@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import gamestage  # noqa: E402
 import tgio  # noqa: E402
+from media_thumbnail import ThumbnailError, ThumbnailResult  # noqa: E402
 
 PIL = pytest.importorskip("PIL.Image")
 
@@ -92,6 +93,30 @@ def test_a_truncated_image_does_not_break_the_upload(tmp_path):
     path.write_bytes(_image(tmp_path / "whole.jpg").read_bytes()[:200])
 
     assert tgio.make_preview(path) is None
+
+
+def test_make_preview_adapts_a_ready_media_thumbnail(tmp_path, monkeypatch):
+    path = tmp_path / "clip.mp4"
+    seen = []
+
+    def capture(candidate, mime_type, ffmpeg):
+        seen.append((candidate, mime_type, ffmpeg))
+        return ThumbnailResult("ready", b"jpeg", 640, 360)
+
+    monkeypatch.setattr(tgio, "capture_thumbnail", capture)
+
+    assert tgio.make_preview(path, "video/mp4", "configured-ffmpeg") == (b"jpeg", 640, 360)
+    assert seen == [(path, "video/mp4", "configured-ffmpeg")]
+
+
+def test_make_preview_does_not_hide_decodable_media_capture_errors(tmp_path, monkeypatch):
+    def fail(*_):
+        raise ThumbnailError("no thumbnail")
+
+    monkeypatch.setattr(tgio, "capture_thumbnail", fail)
+
+    with pytest.raises(ThumbnailError, match="no thumbnail"):
+        tgio.make_preview(tmp_path / "clip.mp4", "video/mp4", "configured-ffmpeg")
 
 
 # --------------------------------------------------------------------------- #
