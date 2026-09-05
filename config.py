@@ -8,6 +8,7 @@ never need to be copied into this repo.
 from __future__ import annotations
 
 import configparser
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,7 +51,17 @@ class Config:
     rclone_dir: Path = Path("rclone")
     warmup_auto: bool = True
     warmup_interval_minutes: float = 360.0
+    accounts_file: Optional[Path] = None
+    upload_files: int = 3
     upload_parts: int = 12
+    hash_concurrency: int = 2
+    hash_check_concurrency: int = 8
+    register_concurrency: int = 8
+    album_batch: int = 10
+    album_timeout_seconds: float = 60.0
+    message_rate: float = 3.0
+    message_burst: int = 6
+    ffmpeg: str = ""
     upload_dir: Path = Path("uploads")
 
     @property
@@ -116,11 +127,32 @@ def _read_env_file(path: Path) -> dict:
     return values
 
 
+def positive_int(name: str, raw: str) -> int:
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{name} must be a positive integer, got {raw!r}") from None
+    if value <= 0:
+        raise ConfigError(f"{name} must be a positive integer, got {raw!r}")
+    return value
+
+
+def positive_float(name: str, raw: str) -> float:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{name} must be a positive number, got {raw!r}") from None
+    if not math.isfinite(value) or value <= 0:
+        raise ConfigError(f"{name} must be a positive number, got {raw!r}")
+    return value
+
+
 def load_config(path: Optional[Path] = None) -> Config:
     if path is None:
         env_path = os.environ.get("TELEDRIVE_WEBDAV_CONFIG")
         path = Path(env_path) if env_path else HERE / "config.ini"
     path = Path(path)
+    config_dir = path.resolve().parent
 
     parser = configparser.ConfigParser()
     # A missing config.ini is fine as long as the environment carries the
@@ -128,7 +160,10 @@ def load_config(path: Optional[Path] = None) -> Config:
     parser.read([HERE / "config.example.ini", path], encoding="utf-8")
 
     env_file = parser.get("env", "env_file", fallback="").strip()
-    file_env = _read_env_file(Path(env_file)) if env_file else {}
+    env_file_path = Path(env_file)
+    if env_file and not env_file_path.is_absolute():
+        env_file_path = config_dir / env_file_path
+    file_env = _read_env_file(env_file_path) if env_file else {}
 
     def get(section: str, key: str, default: str = "") -> str:
         val = parser.get(section, key, fallback="").strip()
@@ -141,7 +176,7 @@ def load_config(path: Optional[Path] = None) -> Config:
 
     def resolve_dir(raw: str) -> Path:
         p = Path(raw.strip())
-        return p if p.is_absolute() else (HERE / p)
+        return p if p.is_absolute() else (config_dir / p)
 
     # One setting names the root; everything under it is this module's business.
     # Splitting it into four settings only invited them to drift apart, and three
@@ -164,8 +199,18 @@ def load_config(path: Optional[Path] = None) -> Config:
         api_id=int(api_id),
         api_hash=api_hash,
         session=session,
-        download_connections=int(get("telegram", "download_connections", "8")),
-        upload_parts=int(get("telegram", "upload_parts", "12")),
+        download_connections=positive_int("download_connections", get("telegram", "download_connections", "8")),
+        accounts_file=(resolve_dir(raw) if (raw := get("telegram", "accounts_file")) else None),
+        upload_files=positive_int("upload_files", get("telegram", "upload_files", "3")),
+        upload_parts=positive_int("upload_parts", get("telegram", "upload_parts", "12")),
+        hash_concurrency=positive_int("hash_concurrency", get("upload", "hash_concurrency", "2")),
+        hash_check_concurrency=positive_int("hash_check_concurrency", get("upload", "hash_check_concurrency", "8")),
+        register_concurrency=positive_int("register_concurrency", get("upload", "register_concurrency", "8")),
+        album_batch=positive_int("album_batch", get("upload", "album_batch", "10")),
+        album_timeout_seconds=positive_float("album_timeout_seconds", get("upload", "album_timeout_seconds", "60")),
+        message_rate=positive_float("message_rate", get("upload", "message_rate", "3")),
+        message_burst=positive_int("message_burst", get("upload", "message_burst", "6")),
+        ffmpeg=get("upload", "ffmpeg"),
         base_url=get("teledrive", "base_url", "http://127.0.0.1:8000"),
         game_folder=get("teledrive", "game_folder", "game"),
         dir_cache_seconds=float(get("teledrive", "dir_cache_seconds", "3600")),

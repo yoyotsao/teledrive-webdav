@@ -1,0 +1,14 @@
+{
+  "accounts": [
+    {
+      "telegram_user_id": 123456789,
+      "label": "primary",
+      "session": "Telethon StringSession"
+    },
+    {
+      "telegram_user_id": 987654321,
+      "label": "secondary",
+      "session": "Telethon StringSession"
+    }
+  ]
+}

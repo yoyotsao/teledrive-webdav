@@ -2,6 +2,9 @@
 __pycache__/
 *.pyc
 config.ini
+accounts.json
+data/accounts.json
+upload-rate-*.json
 cache/
 staging/
 *.session
