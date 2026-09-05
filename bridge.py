@@ -253,8 +253,8 @@ class Resolver:
         except OSError:
             return None
 
-    def thumbs_for(self, entries: List[Entry]) -> Dict[str, bytes]:
-        """``{file_id: jpeg}`` for those entries that have a preview.
+    def thumbs_for(self, entries: List[Entry]) -> Dict[Tuple[int, str], bytes]:
+        """``{(account_id, file_id): jpeg}`` for entries with a preview.
 
         Cached on disk: a preview is derived from an immutable message, so once
         written it never needs invalidating. Everything still missing is fetched
@@ -262,7 +262,7 @@ class Resolver:
         length before it can answer PROPFIND — one request per file would make
         opening a folder as slow as the thing this replaces.
         """
-        found: Dict[str, bytes] = {}
+        found: Dict[Tuple[int, str], bytes] = {}
         missing: List[Entry] = []
         for entry in entries:
             if entry.is_dir or not entry.has_thumbnail or entry.message_id is None:
@@ -271,7 +271,7 @@ class Resolver:
             if hit is None:
                 missing.append(entry)
             else:
-                found[entry.file_id] = hit
+                found[(entry.telegram_user_id, entry.file_id)] = hit
         if not missing:
             return found
 
@@ -285,7 +285,7 @@ class Resolver:
                 data = fetched.get((entry.message_id, str(entry.file_id)))
                 if not data:
                     continue
-                found[entry.file_id] = data
+                found[(entry.telegram_user_id, entry.file_id)] = data
                 path = self._thumb_path(entry)
                 try:
                     _write_atomic(path, data)
@@ -294,7 +294,7 @@ class Resolver:
         return found
 
     def thumb_bytes(self, entry: Entry) -> Optional[bytes]:
-        return self.thumbs_for([entry]).get(entry.file_id)
+        return self.thumbs_for([entry]).get((entry.telegram_user_id, entry.file_id))
 
     # -- file heads -------------------------------------------------------- #
 
@@ -410,8 +410,10 @@ class Resolver:
             except OSError as exc:  # pragma: no cover - best-effort cleanup
                 log.warning("could not clear head %s: %s", path.name, exc)
 
-    def props_for(self, entries: List[Entry], *, demand: bool = True) -> Dict[str, dict]:
-        """``{file_id: {...}}`` media properties, cached on disk.
+    def props_for(
+        self, entries: List[Entry], *, demand: bool = True
+    ) -> Dict[Tuple[int, str], dict]:
+        """``{(account_id, file_id): {...}}`` media properties, cached on disk.
 
         Same shape as thumbs_for and for the same reason: Explorer asks per file,
         Telegram answers per hundred. Unlike previews these cost no bytes at all —
@@ -422,7 +424,7 @@ class Resolver:
         own fetches as demand would keep resetting the quiet timer it is waiting
         on, and so never get to run.
         """
-        found: Dict[str, dict] = {}
+        found: Dict[Tuple[int, str], dict] = {}
         missing: List[Entry] = []
         for entry in entries:
             if entry.is_dir or entry.message_id is None:
@@ -431,7 +433,7 @@ class Resolver:
             if hit is None:
                 missing.append(entry)
             else:
-                found[entry.file_id] = hit
+                found[(entry.telegram_user_id, entry.file_id)] = hit
         if not missing:
             return found
 
@@ -447,7 +449,7 @@ class Resolver:
                 info = fetched.get((entry.message_id, str(entry.file_id)))
                 if info is None:
                     continue
-                found[entry.file_id] = info
+                found[(entry.telegram_user_id, entry.file_id)] = info
                 self._prop_cache.put(self._cache_key(entry), info, defer=True)
         self._prop_cache.flush()
         return found
@@ -1352,7 +1354,12 @@ class RpcApp:
         loc = self.resolver.resolve(segments)
         if loc.kind != FILE or loc.entry is None:
             return _text_response(start_response, "404 Not Found", "no such file\n")
-        info = dict(self.resolver.props_for([loc.entry]).get(loc.entry.file_id) or {})
+        info = dict(
+            self.resolver.props_for([loc.entry]).get(
+                (loc.entry.telegram_user_id, loc.entry.file_id)
+            )
+            or {}
+        )
         info["size"] = self.resolver.api.total_size(loc.entry)
         payload = json.dumps(info).encode("utf-8")
         start_response(

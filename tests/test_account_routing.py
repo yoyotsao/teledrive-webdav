@@ -105,6 +105,7 @@ class _MemoryWorker:
         self.files = {}
         self.calls = []
         self.info = {}
+        self.thumbs = {}
 
     def put(self, message_id, file_id, data):
         self.files[(message_id, str(file_id))] = data
@@ -116,6 +117,12 @@ class _MemoryWorker:
     def media_info(self, parts):
         return {
             (part.message_id, str(part.file_id)): self.info[(part.message_id, str(part.file_id))]
+            for part in parts
+        }
+
+    def thumbnails(self, parts):
+        return {
+            (part.message_id, str(part.file_id)): self.thumbs[(part.message_id, str(part.file_id))]
             for part in parts
         }
 
@@ -183,17 +190,25 @@ def test_thumbnail_and_head_disk_caches_do_not_collide_across_accounts(tmp_path)
     assert resolver.cached_head(second) == b""
 
 
-def test_property_cache_does_not_cross_accounts_with_same_file_id(tmp_path):
+def test_thumbnail_and_property_results_keep_account_identity_in_one_batch(tmp_path):
     cfg = SimpleNamespace(cache_dir=tmp_path)
     pool = _Pool()
+    pool.runtime(1).worker.thumbs[(9, "same")] = b"thumb-1"
+    pool.runtime(2).worker.thumbs[(9, "same")] = b"thumb-2"
     pool.runtime(1).worker.info[(9, "same")] = {"width": 1}
     pool.runtime(2).worker.info[(9, "same")] = {"width": 2}
     resolver = bridge.Resolver(cfg, SimpleNamespace(), pool)
     first = _entry(1)
     second = _entry(2)
 
-    assert resolver.props_for([first]) == {"same": {"width": 1}}
-    assert resolver.props_for([second]) == {"same": {"width": 2}}
+    assert resolver.thumbs_for([first, second]) == {
+        (1, "same"): b"thumb-1",
+        (2, "same"): b"thumb-2",
+    }
+    assert resolver.props_for([first, second]) == {
+        (1, "same"): {"width": 1},
+        (2, "same"): {"width": 2},
+    }
     assert resolver._prop_cache.get("1-same") == {"width": 1}
     assert resolver._prop_cache.get("2-same") == {"width": 2}
 
@@ -225,3 +240,44 @@ def test_split_cache_does_not_cross_accounts_with_same_file_id(tmp_path):
     assert api.parts_for(first) == [RemotePart(9, 1, 1, "part-1")]
     assert api.parts_for(second) == [RemotePart(9, 1, 2, "part-2")]
     assert api.calls == 2
+
+
+def test_parts_for_preserves_same_message_id_on_different_accounts_in_a_range(tmp_path):
+    api = _SplitApi(tmp_path, [{"files": [
+        {"file_id": "110", "filesize": 3, "telegram_message_id": 10,
+         "telegram_user_id": 1, "part_index": 0},
+        {"file_id": "210", "filesize": 3, "telegram_message_id": 10,
+         "telegram_user_id": 2, "part_index": 1},
+    ]}])
+    entry = Entry("logical", "x", False, 3, 0, message_id=10, is_split=True,
+                  split_group_id="group", telegram_user_id=1)
+    pool = _Pool()
+    pool.runtime(1).worker.put(10, "110", b"abc")
+    pool.runtime(2).worker.put(10, "210", b"DEF")
+
+    remote = tgio.SeekableRemoteFile(pool, api.parts_for(entry), block_size=1)
+    remote.seek(2)
+
+    assert remote.read(3) == b"cDE"
+
+
+def test_legacy_split_cache_without_file_ids_is_refetched(tmp_path):
+    api = _SplitApi(tmp_path, [{"files": [
+        {"file_id": "110", "filesize": 3, "telegram_message_id": 10,
+         "telegram_user_id": 1, "part_index": 0},
+        {"file_id": "211", "filesize": 2, "telegram_message_id": 11,
+         "telegram_user_id": 2, "part_index": 1},
+    ]}])
+    entry = Entry("logical", "x", False, 3, 0, message_id=10, is_split=True,
+                  split_group_id="group", telegram_user_id=0)
+    api._split_cache.put("group", [[10, 3], [11, 2]])
+
+    assert api.parts_for(entry) == [
+        RemotePart(10, 3, 1, "110"),
+        RemotePart(11, 2, 2, "211"),
+    ]
+    assert api.calls == 1
+    assert api._split_cache.get("0:logical") == [
+        [10, 3, 1, "110"],
+        [11, 2, 2, "211"],
+    ]

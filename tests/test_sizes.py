@@ -153,7 +153,8 @@ def test_total_size_keeps_filesize_when_no_hash_suffix():
 
 def test_total_size_clips_a_split_file_tail():
     rows = [
-        {"telegram_message_id": 100 + i, "filesize": SEG, "part_index": i}
+        {"file_id": f"f{100 + i}", "telegram_message_id": 100 + i,
+         "filesize": SEG, "part_index": i}
         for i in range(12)
     ]
     api = FakeApi(rows)
@@ -164,16 +165,18 @@ def test_total_size_clips_a_split_file_tail():
 
 def test_total_size_reports_what_exists_for_an_under_registered_split():
     # the Aqua case: 1 of 6 parts registered, real length far larger
-    rows = [{"telegram_message_id": 1859, "filesize": SEG, "part_index": 0}]
+    rows = [{"file_id": "f1859", "telegram_message_id": 1859,
+             "filesize": SEG, "part_index": 0}]
     api = FakeApi(rows)
     e = entry(SEG, "h:2657828026", is_split=True, group="g2")
     assert api.total_size(e) == SEG  # not 2657828026 — those bytes are gone
-    assert api.parts_for(e) == [RemotePart(1859, SEG, 0, "f1")]
+    assert api.parts_for(e) == [RemotePart(1859, SEG, 0, "f1859")]
 
 
 def test_clipping_survives_the_disk_cache():
     rows = [
-        {"telegram_message_id": 100 + i, "filesize": SEG, "part_index": i}
+        {"file_id": f"f{100 + i}", "telegram_message_id": 100 + i,
+         "filesize": SEG, "part_index": i}
         for i in range(3)
     ]
     api = FakeApi(rows)
@@ -181,9 +184,9 @@ def test_clipping_survives_the_disk_cache():
     first = api.parts_for(e)
     second = api.parts_for(e)  # served from _split_cache this time
     assert api.calls == 1
-    assert first == second == [RemotePart(100, SEG, 0, "f1"),
-                               RemotePart(101, SEG, 0, "f1"),
-                               RemotePart(102, 100, 0, "f1")]
+    assert first == second == [RemotePart(100, SEG, 0, "f100"),
+                               RemotePart(101, SEG, 0, "f101"),
+                               RemotePart(102, 100, 0, "f102")]
 
 
 # --------------------------------------------------------------------------- #

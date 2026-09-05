@@ -123,25 +123,28 @@ def _clip_remote_parts(parts: Sequence[RemotePart], real: Optional[int]) -> List
     ]
 
 
-def _cached_remote_parts(cached, fallback_file_id: str) -> List[RemotePart]:
+def _cached_remote_parts(cached) -> Optional[List[RemotePart]]:
     """Decode current and historical split-cache rows.
 
-    Earlier cache files held ``[message_id, size]`` only.  They have no account
-    information, so zero is the deliberate legacy route; their containing file
-    remains the only usable file identity.
+    Earlier cache files held ``[message_id, size]`` only. A containing entry's
+    file ID identifies only part zero, so applying it to every cached part would
+    fabricate immutable Telegram identities. Any incomplete row invalidates the
+    whole cached table and makes the caller refresh authoritative metadata.
     """
     parts = []
     for row in cached:
-        if not isinstance(row, (list, tuple)) or len(row) < 2:
-            continue
-        message_id, size = row[:2]
-        telegram_user_id = row[2] if len(row) > 2 else 0
-        file_id = row[3] if len(row) > 3 else fallback_file_id
+        if (
+            not isinstance(row, (list, tuple))
+            or len(row) < 4
+            or row[3] in (None, "")
+        ):
+            return None
+        message_id, size, telegram_user_id, file_id = row[:4]
         parts.append(RemotePart(
             int(message_id),
             int(size),
             int(telegram_user_id or 0),
-            str(file_id or fallback_file_id),
+            str(file_id),
         ))
     return parts
 
@@ -603,7 +606,9 @@ class TeleDriveClient:
         if cached is None and entry.telegram_user_id == 0:
             cached = self._split_cache.get(entry.split_group_id)
         if cached:
-            return _clip_remote_parts(_cached_remote_parts(cached, entry.file_id), entry.real_size)
+            cached_parts = _cached_remote_parts(cached)
+            if cached_parts is not None:
+                return _clip_remote_parts(cached_parts, entry.real_size)
 
         data = self._call("GET", f"/files/by-split-group/{entry.split_group_id}")
         rows = sorted(data.get("files") or [], key=lambda r: r.get("part_index") or 0)
@@ -611,17 +616,21 @@ class TeleDriveClient:
         seen = set()
         for row in rows:
             message_id = row.get("telegram_message_id")
+            telegram_user_id = int(row.get("telegram_user_id") or 0)
+            file_id = row.get("file_id")
+            identity = (telegram_user_id, message_id)
             # A genuine split never reuses a message across parts. Collapsing
             # duplicates guards against the historical dedup bug that registered
-            # one message thousands of times.
-            if message_id is None or message_id in seen:
+            # one account-local message thousands of times. The same numeric ID
+            # on another account is a different Telegram message.
+            if message_id is None or not file_id or identity in seen:
                 continue
-            seen.add(message_id)
+            seen.add(identity)
             parts.append(RemotePart(
                 int(message_id),
                 int(row.get("filesize") or 0),
-                int(row.get("telegram_user_id") or 0),
-                str(row.get("file_id") or entry.file_id),
+                telegram_user_id,
+                str(file_id),
             ))
         if len(seen) != len(rows):
             log.warning("split group %s had %s duplicate part rows", entry.split_group_id, len(rows) - len(seen))
