@@ -225,6 +225,7 @@ async def _upload_parts(
     request_factory,
     workers: int,
     progress,
+    collect_payloads: bool = False,
 ):
     """Upload one complete MTProto message under worker and account limits."""
     from telethon import helpers
@@ -234,13 +235,14 @@ async def _upload_parts(
     sent = 0
     sent_lock = asyncio.Lock()
     worker_slots = asyncio.Semaphore(max(1, int(workers)))
-    payloads = [None] * total
+    payloads = [None] * total if collect_payloads else None
 
     async def send_one(index: int, offset: int, nbytes: int) -> None:
         nonlocal sent
         async with worker_slots:
             data = await reader.read_at(offset, nbytes)
-            payloads[index] = data
+            if payloads is not None:
+                payloads[index] = data
             for attempt in range(PART_RETRIES):
                 try:
                     await send_part(
@@ -290,6 +292,7 @@ async def upload_small_file_parts(
     """Use 128 KiB SaveFilePart requests with an MD5 in the InputFile handle."""
     if not 0 < size <= SMALL_FILE_MAX:
         raise ValueError("small upload size must be between 1 byte and 10 MiB")
+    workers = min(4, max(1, int(workers)))
     from telethon.tl.functions.upload import SaveFilePartRequest
     from telethon.tl.types import InputFile
 
@@ -304,6 +307,7 @@ async def upload_small_file_parts(
         ),
         workers=workers,
         progress=progress,
+        collect_payloads=True,
     )
     return InputFile(
         file_id, total, file_name, hashlib.md5(b"".join(payloads)).hexdigest()
@@ -338,6 +342,7 @@ async def upload_big_file_parts(
         request_factory=SaveBigFilePartRequest,
         workers=workers,
         progress=progress,
+        collect_payloads=False,
     )
     return InputFileBig(file_id, total, file_name)
 

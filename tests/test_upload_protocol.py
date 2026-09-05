@@ -16,6 +16,7 @@ from tgupload import (  # noqa: E402
     BIG_PART_SIZE,
     SMALL_PART_SIZE,
     _PartReader,
+    _upload_parts,
     decide_protocol,
     upload_big_file_parts,
     upload_small_file_parts,
@@ -113,29 +114,116 @@ class BlockingSender:
             self.active -= 1
 
 
-def test_small_file_has_128k_parts_four_workers_md5_and_limiter():
-    data = b"x" * 700_000
-    sender = RecordingSender()
+def test_small_file_clamps_even_an_explicit_twelve_worker_request():
+    data = b"x" * (20 * SMALL_PART_SIZE)
+    class ProbeSender:
+        def __init__(self):
+            self.requests = []
+            self.active = 0
+            self.peak = 0
+            self.reached_cap = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def send(self, request):
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            if self.active >= 4:
+                self.reached_cap.set()
+            self.requests.append(request)
+            try:
+                await self.release.wait()
+            finally:
+                self.active -= 1
+
+    sender = ProbeSender()
     limiter = RecordingLimiter()
 
     async def scenario():
         async with _PartReader(io.BytesIO(data)) as reader:
-            return await upload_small_file_parts(
+            task = asyncio.create_task(upload_small_file_parts(
                 sender,
                 limiter,
                 reader,
                 len(data),
                 "x.bin",
-                workers=4,
-            )
+                workers=12,
+            ))
+            await asyncio.wait_for(sender.reached_cap.wait(), timeout=1)
+            sender.release.set()
+            return await task
 
     result = run(scenario())
 
-    assert max(sender.in_flight) <= 4
-    assert {request.file_part for request in sender.requests} == set(range(6))
-    assert {len(request.bytes) for request in sender.requests[:-1]} == {SMALL_PART_SIZE}
+    assert sender.peak <= 4
+    assert {request.file_part for request in sender.requests} == set(range(20))
+    assert {len(request.bytes) for request in sender.requests} == {SMALL_PART_SIZE}
     assert result.md5_checksum == hashlib.md5(data).hexdigest()
-    assert limiter.acquires == 6
+    assert limiter.acquires == 20
+
+
+def test_big_upload_releases_completed_payloads_instead_of_retaining_all_parts():
+    import gc
+    import weakref
+
+    class Payload:
+        def __init__(self, value):
+            self.value = value
+
+        def __len__(self):
+            return len(self.value)
+
+    class Stream:
+        def __init__(self):
+            self.payloads = [Payload(b"a"), Payload(b"b")]
+
+        def seek(self, offset):
+            self.offset = offset
+
+        def read(self, _size):
+            return self.payloads[self.offset]
+
+    class Sender:
+        def __init__(self):
+            self.first_done = asyncio.Event()
+            self.release_second = asyncio.Event()
+
+        async def send(self, request):
+            if request.index == 0:
+                self.first_done.set()
+                return
+            await self.release_second.wait()
+
+    sender = Sender()
+    limiter = RecordingLimiter()
+    stream = Stream()
+    first_ref = weakref.ref(stream.payloads[0])
+
+    async def scenario():
+        async with _PartReader(stream) as reader:
+            task = asyncio.create_task(
+                _upload_parts(
+                    sender,
+                    limiter,
+                    reader,
+                    2,
+                    parts=[(0, 1), (1, 1)],
+                    request_factory=lambda _fid, index, total, data: SimpleNamespace(
+                        index=index, total=total, data=data
+                    ),
+                    workers=2,
+                    progress=None,
+                    collect_payloads=False,
+                )
+            )
+            await sender.first_done.wait()
+            stream.payloads[0] = None
+            gc.collect()
+            released = first_ref() is None
+            sender.release_second.set()
+            await task
+            return released
+
+    assert run(scenario())
 
 
 def test_one_byte_forced_big_upload_uses_big_request_and_limiter():
