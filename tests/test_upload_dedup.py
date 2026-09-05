@@ -16,6 +16,7 @@ from upload_engine import (  # noqa: E402
     assert_parts_cover_file,
     canonical_existing_parts,
 )
+import gamestage  # noqa: E402
 
 
 def row(*, group="g", index=0, size=10, account=1, message=None, file_id=None, split=True):
@@ -131,12 +132,23 @@ def test_two_batch_aliases_run_one_producer():
     assert results[0] == results[1]
 
 
-def test_failed_claim_wakes_all_waiters_and_retry_claims_fresh_producer():
+def test_failed_claim_wakes_joined_follower_and_retry_claims_fresh_producer():
     """A failed owner wakes followers, then a later batch attempt is allowed."""
     claims = FingerprintClaims()
     started = threading.Event()
+    follower_claimed = threading.Event()
     release = threading.Event()
     calls = 0
+
+    claim = claims._claim
+
+    def observe_follower(key):
+        future, owner = claim(key)
+        if not owner:
+            follower_claimed.set()
+        return future, owner
+
+    claims._claim = observe_follower
 
     def failing():
         nonlocal calls
@@ -149,6 +161,7 @@ def test_failed_claim_wakes_all_waiters_and_retry_claims_fresh_producer():
         first = executor.submit(claims.run, "same:10", failing)
         assert started.wait(timeout=2)
         second = executor.submit(claims.run, "same:10", failing)
+        assert follower_claimed.wait(timeout=2)
         release.set()
         for future in (first, second):
             with pytest.raises(RuntimeError, match="telegram unavailable"):
@@ -157,3 +170,31 @@ def test_failed_claim_wakes_all_waiters_and_retry_claims_fresh_producer():
     expected = [UploadedPart(0, 88, "retry", None, 10, 1)]
     assert claims.run("same:10", lambda: expected) == expected
     assert calls == 1
+
+
+class _DedupApi:
+    def __init__(self, rows):
+        self.rows = rows
+        self.registered = []
+
+    def check_hash(self, _file_hash):
+        return {"found": True, "files": self.rows}
+
+    def register(self, **registered):
+        self.registered.append(registered)
+
+    def invalidate(self, _parent_id=None):
+        pass
+
+
+def test_dedup_registration_forwards_reused_part_storage_account(tmp_path):
+    """A reused secondary-account message must remain routed to that account."""
+    archive = tmp_path / "reused.bin"
+    archive.write_bytes(b"0123456789")
+    api = _DedupApi([row(size=10, account=42, split=False, message=77)])
+
+    gamestage.upload_and_register(
+        api, None, archive, "reused.bin", "parent", "application/octet-stream"
+    )
+
+    assert api.registered[0]["telegram_user_id"] == 42

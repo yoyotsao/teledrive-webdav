@@ -398,6 +398,7 @@ def upload_and_register(
             message_id=part.message_id,
             file_id=part.file_id or f"{split_group_id}-{index}",
             access_hash=part.access_hash,
+            telegram_user_id=part.telegram_user_id,
             mime_type=mime_type,
             parent_id=parent_id,
             is_split_file=total > 1,
