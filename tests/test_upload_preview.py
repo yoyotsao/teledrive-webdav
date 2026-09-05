@@ -149,6 +149,24 @@ def test_an_image_upload_carries_a_preview_and_its_size(tmp_path):
     assert preview[1:] == (1200, 800)
 
 
+def test_a_video_upload_carries_a_preview_and_its_mime_type(tmp_path, monkeypatch):
+    path = tmp_path / "clip.mp4"
+    path.write_bytes(b"video bytes")
+    worker = _Worker()
+    seen = []
+
+    def preview(candidate, mime_type):
+        seen.append((candidate, mime_type))
+        return b"jpeg", 640, 360
+
+    monkeypatch.setattr(gamestage, "make_preview", preview)
+
+    gamestage._upload_segments(worker, path, path.stat().st_size, "clip.mp4", "video/mp4")
+
+    assert seen == [(path, "video/mp4")]
+    assert worker.calls[0][1][1:] == (640, 360)
+
+
 def test_a_non_image_upload_carries_none(tmp_path):
     blob = tmp_path / "game.zip"
     blob.write_bytes(bytes([0x50, 0x4B, 3, 4]) + bytes(4096))

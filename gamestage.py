@@ -462,10 +462,10 @@ def _upload_segments(
     worker, archive: Path, size: int, upload_name: str, mime_type: str = ""
 ) -> List[dict]:
     segments = plan_segments(size, SEGMENT_SIZE)
-    # Only a whole still image gets a preview. One part of a split file is not
-    # an image, and neither is a /game zip.
-    single_image = len(segments) == 1 and mime_type.startswith("image/")
-    with _preview_file(archive if single_image else None) as preview:
+    # Only whole image/video media gets a preview. One part of a split file is
+    # not media in its own right, and neither is a /game zip.
+    single_media = len(segments) == 1 and mime_type.startswith(("image/", "video/"))
+    with _preview_file(archive if single_media else None, mime_type) as preview:
         parts: List[dict] = []
         for index, (offset, seg_size) in enumerate(segments):
             name = upload_name if len(segments) == 1 else f"{upload_name}.part{index + 1}"
@@ -484,8 +484,8 @@ def _upload_segments(
 
 
 @contextlib.contextmanager
-def _preview_file(image: Optional[Path]):
-    """Yield ``(jpeg_path, width, height)`` for ``image``, or None.
+def _preview_file(image: Optional[Path], mime_type: str = ""):
+    """Yield ``(jpeg_path, width, height)`` for media ``image``, or None.
 
     On disk rather than in memory because Telethon uploads a thumbnail by name
     and Telegram ignores one that does not look like a ``.jpg`` file. In the
@@ -493,7 +493,7 @@ def _preview_file(image: Optional[Path]):
     ``staging/`` are both scanned for work, and a stray file there would be
     read back as something the user asked to upload.
     """
-    made = make_preview(image) if image is not None else None
+    made = make_preview(image, mime_type) if image is not None else None
     if made is None:
         yield None
         return
