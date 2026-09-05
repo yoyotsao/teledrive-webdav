@@ -131,11 +131,9 @@ STREAM_BLOCK_SIZE = REQUEST_SIZE * DOWNLOAD_CONNECTIONS * READS_IN_FLIGHT
 # Same split boundary as the browser uploader: MAX_PARTS (1000) x CHUNK_SIZE
 # (512 KB) = 500 MiB, see frontend/src/lib/gramjs.ts:502 and frontend config.ts.
 # Not 512 MiB — that would exceed the browser's 1000-part-per-message ceiling.
-# tgupload.PART_SIZE is now the authoritative part size for segments over
-# tgupload.BIG_FILE_THRESHOLD; UPLOAD_PART_KB only feeds Telethon's own
-# client.upload_file for the small-segment path below.
-UPLOAD_PART_KB = 512
-SEGMENT_SIZE = 1000 * UPLOAD_PART_KB * 1024
+# The sender's message maximum is authoritative, so split planning and wire
+# limits cannot drift apart.
+SEGMENT_SIZE = tgupload.MESSAGE_MAX
 assert SEGMENT_SIZE == tgupload.MAX_PARTS_PER_MESSAGE * tgupload.PART_SIZE
 
 DOC_CACHE_TTL = 45 * 60  # file_reference lives a few hours; refresh well before
@@ -263,6 +261,7 @@ class TelegramWorker:
         connections: int = DOWNLOAD_CONNECTIONS,
         *,
         upload_parts: int = 12,
+        upload_limiter=None,
     ):
         self._api_id = api_id
         self._api_hash = api_hash
@@ -280,7 +279,8 @@ class TelegramWorker:
         self._pool_lock: Optional[asyncio.Lock] = None
         self._rr = 0  # round-robin cursor over the pool, see _next_client
         self._upload = None  # dedicated client for part sends, see _upload_client
-        self._gate: Optional[tgupload.UploadGate] = None
+        self._upload_limiter = upload_limiter
+        self._gate = upload_limiter
         self._thumb_gate: Optional[asyncio.Semaphore] = None  # see THUMB_CONCURRENCY
 
     # -- lifecycle -------------------------------------------------------- #
@@ -377,6 +377,13 @@ class TelegramWorker:
             self._gate = tgupload.UploadGate(self._upload_parts)
         return self._gate
 
+    def set_upload_limiter(self, limiter) -> None:
+        """Bind the AccountRuntime-owned limiter before this worker starts."""
+        if self._gate is not None and self._gate is not limiter:
+            raise RuntimeError("upload limiter cannot change after upload admission starts")
+        self._upload_limiter = limiter
+        self._gate = limiter
+
     def stop(self) -> None:
         loop = self._loop
         thread = self._thread
@@ -397,7 +404,7 @@ class TelegramWorker:
         self._pool = None
         self._pool_lock = None
         self._upload = None
-        self._gate = None
+        self._gate = self._upload_limiter
         self._thumb_gate = None
 
     async def _disconnect_all(self) -> None:
@@ -783,7 +790,7 @@ class TelegramWorker:
 
     # -- uploading -------------------------------------------------------- #
 
-    def upload_segment(self, stream, size: int, file_name: str, progress=None, preview=None) -> dict:
+    def upload_segment(self, stream, size: int, file_name: str, progress=None, preview=None, *, force_big=None) -> dict:
         """Upload one segment as a single Telegram document message.
 
         ``stream`` is a binary file object positioned at the segment start and
@@ -797,34 +804,25 @@ class TelegramWorker:
         image; a zip or one part of a split file has no preview to give.
         """
         return self.run(
-            self._upload_segment(stream, size, file_name, progress, preview), timeout=None
+            self._upload_segment(stream, size, file_name, progress, preview, force_big), timeout=None
         )
 
-    async def _upload_segment(self, stream, size: int, file_name: str, progress, preview=None) -> dict:
+    async def _upload_segment(self, stream, size: int, file_name: str, progress, preview=None, force_big=None) -> dict:
         from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeImageSize
 
-        if size <= tgupload.BIG_FILE_THRESHOLD:
-            # A handful of parts at most: parallelism buys nothing over one
-            # round trip per part, and Telethon's own MD5-verified small-file
-            # path is worth leaving untouched.
-            client = self._client
-            handle = await client.upload_file(
-                stream,
-                file_size=size,
-                file_name=file_name,
-                part_size_kb=UPLOAD_PART_KB,
-                progress_callback=progress,
-            )
-        else:
-            client = await self._upload_client()
-            async with tgupload._PartReader(stream) as reader:
-                handle = await tgupload.upload_file_parts(
-                    client=client,
-                    gate=self._upload_gate(),
-                    reader=reader,
-                    size=size,
-                    file_name=file_name,
-                    progress=progress,
+        decision = tgupload.decide_protocol(size, album_eligible=False)
+        if force_big is None:
+            force_big = bool(getattr(stream, "force_big", False))
+        client = await self._upload_client()
+        async with tgupload._PartReader(stream) as reader:
+            if force_big or decision.force_big:
+                handle = await tgupload.upload_big_file_parts(
+                    client, self._upload_gate(), reader, size, file_name,
+                    force_big=True, progress=progress,
+                )
+            else:
+                handle = await tgupload.upload_small_file_parts(
+                    client, self._upload_gate(), reader, size, file_name, progress=progress,
                 )
 
         attributes = [DocumentAttributeFilename(file_name)]
@@ -1396,13 +1394,14 @@ class SegmentReader(io.RawIOBase):
     loop.
     """
 
-    def __init__(self, path, start: int, size: int):
+    def __init__(self, path, start: int, size: int, *, force_big: bool = False):
         super().__init__()
         self._fh = open(path, "rb")
         self._fh.seek(start)
         self._start = start
         self._size = size
         self._pos = 0
+        self.force_big = bool(force_big)
 
     def readable(self) -> bool:
         return True

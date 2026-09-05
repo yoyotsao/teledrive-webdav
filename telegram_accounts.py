@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import logging
 import threading
 import time
@@ -96,7 +97,7 @@ class TelegramAccountPool:
         upload_files: int = 3,
         upload_parts: int = 12,
         worker_factory: Callable[..., TelegramWorker] = TelegramWorker,
-        chunk_limiter_factory: Optional[Callable[[], object]] = None,
+        chunk_limiter_factory: Optional[Callable[..., object]] = None,
         message_limiter_factory: Optional[Callable[[], object]] = None,
     ) -> None:
         if not specs:
@@ -108,6 +109,8 @@ class TelegramAccountPool:
 
         self._runtimes: list[AccountRuntime] = []
         for spec in specs:
+            chunk_limiter = self._make_runtime_value(chunk_limiter_factory, spec)
+            message_limiter = message_limiter_factory() if message_limiter_factory else None
             worker = worker_factory(
                 api_id,
                 api_hash,
@@ -115,13 +118,16 @@ class TelegramAccountPool:
                 download_connections,
                 upload_parts=upload_parts,
             )
+            bind_limiter = getattr(worker, "set_upload_limiter", None)
+            if chunk_limiter is not None and callable(bind_limiter):
+                bind_limiter(chunk_limiter)
             self._runtimes.append(
                 AccountRuntime(
                     spec=spec,
                     worker=worker,
                     file_slots=threading.BoundedSemaphore(upload_files),
-                    chunk_limiter=(chunk_limiter_factory() if chunk_limiter_factory else None),
-                    message_limiter=(message_limiter_factory() if message_limiter_factory else None),
+                    chunk_limiter=chunk_limiter,
+                    message_limiter=message_limiter,
                 )
             )
         self._by_id = {
@@ -133,13 +139,24 @@ class TelegramAccountPool:
         self._lock = threading.Lock()
         self._started = False
 
+    @staticmethod
+    def _make_runtime_value(factory, spec: AccountSpec):
+        """Support legacy zero-argument factories and spec-aware production ones."""
+        if factory is None:
+            return None
+        try:
+            inspect.signature(factory).bind(spec)
+        except (TypeError, ValueError):
+            return factory()
+        return factory(spec)
+
     @classmethod
     def from_config(
         cls,
         cfg,
         *,
         worker_factory: Callable[..., TelegramWorker] = TelegramWorker,
-        chunk_limiter_factory: Optional[Callable[[], object]] = None,
+        chunk_limiter_factory: Optional[Callable[..., object]] = None,
         message_limiter_factory: Optional[Callable[[], object]] = None,
     ) -> "TelegramAccountPool":
         specs = (
@@ -147,6 +164,16 @@ class TelegramAccountPool:
             if cfg.accounts_file is not None
             else [AccountSpec(0, "primary", cfg.session)]
         )
+        if chunk_limiter_factory is None:
+            from upload_limiter import AdaptiveUploadLimiter
+
+            def chunk_limiter_factory(spec: AccountSpec):
+                return AdaptiveUploadLimiter(
+                    max_window=cfg.upload_parts,
+                    account_id=spec.telegram_user_id,
+                    cache_dir=getattr(cfg, "cache_dir", None),
+                )
+
         return cls(
             specs,
             api_id=cfg.api_id,

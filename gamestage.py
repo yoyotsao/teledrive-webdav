@@ -472,7 +472,7 @@ def _upload_segments(
             log.info(
                 "uploading %s (%s/%s, %.1f MiB)", name, index + 1, len(segments), seg_size / 2**20
             )
-            reader = SegmentReader(_ext(archive), offset, seg_size)
+            reader = SegmentReader(_ext(archive), offset, seg_size, force_big=len(segments) > 1)
             try:
                 result = _upload_one_segment(worker, reader, seg_size, name, preview)
             finally:

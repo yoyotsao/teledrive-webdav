@@ -282,6 +282,66 @@ def test_runtime_limiters_are_independent_and_injectable():
     assert pool.runtime(1).message_limiter is not pool.runtime(2).message_limiter
 
 
+def test_runtime_binds_its_injected_chunk_limiter_to_its_worker():
+    from telegram_accounts import TelegramAccountPool
+
+    class BindingWorker(FakeWorker):
+        def __init__(self, user_id):
+            super().__init__(user_id)
+            self.bound_limiter = None
+
+        def set_upload_limiter(self, limiter):
+            self.bound_limiter = limiter
+
+    workers = {"s1": BindingWorker(1), "s2": BindingWorker(2)}
+    pool = TelegramAccountPool(
+        [AccountSpec(1, "one", "s1"), AccountSpec(2, "two", "s2")],
+        api_id=1,
+        api_hash="hash",
+        worker_factory=WorkerFactory(workers),
+        chunk_limiter_factory=object,
+    )
+
+    assert workers["s1"].bound_limiter is pool.runtime(1).chunk_limiter
+    assert workers["s2"].bound_limiter is pool.runtime(2).chunk_limiter
+
+
+def test_from_config_builds_and_binds_one_persisted_limiter_per_account(tmp_path):
+    """The production pool path, not only injected-test callers, owns it."""
+    from telegram_accounts import TelegramAccountPool
+    from upload_limiter import AdaptiveUploadLimiter
+
+    class BindingWorker(FakeWorker):
+        def __init__(self, user_id):
+            super().__init__(user_id)
+            self.bound_limiter = None
+
+        def set_upload_limiter(self, limiter):
+            self.bound_limiter = limiter
+
+    accounts = write_accounts(tmp_path, [(42, "primary", "session-42")])
+    cfg = SimpleNamespace(
+        accounts_file=accounts,
+        session="legacy-secret",
+        api_id=123,
+        api_hash="hash",
+        download_connections=8,
+        upload_files=3,
+        upload_parts=99,
+        cache_dir=tmp_path / "meta",
+    )
+    worker = BindingWorker(42)
+    pool = TelegramAccountPool.from_config(
+        cfg, worker_factory=WorkerFactory({"session-42": worker})
+    )
+
+    limiter = pool.runtime(42).chunk_limiter
+    assert isinstance(limiter, AdaptiveUploadLimiter)
+    assert limiter.account_id == 42
+    assert limiter.snapshot().window == 12
+    assert worker.bound_limiter is limiter
+
+
 def test_worker_can_start_again_after_connection_failure():
     class RetryWorker(TelegramWorker):
         def __init__(self):
