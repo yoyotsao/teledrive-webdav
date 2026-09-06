@@ -72,6 +72,31 @@ def test_returned_file_id_is_checked_before_getfile():
     assert worker._client.getfile_calls == []
 
 
+def test_a_legacy_synthetic_file_id_still_reads():
+    """Rows registered before file_id meant anything must stay readable.
+
+    /game split parts used to be registered with ``f"{split_group_id}-{index}"``
+    whenever the upload did not return a document id, so their file_id is a
+    timestamp and a hex tag, not a Telegram identity. Checking those against
+    what Telegram returns can only ever fail, and failing means the archive
+    cannot be opened at all: measured on the live drive, 127 of 143 rows under
+    /game carried one of these and every one of them stopped reading.
+
+    An id that is not a document id carries no identity to verify, so the read
+    falls back to trusting the message id, which is what it did before.
+    """
+    worker = _worker({5: _Message(5, "700")})
+
+    assert worker.get_document(5, "1788435722109-52da4qq-3").id == 700
+    assert worker.read(5, "1788435722109-52da4qq-3", 0, 1) == b"x"
+
+
+def test_an_empty_file_id_is_not_an_identity_either():
+    worker = _worker({5: _Message(5, "700")})
+
+    assert worker.get_document(5, "").id == 700
+
+
 def test_document_cache_key_includes_expected_file_id():
     worker = _worker({5: _Message(5, "700")})
 

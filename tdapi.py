@@ -21,6 +21,7 @@ import hashlib
 import json
 import logging
 import os
+import tempfile
 import re
 import threading
 import time
@@ -241,13 +242,29 @@ class JsonStore:
         with self._lock:
             self._data = merged
 
-        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+        # A temp name per writer, not a fixed ".tmp". wsgidav answers a listing
+        # on sixteen worker threads and each one that fills a zip directory
+        # flushes this store, so a shared name means one thread's os.replace
+        # lands on a file another thread still holds open -- on Windows that is
+        # a hard WinError 32 and the write is simply lost. It looked like two
+        # processes fighting (the case the merge above exists for) but it is
+        # one process racing itself, and the cost is real: losing zip_dirs.json
+        # means re-downloading every archive's central directory after a
+        # restart.
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        handle, name = tempfile.mkstemp(
+            dir=self._path.parent, prefix=self._path.name + ".", suffix=".tmp"
+        )
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp.write_text(json.dumps(merged), encoding="utf-8")
-            os.replace(tmp, self._path)
+            with os.fdopen(handle, "w", encoding="utf-8") as fh:
+                json.dump(merged, fh)
+            os.replace(name, self._path)
         except OSError as exc:  # pragma: no cover - cache is best-effort
             log.warning("could not persist %s: %s", self._path.name, exc)
+            try:
+                os.unlink(name)
+            except OSError:
+                pass
 
 
 class TeleDriveClient:

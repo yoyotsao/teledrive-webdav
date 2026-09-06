@@ -145,8 +145,26 @@ class RemoteIdentityError(RuntimeError):
 
 
 def _assert_media_id(media, expected_file_id: str) -> None:
+    """Refuse media that is not the file the metadata named.
+
+    Only a Telegram document/photo id can be checked, and only some rows carry
+    one. /game split parts used to be registered as
+    ``f"{split_group_id}-{index}"`` whenever the upload did not hand back a
+    document id, so their file_id is a timestamp and a hex tag; comparing that
+    to what Telegram returns can only ever fail, and a failure here means the
+    archive does not open at all. Measured on the live drive after this check
+    was introduced: 127 of 143 rows under /game carried such an id and every
+    one of them stopped reading, taking PROPFIND / down with them.
+
+    A value that is not a document id carries no identity to verify, so those
+    reads fall back to trusting the message id -- which is exactly what every
+    read did before this check existed.
+    """
+    expected = str(expected_file_id or "")
+    if not expected.isdigit():
+        return
     actual = str(getattr(media, "id", ""))
-    if actual != str(expected_file_id):
+    if actual != expected:
         raise RemoteIdentityError(
             f"Telegram file mismatch: expected {expected_file_id}, got {actual}"
         )
