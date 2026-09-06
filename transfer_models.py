@@ -58,6 +58,11 @@ class TransferResult:
     request: TransferRequest
     fingerprint: str
     parts: tuple[UploadedPart, ...]
+    #: Stage timings, carried here so registration can finish the one
+    #: completion log line rather than emitting a second, partial one.
+    #: Excluded from comparison: two aliases of the same upload are the same
+    #: result even though each measured its own check-hash round trip.
+    metrics: Optional[object] = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True)

@@ -51,16 +51,21 @@ bridge 只用現有 public API，沒有為它新增任何會讀寫二進位資�
 | `bridge.py` | wsgidav provider、寫入保護、`/rpc/*`、cheroot 伺服器（綁 127.0.0.1） |
 | `tdapi.py` | TeleDrive REST client：JWT 取得（bot challenge，見「踩過的坑」）/快取/401 自動重登、路徑解析、listing 快取（記憶體 + `meta/dirs/`，`/folders` 與 `/files` 併發，見「效能」第 7 節）、split part 表快取、`JsonStore` |
 | `tgio.py` | split 位移數學、Telethon worker（背景 event loop）、連線池、`SeekableRemoteFile`、分段上傳、縮圖與 media attributes（讀 Telegram 的預覽，以及 `make_preview` 產自己上傳的那張） |
-| `tgupload.py` | `/game` 大檔案的並行分 part 上傳：自算 part index、`UploadGate`（window+rate 的 AIMD 節流）、繞過 `client._call` 直送 `SaveBigFilePart` |
+| `tgupload.py` | 上傳的線路協定：`decide_protocol`（10 MiB / 500 MiB 兩個界線）、`SaveFilePart`（128 KiB × 4 workers）與 `SaveBigFilePart`（512 KiB）兩套 part 原語、繞過 `client._call` 直送 |
+| `upload_engine.py` | **所有**上傳的唯一入口：指紋 → check-hash → 協定選擇 → album/一般 → 帳號租借 → 訊息 → 註冊；`transfer_batch` 的串流階段、`FingerprintClaims`、精確去重覆蓋、`TransferMetrics` 完成日誌、`redact` |
+| `telegram_accounts.py` | 帳號檔載入與驗證、每個帳號一個 `TelegramWorker` 與各自的 file/chunk/message 額度、`for_read(id)` 精確路由、`acquire_upload()` round-robin 租借 |
+| `upload_limiter.py` | 移植網頁端 `adaptiveRateLimiter.ts` 的狀態機（ceiling / slow zone / probe / escalation）+ 訊息 token bucket；每個帳號一份 `meta/upload-rate-<id>.json`，原子寫入 |
+| `media_thumbnail.py` | 靜態圖（Pillow）與影片（ffmpeg）的預覽擷取，結果分成 `ready` / `not_media` / `undecodable` |
+| `transfer_models.py` | 不可變值物件：`AccountSpec` / `RemotePart` / `UploadedPart` / `TransferRequest` / `TransferResult` / `PreparedAlbumItem` / `QueueStage` |
 | `zipfs.py` | 讀 zip central directory → 虛擬目錄樹；單一 entry 的 range 讀取 |
-| `gamestage.py` | `/game` staging + debounce 打包（`ZIP_STORED`）+ 上傳 + 去重 + 清理；`upload_and_register` 給 `uploadstage.py` 共用 |
-| `uploadstage.py` | `/game` 以外任意路徑的一般檔案寫入：落地 + debounce（無打包，單位是單一檔案）+ 上傳 + 去重 + 註冊到寫入時解析到的真實 parent |
+| `gamestage.py` | `/game` staging + debounce 打包（`ZIP_STORED`）+ 清理；打包完就交給 `upload_engine`。另外持有 `sample_hash` 與 `_preview_file`（engine 會回頭呼叫） |
+| `uploadstage.py` | `/game` 以外任意路徑的一般檔案寫入：落地 + debounce + **整批**交給 engine + 註冊 + 只在註冊落地後才刪暫存；佇列狀態持久化在 `meta/upload-queue.json` |
 | `fetchlocal.py` | 「儲存在本地」：伺服端複製邏輯 + 右鍵 verb 用的進度顯示 CLI |
 | `warmup.py` | 走遍整棵樹批次填滿縮圖與屬性快取、跑 Windows 縮圖快取，可續跑；`BackgroundWarmup` 讓 bridge 自己跑 |
 | `install_menu.py` | 註冊/移除 Explorer 右鍵 verb |
 | `install_thumb.py` | 註冊/移除 shell handler，逐副檔名記錄被取代的既有 CLSID |
 | `shellthumb/` | C++ shell 擴充：`IThumbnailProvider` + `IPropertyStore`，同一份 DLL 兩個 CLSID；`warmshell.exe` 把縮圖灌進 Windows thumbcache，`bench.exe` / `isolate.exe` 量測 |
-| `config.py` | 讀 `config.ini`，空值回退環境變數，再回退 `env_file`；由單一 `cache_dir` 推導所有路徑 |
+| `config.py` | 讀 `config.ini`，空值回退環境變數，再回退 `env_file`；由單一 `cache_dir` 推導所有路徑；並發參數做範圍檢查（0 或負數直接 `ConfigError`，不是靜靜跑一個壞值） |
 | `start.bat` | 啟動 bridge + `rclone mount` |
 | `restart.bat` | 只重啟 bridge（rclone 與 `H:` 不動），改完 Python 後的收尾 |
 
@@ -79,8 +84,8 @@ bridge 只用現有 public API，沒有為它新增任何會讀寫二進位資�
 - **`MKCOL`** 直接打 `POST /folders`（`RootCollection.create_collection`），
   沒有落地、沒有 debounce，是即時的真實寫入。
 - **`PUT`** 落地到 `uploads/`，debounce 之後走跟 `/game` 一模一樣的
-  上傳＋去重＋註冊（`gamestage.upload_and_register`，`uploadstage.py` 只補
-  「落地/debounce」那一半），差別只在兩點：單位永遠是單一檔案（資料夾是真的，
+  上傳＋去重＋註冊（`upload_engine.UploadEngine`，`uploadstage.py` 只補
+  「落地/debounce/整批派工」那一半），差別只在兩點：單位永遠是單一檔案（資料夾是真的，
   從不落地打包），以及 parent 是寫入當下解析到的真實資料夾，不是固定的 `/game`。
   覆寫既有檔案也走這條路（`RemoteFileResource.begin_write`）——backend 沒有
   `UNIQUE(filename, parent_id)`，所以覆寫就是用新內容再註冊一筆同名 row，
@@ -100,10 +105,23 @@ bridge 只用現有 public API，沒有為它新增任何會讀寫二進位資�
   沒有共通的落地邏輯可以套。`MOVE` 維持原樣只在 `/game` 放行：一般路徑的暫存
   沒有搬移原語（`UploadStager` 沒有 `move()`）。
 
-沒有做的是 album 分組——那是網頁上傳流程專屬的功能，這裡沒有重做；
-去重（`check_hash`，跟網頁同一套指紋）則是共用的，照樣套用。
-`/rpc/status` 的 `uploads` 欄位回報目前 debounce 中的一般寫入，跟 `/game`
-的 `units` 分開列。
+album 分組現在**有**做（`upload_engine.AlbumQueue`），跟網頁同一套規則：
+`image/*` 或 `video/*`、≤ 10 MiB、排除 `image/webp`，每 10 個一批送
+`SendMultiMedia`，尾巴在批次結束時 flush。去重（`check_hash`，跟網頁同一套指紋）
+一樣共用。`/rpc/status` 的 `uploads` 欄位回報目前 debounce 中的一般寫入，
+跟 `/game` 的 `units` 分開列。
+
+**暫存檔是唯一的副本，所以它只在「訊息送出 + 每一筆註冊都成功」之後才刪。**
+中間任何一步掛掉，檔案都還在 `uploads/` 底下，下次啟動由 `_adopt_leftovers`
+重新收養。旁邊的 `meta/upload-queue.json` 只記「這個來源已經失敗幾次、上一次的
+錯誤是什麼」（錯誤先過 `upload_engine.redact` 才落地）——**佇列本身是磁碟上那些
+檔案，不是那份 JSON**。第 5 次失敗標成 `abandoned` 並保留檔案，不再自動重試。
+
+> **`_adopt_leftovers` 在 Windows 上曾經完全沒作用。** `os.walk(ext_path(...))`
+> 產出的 root 帶 `\?\` 前綴，而 `Path(root)/fn` 對純路徑的 `upload_dir` 做
+> `relative_to` 永遠 `ValueError` → `continue`，於是**每一個 crash 掉的上傳都被
+> 靜靜地從佇列裡丟掉，位元組卻永遠留在磁碟上**。現在路徑段是從 walk 自己的
+> 相對 root 編出來的。
 
 **縮圖是有的，而且它不是「網頁那邊的加工」，是這個專案自己的效能前提。**
 而它壞掉的方式跟看起來的完全不一樣，所以先講量到的事實：
@@ -146,6 +164,74 @@ DB 確認 0/84），而且自己送的預覽尺寸是確定的 320px。實作上
 不像 JPEG 的東西），所以走 `tempfile` 而不是 `uploads/`／`staging/` ——
 那兩個目錄都會被掃成待辦工作。只對「單一 segment 且 mime 是 `image/`」做，
 產不出來一律回 None：**產不出預覽永遠不能讓上傳失敗**。
+
+## 多帳號與上傳引擎
+
+**這一層存在的理由是網頁端已經是多帳號的，而 bridge 以前不是。** 網頁把一般檔案
+與大檔的每個 segment 分派到不同的 linked account；bridge 只有一條 session，而且
+`Entry`／part 表根本沒存 `telegram_user_id`——所以**凡是存在另一個帳號底下的
+file/part，bridge 一律讀不到**，跨帳號的 split file 只是最明顯的那個症狀。
+
+### 帳號
+
+`config.ini` 的 `accounts_file` 指向一份 JSON（格式見 `accounts.example.json`，
+真檔要放在 repo 外，`.gitignore` 也擋著 `accounts.json`）。留空就是舊行為：
+`session` 那一條就是 primary，也是唯一的上傳目標。
+
+- **順序有意義。** 第一個是 primary：只有它對 backend 做 bot challenge 認證，
+  也只有它負責回答 `telegram_user_id = 0` 的舊 row（多帳號之前註冊的全部是 0）。
+- **`telegram_user_id` 對不上 session 真正的帳號就停用那一個帳號並說明原因**，
+  其他帳號照常起來。錯誤訊息會把 session string 換成 `[redacted]`。
+- **`for_read(id)` 不做 fallback。** 0 走 primary，其他值必須是「有設定且連上」
+  的那一個帳號，找不到就 `AccountUnavailableError`。悄悄改用 primary 讀會拿到
+  別的檔案或空手而回，那比一個明確的錯誤糟得多。
+- **新上傳只會發到「有設定 + 連上 + backend 說已 linked」的帳號**
+  （`eligible_upload_ids`）。沒 link 的帳號仍可讀它歷史上存的東西。
+
+每個帳號各自持有：3 個 file slot（同時處理幾個檔）、12 個 chunk slot、
+一份 `AdaptiveUploadLimiter`、一個訊息 token bucket（3/s，burst 6）。
+**互不影響是重點**——一個帳號撞 FLOOD_WAIT 不該把另一個帳號也節流掉。
+
+### 引擎
+
+`UploadEngine.transfer_batch()` 是唯一的上傳路徑，`/game` 與一般路徑都走它：
+
+```
+指紋(2 併發) ─┐
+              ├─▶ check-hash(8 併發) ─▶ 上傳(序列) ─▶ 訊息 ─▶ 註冊(8 併發，呼叫端的 pool)
+下一個檔 ─────┘
+```
+
+- **指紋與 check-hash 跑在上傳前面**，各有自己的上限。一個 100 MiB 的 sample hash
+  跟一個 0.5 秒的 backend 往返放同一個 pool，慢的那個會決定另一個的上限。
+- **上傳那一段是刻意序列的**（在驅動執行緒上）。album 是按到達順序湊滿 10 個就送，
+  而「湊滿就送、不等整批走完」正是它跟一次性 flush 的差別；把上傳並行化會讓
+  批次邊界變成看誰先做完。真正的並行在更下面兩層：一個 split 的各 segment 分別
+  租不同帳號，每個帳號自己有 3 個 file slot。
+- **結果一產生就交給 `on_result`，不等整批結束。** 所以第一個檔在註冊的同時，
+  第二個檔已經在送位元組、第三個已經在算指紋。`on_result` 因此**不可以阻塞**——
+  stager 的做法是丟進 register pool 就回來。
+- **`FingerprintClaims`：同一批裡位元組相同的兩個檔只上傳一次，但各自註冊。**
+  失敗的 claim 會被移除，之後的重試拿得到新的 claim。
+- **覆蓋率是精確比對，不是「有就好」。** `assert_parts_cover_file` 要求 part index
+  從 0 連續、沒有負數大小、而且**加總完全等於**檔案長度。去重也套同一條：
+  歷史上那些只註冊了 part 0 的殘缺 split group（見「已知限制」第 6 點）因此
+  不會被當成可重用的重複內容。
+
+### 完成日誌
+
+一個邏輯檔案跑完會在 `bridge.log` 留一行：
+
+```
+transfer complete protocol=split bytes=629145601 parts=2 hash_ms=812 check_ms=530
+  thumb_ms=0 slot_ms=3 upload_ms=118442 message_ms=402 register_ms=1104
+  total_ms=61230 accounts=(1, 2) rate=4.00 ceiling=None
+```
+
+**各階段是「花掉的工作量」而不是 `total_ms` 的切片**：split 的 segment 是並行的，
+所以 `upload_ms` 可以比 wall clock 還大。那個讀法才有用——它說的是這個檔吃掉了
+帳號多少額度。這一行印在**註冊之後**，因為一個檔要位元組在 Telegram 上、
+row 在 drive 裡，才算完成；中途失敗印的是 `transfer failed`，錯誤先過 `redact`。
 
 ## 效能：這整個專案真正的難題
 
@@ -665,7 +751,7 @@ GET /files    0.52s ┘
 | 端點 | 用途 |
 |---|---|
 | `GET /rpc/health` | 連線狀態、telegram user id |
-| `GET /rpc/status` | `/game` staging 各單位的狀態與閒置秒數 |
+| `GET /rpc/status` | `/game` 的 `units`、一般路徑的 `uploads`（stage / attempts / 已用帳號 / 已 redact 的錯誤）、每個帳號的 `accounts`（online / linked / limiter 的 rate / ceiling / window / floods）與 `eligible_upload_ids`。**這裡不會出現任何憑證**，貼進 issue 是安全的 |
 | `POST /rpc/forget` | 清 metadata 快取（rclone 那層另外用 `rclone rc vfs/forget`） |
 | `POST /rpc/fetch-local` | `path=<Windows 路徑>`，串流回進度 |
 | `GET /rpc/thumb` | `path=<Windows 路徑>` → Telegram 預覽圖（JPEG）；沒有就 404 讓 DLL 走 fallback |
@@ -690,7 +776,20 @@ GET /files    0.52s ┘
 | `tests/test_auth_challenge.py` | bot challenge 登入：nonce 原文 DM 給 challenge 指名的 bot、202 continue 輪詢、session string 一個位元組都不上線、token.txt 重用、沒接 Telegram client 時明確報錯、並行 401 重登只送一個 nonce |
 | `tests/test_thumbnails.py` | 預覽走 DC-aware 的 `iter_download`（跨 DC 不再 FILE_MIGRATE）、整批預覽受 `THUMB_CONCURRENCY` 節流、短 FLOOD_WAIT 重試 |
 | `tests/test_read_pace.py` | 一次串流讀取在每條連線上排 `READS_IN_FLIGHT` 個請求且全部同時在飛、窄讀取仍只付一個請求、檔案 DC 的 exported sender 每個連線只借一次且刻意不還（session 自己的 DC 不釘）、讀取成功與失敗都會關掉下載迭代器 |
-| `tests/test_upload_preview.py` | 上傳的縮圖：JPEG／帶 alpha 的 PNG／EXIF 旋轉都給得出「≤ 320px、≤ 20 KB 的 JPEG + 原圖寬高」、zip 與截斷的檔回 None（不讓上傳失敗）、只有單一 segment 的圖帶預覽（split 的每個 part 都不帶）、暫存的 `.jpg` 用完就刪；以及 `register()` 照實回報 `has_thumbnail`（圖 True、zip False、去重沿用原 row），沒有它前面那半等於沒做 |
+| `tests/test_upload_preview.py` | 上傳的縮圖：JPEG／帶 alpha 的 PNG／EXIF 旋轉都給得出「≤ 320px、≤ 20 KB 的 JPEG + 原圖寬高」、zip 與截斷的檔回 None（不讓上傳失敗）、只有 segment 0 帶預覽、暫存的 `.jpg` 用完就刪；以及 `register()` 照實回報 `has_thumbnail`（圖 True、zip False、去重沿用原 row），沒有它前面那半等於沒做 |
+| `tests/test_transfer_config.py` | parity 參數的預設值與範圍檢查（0 或負數是 `ConfigError`）、路徑相對 `config.ini` 解析、`transfer_models` 的值物件 |
+| `tests/test_routed_metadata.py` | `Entry` / part 表保存 `telegram_user_id` 與 `file_id`、`linked_account_ids()`、註冊帶上儲存帳號、thread-local HTTP session |
+| `tests/test_account_pool.py` | 帳號檔驗證（重複 id、空 label/session）、user id 對不上就只停用那一個、`for_read(0)` 走 primary 而非零值 fallback、未 linked 的帳號不接新上傳、round-robin 跳過忙碌帳號、例外訊息不含 session |
+| `tests/test_account_routing.py` | 讀取前先驗 `file_id`（不對就不發 GetFile）、兩個帳號上相同 message id 不會互串、跨帳號 split 的 Range 拼接正確、快取 key 帶帳號 |
+| `tests/test_upload_limiter.py` | 移植自 `adaptiveRateLimiter.ts` 的狀態轉移向量：首次 flood、學到的 ceiling、slow zone、probe 確認/失敗冷卻、三次 flood 升級、十分鐘重置、premium 等待不降速、壞掉的狀態檔回退、每帳號各自一份 |
+| `tests/test_upload_protocol.py` | `decide_protocol` 的三個界線（10 MiB / 500 MiB / 500 MiB + 1）、small 走 128 KiB × 4 workers 且 md5 正確、split 的尾巴仍用 `SaveBigFilePart` |
+| `tests/test_media_thumbnail.py` | `ready` / `not_media` / `undecodable` 的分類、ffmpeg 的探索與逾時、webp 是 media 但不進 album |
+| `tests/test_upload_dedup.py` | 精確覆蓋：殘缺的 split group 不可重用、別名與重複 message id 收斂、完整重複保留各 part 的儲存帳號、同批的兩個別名只上傳一次 |
+| `tests/test_upload_engine.py` | 引擎的整合：small 四 worker、單一 big segment、split 的 segment 分租不同帳號且結果按 plan index 還原、只有 index 0 帶縮圖、file lease 在訊息與註冊前就放掉、註冊上限 8、Telegram 回報長度不符就不註冊 |
+| `tests/test_upload_album.py` | album：適用規則、湊滿 10 就送而不等整批、按 document id 對回亂序的 updates、逾時/失敗的逐檔 fallback（單 worker、不帶縮圖）、不同帳號不共用一個 `SendMultiMedia` |
+| `tests/test_upload_scheduler.py` | 串流階段（指紋 ≤ 2、check ≤ 8、第三個檔在算指紋時第二個已在上傳、第一個還在註冊）、durable 佇列（失敗只留下受影響的來源、第 5 次 abandoned 且保留、重啟收養每一個暫存檔並沿用 attempts、原子寫入、狀態不含憑證） |
+| `tests/test_transfer_status.py` | 一份 pool 一份 engine 貫穿全程：`/game` 打包後送出的是 `.zip` + `application/zip` + 不進 album、直接丟進 `/game` 的檔案保留自己的型別、`/rpc/status` 列出帳號與 limiter 且不含憑證、只有 primary 回答 bot challenge、停止時每個帳號都停、sweep 的縮圖與屬性按帳號路由 |
+| `tests/test_transfer_logging.py` | 完成日誌帶齊每一個計時欄位且數字讀得出來、去重的那筆報 0 上傳時間、失敗只記一行且 session/JWT 被 redact、兩份 example 設定檔不含任何憑證值 |
 | `tests/test_log_noise.py` | 日誌可讀性：單一 call site 的洪水收成一行並報出壓了幾筆、同一個 logger 的其他診斷不被延遲（這就是不用 `setLevel(WARNING)` 的理由）、direct 的洪水擋不住第一行 indirect |
 | `tests/test_shell_warm.py` | shell warm 的記帳：逐檔 stderr 回報的解析（含非 ASCII 路徑）、被 kill 的批次仍報得出暖成幾個與還卡在哪一個、卡住就停掉這一輪而不是把後面幾十批排在後面、期限按檔數算、沒掛載就不去問 shell |
 | `tests/test_upload_pace.py` | `tgupload.UploadGate`：distinct-event guard、window/rate 的 AIMD、rate cap 從量測值算出且爬回不再綁得住時拆掉、注入假時鐘 |
@@ -708,8 +807,16 @@ GET /files    0.52s ┘
 6. 瀏覽器開網頁確認 `/game` 上傳的 zip 顯示、下載正常
 7. `/game` 以外的資料夾建立子資料夾、丟一個檔案進去，debounce 到期後網頁能看到、下載內容正確；
    同名再丟一次，確認覆寫後讀到的是新內容
+8. **多帳號**：設好 `accounts_file` 之後，確認 `/rpc/status` 的 `accounts` 每一個都
+   `online` + `linked`；丟一個 > 500 MiB 的檔案，看網頁上兩個 part 的
+   `telegram_user_id` 真的不同，再從 `H:` 讀回來比對 SHA256（這是「跨帳號 split 讀得回來」
+   唯一的實證）。另外挑一個存在**次要**帳號的既有檔案，確認縮圖與內容都出得來。
+9. **album**：一次丟 11 張 ≤ 10 MiB 的 JPEG 到 `/game` 以外的資料夾，網頁上 11 張都在、
+   都有縮圖；`bridge.log` 應該看得到兩批（10 + 1）。再丟一張 `.webp`，確認它走的是
+   一般上傳而不是 album（網頁端記著 webp 走 album 會 `MEDIA_EMPTY` 且掉縮圖）。
 
-**`/game` 與一般路徑的上傳都從未對真實 TeleDrive 跑過** —— 兩者都有副作用，測試環境只用假 backend。
+**`/game`、一般路徑的上傳、多帳號路由與 album 都從未對真實 TeleDrive 跑過** ——
+全都有副作用，測試環境只用假 backend 與假 MTProto。
 
 ## 已知限制
 
@@ -721,7 +828,8 @@ GET /files    0.52s ┘
 5. **同名檔案**：TeleDrive 沒有 `UNIQUE(filename, parent_id)` → 取 `created_at` 最新者並記 warning。
 6. **上傳中斷的檔案**：`split_group_id` 有值但只註冊了 part 0，那是真的少資料，只能刪掉重傳。
    `truncated.csv` 記著目前已知的 38 個。
-7. **一機一份 bridge**：只有跑 bridge 的那台 PC 能掛磁碟。
+7. **一機一份 bridge**：只有跑 bridge 的那台 PC 能掛磁碟。所有設定的帳號都由這一份
+   bridge 連線，session string 全部留在這台機器上。
 8. **進入未快取資料夾的第一個請求約 0.58 秒**（路徑解析：每一層一個 backend 往返，見「效能」第 7 節），之後每張 15ms。重啟後若那個資料夾之前列過，是 0.016 秒。
 9. Windows 11 右鍵選單只能出現在「顯示更多選項」（第一層要 MSIX + `IExplorerCommand`）。
 10. **COPY/MOVE 到已打包的 `/game/<name>` 底下不會失敗，會悄悄開一個新的 shadow staging unit**：
@@ -729,12 +837,14 @@ GET /files    0.52s ┘
     `GameStager.copy()`/`.move()` 只驗證目的地留在 `/game` 底下，不檢查該名字是不是已經打包
     上傳過——結果是新建一筆同名 staging unit，下一輪 debounce 打包後蓋掉真正的舊封存
     （見「同名檔案」那條限制）。解法跟 PUT 一樣：改用新名字，或先從網頁刪掉舊的 zip。
+11. **`/game` 一個 unit 失敗就整包重來**：以前 gamestage 自己會逐 segment 重試，現在
+    重試下放到 `tgupload.send_part`（每個 512 KiB part 三次）。part 層面的暫時性失敗
+    因此便宜得多，但一個 segment 真的失敗仍然是整個 unit 十分鐘後從頭再跑一次。
+12. **`/game` 與一般路徑的上傳仍未對真實 TeleDrive 跑過**（測試用的 backend 與 MTProto
+    都是假的），多帳號路由與 album 也一樣——見「測試」節尾的手動清單第 8、9 項。
 
 ## 明確不做
 
-- **album 分組**：PUT/覆寫本身已支援（見「一般路徑的寫入」一節），但分組是網頁上傳
-  流程專屬的加工，這裡沒有重做。去重與縮圖都是共用的，不算例外
-  （縮圖見「一般路徑的寫入」那一節，那是效能前提不是加工）。
 - **版本回收**：backend 沒有這個概念，覆寫就是新增一筆同名 row，舊的還在只是被蓋掉
   （已知限制第 5 點），不是真的版本歷史。
 - **`MOVE`/`PROPPATCH`/`LOCK` 限定在 `/game/<name>/...`**：

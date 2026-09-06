@@ -12,10 +12,11 @@
 - `teledrive-webdav` 是 Windows/WebDAV 介面。Windows 程式先經 `H:`、rclone、WsgiDAV 到本機 Python bridge，再由 Telethon 直連 Telegram；TeleDrive backend 同樣只收到 metadata，但檔案 bytes 會通過本機 Python bridge，且上傳一定先落到本機 staging 目錄。
 - 兩邊的 fresh upload 都先以 **10 MiB** 區分 small-file protocol，再以每個 Telegram message 的精確容量 **500 MiB** 區分 single-message 與 multi-message split；因此不能把所有檔案概括成同一種上傳法。完整決策表見 4.1。
 - 兩者刻意共用相同的去重 fingerprint、large/split upload 的 512 KiB part、每個 Telegram message 最多 1000 parts，以及 `split_group_id`／`part_index` 等 backend schema，因此單一帳號下的普通檔案大致互通。
-- 最大的行為差異在於：Web 版偏向「即時、平行、多帳號、瀏覽器內處理」；WebDAV 版偏向「先持久化到本機、靜置後上傳、單帳號、可被任意 Windows 程式 Range-read」。
+- 最大的行為差異在於：Web 版偏向「即時、瀏覽器內處理」；WebDAV 版偏向「先持久化到本機、靜置後上傳、可被任意 Windows 程式 Range-read」。多帳號、平行、album 這三項原本也在差異清單裡，現在不是了（見下面兩條）。
 - `/game` 是 WebDAV 專屬的特殊流程：一個第一層目錄會先打包成 `ZIP_STORED`，在 Telegram／backend 中是一個 `.zip`，掛載後再被虛擬展開成資料夾。Web 版上傳資料夾則建立真正的 backend folder tree，並逐檔上傳。
-- 目前存在一個重要互通缺口：Web 版會把一般檔案及大檔 segments 分派到不同 Telegram linked accounts；WebDAV 下載端只使用單一 Telegram session，而且 `Entry`／part table 沒保存 `telegram_user_id`，所以凡是存到另一帳號的 file/part 都無法可靠讀取。跨帳號 split file 只是最明顯的案例。
-- 去重完整性也有差異：Web 版只有在既有 parts 的合計大小「精確等於」本機檔案大小時才重用；WebDAV 版目前只挑 canonical parts，沒有同等的 size coverage 檢查，可能重用歷史上不完整的 split group。
+- ~~目前存在一個重要互通缺口：Web 版會把一般檔案及大檔 segments 分派到不同 Telegram linked accounts；WebDAV 下載端只使用單一 Telegram session⋯~~ **已修**（2026-09-06）：`Entry` 與 part table 保存 `telegram_user_id` 與 `file_id`，`telegram_accounts.TelegramAccountPool` 為每個設定的帳號各持一條 session，讀取一律以 `(telegram_user_id, message_id, file_id)` 精確路由，`file_id` 對不上就在發 `GetFile` 之前擋下來。`telegram_user_id = 0` 的舊 row 走 primary。上傳側同樣分派：一個 split 的每個 segment 各自租一個帳號。
+- ~~去重完整性也有差異⋯~~ **已修**（2026-09-06）：`upload_engine.assert_parts_cover_file` 要求 part index 從 0 連續、沒有負數大小、加總**精確等於**檔案長度，去重挑候選時套同一條，所以歷史上只註冊了 part 0 的殘缺 split group 不會被重用。
+- album 分組（`image/*`／`video/*`、≤ 10 MiB、排除 `image/webp`、每 10 個一批）與網頁端的自適應 chunk limiter 也都已移植，狀態逐帳號存在 `meta/upload-rate-<telegram_user_id>.json`。
 
 ## 2. 整體架構位置
 
