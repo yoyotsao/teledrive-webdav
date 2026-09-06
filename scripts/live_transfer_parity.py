@@ -85,6 +85,15 @@ CASES = (
 
 CHUNK = 1 << 20
 
+#: Above this, read back three windows instead of the whole file. Pulling a
+#: gigabyte back down while rclone still holds its own copy and the bridge
+#: holds block caches is what put the machine under memory pressure; it is
+#: also the least informative way to spend that gigabyte. What can actually be
+#: wrong in a split is the seam, so the windows are the head, the bytes
+#: straddling the segment boundary, and the tail.
+RANGE_CHECK_ABOVE = 64 * 1024 * 1024
+WINDOW = 1 << 20
+
 
 def payload_chunks(size: int, seed: int):
     """Deterministic bytes in 1 MiB pieces, so a rerun hashes the same.
@@ -184,9 +193,33 @@ def plan(cases, mount: Path, folder: str) -> list[Planned]:
     return planned
 
 
+def slice_of(item: "Planned", offset: int, length: int) -> bytes:
+    """The expected bytes at ``[offset, offset + length)``, regenerated."""
+    out = bytearray()
+    position = 0
+    for chunk in item.chunks():
+        start = max(offset - position, 0)
+        if start < len(chunk):
+            out += chunk[start : start + (length - len(out))]
+        position += len(chunk)
+        if len(out) >= length or position >= offset + length:
+            break
+    return bytes(out[:length])
+
+
+def windows_for(item: "Planned", boundary: int) -> list[tuple[int, int]]:
+    seam = max(0, min(boundary, item.size - 1) - WINDOW // 2)
+    spans = [(0, min(WINDOW, item.size)),
+             (seam, min(WINDOW, item.size - seam)),
+             (max(0, item.size - WINDOW), min(WINDOW, item.size))]
+    return sorted({span for span in spans if span[1] > 0})
+
+
 def fingerprint_all(planned: list[Planned]) -> None:
     """Fill in each file's SHA-256 without holding more than one chunk."""
     for item in planned:
+        if item.size > RANGE_CHECK_ABOVE:
+            continue
         digest = hashlib.sha256()
         produced = 0
         for chunk in item.chunks():
@@ -337,22 +370,39 @@ def verify(item: Planned, entry, api: TeleDriveClient, rpc: str, folder: str) ->
                 )
 
     # The real proof: read it back through the bridge, not off the mount, and
-    # hash what comes out.
+    # compare with what was written.
     url = f"{rpc}/{folder}/{item.name}"
     try:
-        digest = hashlib.sha256()
-        read = 0
-        with requests.get(url, stream=True, timeout=1800) as response:
-            response.raise_for_status()
-            for chunk in response.iter_content(1 << 20):
-                digest.update(chunk)
-                read += len(chunk)
-        item.observed["read_bytes"] = read
-        item.observed["read_sha256"] = digest.hexdigest()
-        if read != item.size:
-            item.findings.append(f"read back {read} bytes, wrote {item.size}")
-        elif digest.hexdigest() != item.sha256:
-            item.findings.append("read back the right length but different bytes")
+        if item.size > RANGE_CHECK_ABOVE:
+            boundary = parts[0].size if len(parts) > 1 else item.size
+            checked = []
+            for offset, length in windows_for(item, boundary):
+                response = requests.get(
+                    url, headers={"Range": f"bytes={offset}-{offset + length - 1}"},
+                    timeout=1800,
+                )
+                response.raise_for_status()
+                got = response.content
+                checked.append([offset, len(got)])
+                if got != slice_of(item, offset, length):
+                    item.findings.append(
+                        f"bytes at offset {offset} differ over {length} bytes"
+                    )
+            item.observed["read_windows"] = checked
+        else:
+            digest = hashlib.sha256()
+            read = 0
+            with requests.get(url, stream=True, timeout=1800) as response:
+                response.raise_for_status()
+                for chunk in response.iter_content(1 << 20):
+                    digest.update(chunk)
+                    read += len(chunk)
+            item.observed["read_bytes"] = read
+            item.observed["read_sha256"] = digest.hexdigest()
+            if read != item.size:
+                item.findings.append(f"read back {read} bytes, wrote {item.size}")
+            elif digest.hexdigest() != item.sha256:
+                item.findings.append("read back the right length but different bytes")
     except Exception as exc:
         item.findings.append(f"read back failed: {type(exc).__name__}: {exc}")
 
