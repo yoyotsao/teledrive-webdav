@@ -65,18 +65,20 @@ class LocalFetcher:
         items: List[Item] = []
 
         if loc.kind == bridge.ZIPFILE:
-            dest = root / loc.node.name
-            items.append(Item(lambda n=loc.node, v=loc.view: v.open(n), loc.node.size, dest))
+            node = loc.zip_node()
+            dest = root / node.name
+            items.append(Item(lambda n=node, v=loc.view: v.open(n), node.size, dest))
             return items, dest
 
         if loc.kind == bridge.ZIPDIR:
             # The zip's own root maps to the game name; a subfolder keeps its name.
-            base_name = loc.node.name or loc.view.name or (segments[-1] if segments else "download")
+            node = loc.zip_node()
+            base_name = (node.name if node is not None else "") or loc.view.name or (segments[-1] if segments else "download")
             base = root / base_name
-            for rel, node in loc.view.walk(loc.node):
-                if node.is_dir:
+            for rel, member in loc.view.walk(node):
+                if member.is_dir:
                     continue
-                items.append(Item(lambda n=node, v=loc.view: v.open(n), node.size, base / rel))
+                items.append(Item(lambda n=member, v=loc.view: v.open(n), member.size, base / rel))
             return items, base
 
         if loc.kind == bridge.FILE:

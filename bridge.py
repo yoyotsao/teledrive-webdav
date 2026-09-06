@@ -180,6 +180,18 @@ class Loc:
     segments: Optional[List[str]] = None  # full path, for UPLOAD_FILE
     parent_id: Optional[str] = None  # resolved destination folder, for UPLOAD_FILE
 
+    def zip_node(self) -> Optional["zipfs.ZipNode"]:
+        """The archive tree, parsed now if resolution deliberately skipped it.
+
+        ``node`` is None for an archive root: naming a ``.zip`` is enough to
+        answer "is this a directory", so listing /game does not read 143
+        central directories out of Telegram. Anything that needs the tree
+        itself asks through here and pays for one.
+        """
+        if self.node is None and self.view is not None:
+            self.node = self.view.lookup([])
+        return self.node
+
 
 class Resolver:
     """Path resolution shared by the DAV provider and the fetch-local RPC.
@@ -629,6 +641,15 @@ class Resolver:
         zip_entry = children.get(top + ".zip")
         if zip_entry is not None and not zip_entry.is_dir:
             view = self.zip_view(zip_entry)
+            if len(rest) == 1:
+                # The archive root, and its .zip name already says it is a
+                # directory. Parsing the central directory here would answer a
+                # question nobody asked: PROPFIND Depth:1 on /game resolves
+                # every child, so a folder of 143 archives meant 143 Telegram
+                # round trips at ~6s each -- fifteen minutes for one listing,
+                # which is long enough that rclone gives up and the mount
+                # wedges. The tree is read when somebody looks inside.
+                return Loc(ZIPDIR, entry=zip_entry, view=view, node=None, top=top)
             try:
                 node = view.lookup(rest[1:])
             except Exception as exc:
@@ -892,13 +913,28 @@ class FolderCollection(RootCollection):
 
 
 class ZipDirCollection(_ReadOnlyCollection):
-    def __init__(self, path, environ, node: zipfs.ZipNode):
+    """A directory inside an archive, or the archive itself presented as one.
+
+    ``node`` is None for the archive root: the name ended in ``.zip``, which is
+    all the caller needed to know, and reading the central directory is
+    deferred until somebody actually lists it.
+    """
+
+    def __init__(self, path, environ, node, view=None, mtime=None):
         super().__init__(path, environ)
-        self.node = node
-        self._mtime = node.mtime or time.time()
+        self._node = node
+        self._view = view
+        self._mtime = (node.mtime if node is not None else None) or mtime or time.time()
+
+    @property
+    def node(self):
+        if self._node is None:
+            self._node = self._view.lookup([])
+        return self._node
 
     def get_member_names(self):
-        return list(self.node.children.keys())
+        node = self.node
+        return list(node.children.keys()) if node is not None else []
 
     # Writing into an already-packed archive would produce a repack containing
     # only the newly written files, silently dropping everything else. Refuse
@@ -1178,7 +1214,10 @@ class TeleDriveProvider(DAVProvider):
                 log.warning("cannot size %s: %s", path, exc)
                 return None
         if loc.kind == ZIPDIR:
-            return ZipDirCollection(path, environ, loc.node)
+            return ZipDirCollection(
+                path, environ, loc.node, view=loc.view,
+                mtime=loc.entry.mtime if loc.entry is not None else None,
+            )
         if loc.kind == ZIPFILE:
             return ZipFileResource(path, environ, res, loc.view, loc.node, loc.entry)
         if loc.kind == STAGE_DIR:

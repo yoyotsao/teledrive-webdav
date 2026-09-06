@@ -847,6 +847,26 @@ def test_game_listing_hides_the_zip_and_shows_a_folder(rig):
     assert rig.names("/game") == ["MyGame"]
 
 
+def test_listing_game_does_not_open_any_archive(rig):
+    """Naming a .zip is enough to call it a directory.
+
+    PROPFIND Depth:1 on /game resolves every child, so parsing each archive's
+    central directory to answer "is this a directory" costs one Telegram round
+    trip per archive. Measured on the live drive at ~6s each across 143
+    archives: fifteen minutes for one listing, long enough that rclone gave up
+    and the mount wedged. The tree is read when somebody looks inside.
+    """
+    rig.worker.reads.clear()
+
+    assert rig.names("/game") == ["MyGame"]
+
+    assert rig.worker.reads == [], "listing /game read archive bytes"
+
+    # Looking inside pays for it, once.
+    assert "bin" in rig.names("/game/MyGame")
+    assert rig.worker.reads, "opening an archive should read its directory"
+
+
 def test_zip_root_is_a_collection(rig):
     assert rig.has_tag("/game/MyGame", "collection")
     assert rig.names("/game/MyGame") == ["big", "bin", "說明.txt"]
