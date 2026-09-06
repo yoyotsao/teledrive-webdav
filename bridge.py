@@ -1533,6 +1533,7 @@ def main(argv=None) -> int:
     # Imported here so `python bridge.py --help` works without Telethon present.
     from fetchlocal import LocalFetcher
     from gamestage import GameStager
+    from upload_engine import UploadEngine
     from uploadstage import UploadStager
     from warmup import BackgroundWarmup
 
@@ -1541,10 +1542,22 @@ def main(argv=None) -> int:
     pool.start(api)
     worker = pool.primary.worker
 
+    # One engine for the whole process: fingerprint claims only collapse
+    # duplicates that share it, and the per-account limiters it reaches through
+    # the pool are what keeps two stagers from doubling up on one account.
+    engine = UploadEngine(
+        api, pool, ffmpeg=cfg.ffmpeg,
+        register_concurrency=cfg.register_concurrency,
+        hash_concurrency=cfg.hash_concurrency,
+        hash_check_concurrency=cfg.hash_check_concurrency,
+        album_batch=cfg.album_batch, album_timeout=cfg.album_timeout_seconds,
+        message_rate=cfg.message_rate, message_burst=cfg.message_burst,
+    )
+
     resolver = Resolver(cfg, api, pool)
     stager = GameStager(cfg, api, worker)
     resolver.stager = stager
-    upload_stager = UploadStager(cfg, api, worker)
+    upload_stager = UploadStager(cfg, api, engine)
     resolver.upload_stager = upload_stager
     fetcher = LocalFetcher(cfg, resolver)
     stager.start()

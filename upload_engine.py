@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from threading import BoundedSemaphore, Lock
 from typing import Callable, Dict, Mapping, Sequence
@@ -10,12 +12,32 @@ from uuid import uuid4
 from config import ext_path
 from tgio import SegmentReader
 from tgupload import SMALL_FILE_MAX, decide_protocol
-from transfer_models import TransferRequest, TransferResult, UploadedPart
+from transfer_models import QueueStage, TransferRequest, TransferResult, UploadedPart
 from upload_limiter import MessageTokenBucket
 
 
 class CoverageError(RuntimeError):
     """Metadata parts do not describe exactly the logical file bytes."""
+
+
+# Anything that could carry an auth_key or a drive JWT onwards. Failures are
+# written into durable queue state and into bridge.log, and both outlive the
+# process, so the redaction has to happen before the text is stored -- not at
+# the point somebody reads it.
+_SECRETS = (
+    (re.compile(r"(session\s*[=:]\s*)\S+", re.IGNORECASE), r"\1***"),
+    (re.compile(r"(authorization\s*:\s*)\S+(?:\s+\S+)?", re.IGNORECASE), r"\1***"),
+    (re.compile(r"(bearer\s+)\S+", re.IGNORECASE), r"\1***"),
+    (re.compile(r"\bey[A-Za-z0-9_\-]*\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"), "***"),
+)
+
+
+def redact(value) -> str:
+    """``Type: message`` with every credential-shaped run replaced."""
+    text = value if isinstance(value, str) else f"{type(value).__name__}: {value}"
+    for pattern, replacement in _SECRETS:
+        text = pattern.sub(replacement, text)
+    return text
 
 
 def album_eligible(mime_type: str, size: int) -> bool:
@@ -181,9 +203,10 @@ class FingerprintClaims:
 class AlbumQueue:
     """One account's prepared documents; flushes settle every item's future."""
 
-    def __init__(self, runtime, fallback, *, timeout=60):
+    def __init__(self, runtime, fallback, *, batch=10, timeout=60):
         self.runtime = runtime
         self.fallback = fallback
+        self.batch = max(1, int(batch))
         self.timeout = timeout
         self._pending = []
         self._lock = Lock()
@@ -194,7 +217,7 @@ class AlbumQueue:
         future = future if future is not None else Future()
         with self._lock:
             self._pending.append((item, future))
-            batch = self._pending if len(self._pending) == 10 else []
+            batch = self._pending if len(self._pending) == self.batch else []
             if batch:
                 self._pending = []
         if batch:
@@ -245,6 +268,8 @@ class UploadEngine:
     def __init__(
         self, api, pool, *, claims=None, register_concurrency=8,
         segment_concurrency=32, ffmpeg=None, message_rate=3.0, message_burst=6,
+        hash_concurrency=2, hash_check_concurrency=8,
+        album_batch=10, album_timeout=60.0,
     ):
         self.api = api
         self.pool = pool
@@ -253,6 +278,10 @@ class UploadEngine:
         self._segment_concurrency = max(1, int(segment_concurrency))
         self._register_concurrency = min(8, max(1, int(register_concurrency)))
         self._register_slots = BoundedSemaphore(self._register_concurrency)
+        self._hash_concurrency = max(1, int(hash_concurrency))
+        self._check_concurrency = max(1, int(hash_check_concurrency))
+        self._album_batch = max(1, int(album_batch))
+        self._album_timeout = float(album_timeout)
         self._bucket_lock = Lock()
         self._message_rate = message_rate
         self._message_burst = message_burst
@@ -260,7 +289,7 @@ class UploadEngine:
     def transfer(self, request: TransferRequest) -> TransferResult:
         return self.transfer_batch([request])[0]
 
-    def _inspect_request(self, request):
+    def _fingerprint(self, request):
         # Imported lazily: gamestage also exposes the legacy upload wrapper.
         from gamestage import sample_hash
 
@@ -269,56 +298,149 @@ class UploadEngine:
         actual_size = request.source.stat().st_size
         if actual_size != request.logical_size:
             raise CoverageError(f"source has {actual_size} bytes, expected {request.logical_size}")
-        fingerprint = sample_hash(request.source)
+        return sample_hash(request.source)
+
+    def _check_existing(self, request, fingerprint):
         response = self.api.check_hash(fingerprint) or {}
-        existing = canonical_existing_parts(response.get("files") or [], request.logical_size)
-        return fingerprint, existing
+        return canonical_existing_parts(response.get("files") or [], request.logical_size)
 
-    def transfer_batch(self, requests):
-        """Prepare during discovery, flush account tails, then return in input order.
+    def _submit_inspection(self, request, hash_pool, check_pool):
+        """Chain hash -> check-hash so the two caps stay independent.
 
-        No registration or source deletion occurs here. Pending aliases share
-        futures without blocking discovery, so a tail can always reach flush.
-        The streaming scheduler owns concurrent discovery in the next layer.
+        Both stages are latency, not CPU: a 100 MiB read and a half-second
+        round trip to a backend on the other side of Cloudflare. Running them
+        in one pool would make the slower one set the other's cap.
         """
+        inspected: Future = Future()
+
+        def checked(fingerprint, future):
+            try:
+                inspected.set_result((fingerprint, future.result()))
+            except BaseException as exc:  # noqa: BLE001 - forwarded to the caller
+                inspected.set_exception(exc)
+
+        def hashed(future):
+            try:
+                fingerprint = future.result()
+            except BaseException as exc:  # noqa: BLE001 - forwarded to the caller
+                inspected.set_exception(exc)
+                return
+            try:
+                check_pool.submit(self._check_existing, request, fingerprint).add_done_callback(
+                    lambda done: checked(fingerprint, done)
+                )
+            except BaseException as exc:  # noqa: BLE001 - pool already shutting down
+                inspected.set_exception(exc)
+
+        hash_pool.submit(self._fingerprint, request).add_done_callback(hashed)
+        return inspected
+
+    def _inspection_stream(self, requests, hash_pool, check_pool, notify, lookahead):
+        """Yield ``(request, inspection)`` in input order, ``lookahead`` ahead.
+
+        The window is what makes hashing and checking overlap the upload stage
+        without reading the whole input first: a caller streaming a directory
+        walk still gets its first upload started after one file.
+        """
+        window = max(0, int(lookahead)) + 1
+        source = iter(requests)
+        inflight = deque()
+        exhausted = False
+        while True:
+            while not exhausted and len(inflight) < window:
+                try:
+                    request = next(source)
+                except StopIteration:
+                    exhausted = True
+                    break
+                notify(request, QueueStage.PLANNING, "")
+                inflight.append((request, self._submit_inspection(request, hash_pool, check_pool)))
+            if not inflight:
+                return
+            yield inflight.popleft()
+
+    def transfer_batch(self, requests, status_sink=None, *, on_result=None, lookahead=0):
+        """Stream a batch through hash, check-hash and upload; return in input order.
+
+        No registration or source deletion happens here -- ``on_result`` is
+        called with each :class:`TransferResult` the moment it exists, so the
+        caller can start registering one file while the next is still moving
+        bytes. Pending aliases share futures without blocking discovery, so an
+        album tail can always reach its flush.
+
+        The upload stage itself is deliberately serial in this thread: album
+        batches are formed in arrival order, and ten prepared items must flush
+        while discovery continues rather than in whatever order preparations
+        happen to finish. Concurrency within a file (segments across accounts)
+        and across accounts (per-account file slots) already lives lower down.
+        """
+        notify = status_sink if status_sink is not None else (lambda *_a, **_kw: None)
         queues = {}
         pending = []
         errors = []
-        try:
-            for request in requests:
-                try:
-                    fingerprint, existing = self._inspect_request(request)
-                    if existing:
-                        future = Future()
-                        future.set_result(existing)
-                        owner = False
-                    else:
-                        future, owner = self.claims._claim(fingerprint)
-                    pending.append((request, fingerprint, future))
-                    if not owner:
-                        continue
+
+        def deliver(request, fingerprint, future):
+            """Hand one finished file to the caller; never called twice."""
+            try:
+                parts = future.result()
+                assert_parts_cover_file(parts, request.logical_size)
+            except BaseException as exc:  # noqa: BLE001 - reported per request
+                errors.append(exc)
+                notify(request, QueueStage.FAILED, redact(exc))
+                return
+            result = TransferResult(request, fingerprint, tuple(sorted(parts, key=lambda p: p.index)))
+            notify(request, QueueStage.SENDING, "")
+            if on_result is not None:
+                on_result(result)
+            return result
+
+        with ThreadPoolExecutor(max_workers=self._hash_concurrency, thread_name_prefix="tx-hash") as hash_pool, \
+                ThreadPoolExecutor(max_workers=self._check_concurrency, thread_name_prefix="tx-check") as check_pool:
+            try:
+                stream = self._inspection_stream(requests, hash_pool, check_pool, notify, lookahead)
+                for request, inspection in stream:
                     try:
-                        if request.allow_album and album_eligible(request.mime_type, request.logical_size):
-                            runtime, item = self._prepare_album(request)
-                            queue = queues.setdefault(runtime.telegram_user_id, AlbumQueue(runtime, self._album_fallback))
-                            queue.add(item, future)
+                        fingerprint, existing = inspection.result()
+                        if existing:
+                            future = Future()
+                            future.set_result(existing)
+                            owner = False
                         else:
-                            future.set_result(self._upload_fresh(request))
-                    except Exception as exc:
-                        future.set_exception(exc)
-                except Exception as exc:
-                    errors.append(exc)
-        finally:
-            for queue in queues.values():
-                queue.flush()
+                            future, owner = self.claims._claim(fingerprint)
+                        pending.append((request, fingerprint, future))
+                        if owner:
+                            notify(request, QueueStage.UPLOADING, "")
+                            try:
+                                if request.allow_album and album_eligible(request.mime_type, request.logical_size):
+                                    runtime, item = self._prepare_album(request)
+                                    queue = queues.setdefault(runtime.telegram_user_id, AlbumQueue(
+                                        runtime, self._album_fallback,
+                                        batch=self._album_batch, timeout=self._album_timeout,
+                                    ))
+                                    queue.add(item, future)
+                                else:
+                                    future.set_result(self._upload_fresh(request))
+                            except BaseException as exc:  # noqa: BLE001 - reported per request
+                                future.set_exception(exc)
+                        # A callback, not a blocking read: an alias and an album
+                        # item both settle later, and waiting here for an album
+                        # future would stop the batch that has to flush it.
+                        future.add_done_callback(
+                            lambda done, r=request, f=fingerprint: deliver(r, f, done)
+                        )
+                    except BaseException as exc:  # noqa: BLE001 - reported per request
+                        errors.append(exc)
+                        notify(request, QueueStage.FAILED, redact(exc))
+            finally:
+                for queue in queues.values():
+                    queue.flush()
         results = []
         for request, fingerprint, future in pending:
             try:
                 parts = future.result()
-                assert_parts_cover_file(parts, request.logical_size)
                 results.append(TransferResult(request, fingerprint, tuple(sorted(parts, key=lambda p: p.index))))
-            except Exception as exc:
-                errors.append(exc)
+            except BaseException:  # noqa: BLE001 - already recorded by deliver
+                pass
         if errors:
             raise errors[0]
         return results

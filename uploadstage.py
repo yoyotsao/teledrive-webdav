@@ -12,26 +12,45 @@ follows from there being no packing step:
 - A unit's destination parent is whatever folder the write actually resolved
   to, captured at write time, instead of a folder fixed in advance.
 
-Dedup, segment upload, and registration are the exact same code /game uses
-(``gamestage.upload_and_register``) — this module only supplies the staging
-and debounce half.
+The transfer itself belongs to ``UploadEngine``: dedup, protocol choice,
+albums, account routing and registration are shared with /game. This module
+owns the staging half — landing bytes, debouncing, dispatching a whole due
+batch at once, and the durable record of where each file got to.
+
+**The staged source is the only copy.** It is deleted after registration has
+settled and never before, so a crash anywhere in between leaves a file that
+``_adopt_leftovers`` picks up again on the next start. The queue state beside
+it (``meta/upload-queue.json``) only remembers *how many times* a source has
+already failed and what went wrong; the sources on disk, not that file, are
+what the queue actually is.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import mimetypes
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from config import ext_path as _ext
-from gamestage import MAX_ATTEMPTS, RETRY_SECONDS, TICK_SECONDS, upload_and_register
+from gamestage import MAX_ATTEMPTS, RETRY_SECONDS, TICK_SECONDS
+from transfer_models import QueueStage, TransferRequest
+from upload_engine import redact
 
 log = logging.getLogger("uploadstage")
+
+STATE_FILE = "upload-queue.json"
+STATE_VERSION = 1
+
+#: Stages a file can sit in between debounce windows. Anything else is a
+#: transient in-flight stage that a restart re-derives from the source itself.
+_RESTING = (QueueStage.STAGING, QueueStage.FAILED, QueueStage.ABANDONED)
 
 
 @dataclass
@@ -41,26 +60,33 @@ class PendingUpload:
     segments: Tuple[str, ...]
     parent_id: Optional[str]
     last_write: float = field(default_factory=time.monotonic)
-    state: str = "staging"
+    stage: QueueStage = QueueStage.STAGING
     attempts: int = 0
     retry_after: float = 0.0
     detail: str = ""
+    accounts: Tuple[int, ...] = ()
 
     @property
     def name(self) -> str:
         return self.segments[-1]
 
+    @property
+    def path(self) -> str:
+        return "/".join(self.segments)
+
 
 class UploadStager:
-    def __init__(self, cfg, api, worker):
+    def __init__(self, cfg, api, engine):
         self.cfg = cfg
         self.api = api
-        self.worker = worker
+        self.engine = engine
         self._pending: Dict[Tuple[str, ...], PendingUpload] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._state_lock = threading.Lock()
         self.cfg.upload_dir.mkdir(parents=True, exist_ok=True)
+        self.cfg.cache_dir.mkdir(parents=True, exist_ok=True)
         self._adopt_leftovers()
 
     # -- staging paths ------------------------------------------------- #
@@ -118,6 +144,7 @@ class UploadStager:
         """
         with self._lock:
             self._pending.pop(tuple(segments), None)
+        self._save()
 
     def touch(self, segments: Sequence[str], parent_id: Optional[str] = None) -> None:
         """Record write activity, restarting that file's debounce window."""
@@ -131,9 +158,79 @@ class UploadStager:
             if parent_id is not None:
                 pending.parent_id = parent_id
             pending.last_write = time.monotonic()
-            if pending.state in ("done", "failed"):
-                pending.state = "staging"
+            if pending.stage in (QueueStage.FAILED,):
+                pending.stage = QueueStage.STAGING
                 pending.attempts = 0
+                pending.detail = ""
+        self._save()
+
+    # -- durable queue state ---------------------------------------------- #
+
+    @property
+    def _state_path(self) -> Path:
+        return self.cfg.cache_dir / STATE_FILE
+
+    def _save(self) -> None:
+        """Rewrite the queue record atomically.
+
+        A ``.part`` in the same directory plus ``os.replace``: a half-written
+        record read back after a crash would either lose the attempt count of
+        every file or, worse, resurrect one already registered.
+        """
+        with self._lock:
+            body = {
+                "version": STATE_VERSION,
+                "pending": {
+                    unit.path: {
+                        "stage": unit.stage.value,
+                        "attempts": unit.attempts,
+                        "detail": unit.detail,
+                        "parent_id": unit.parent_id,
+                        "accounts": list(unit.accounts),
+                    }
+                    for unit in self._pending.values()
+                },
+            }
+        target = self._state_path
+        temp = target.with_suffix(".part")
+        with self._state_lock:
+            try:
+                temp.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+                os.replace(temp, target)
+            except OSError:  # pragma: no cover - state is an optimisation, not the queue
+                log.warning("could not persist the upload queue state", exc_info=True)
+
+    def _load_state(self) -> dict:
+        try:
+            body = json.loads(self._state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(body, dict) or body.get("version") != STATE_VERSION:
+            return {}
+        pending = body.get("pending")
+        return pending if isinstance(pending, dict) else {}
+
+    def _set_stage(self, key, stage: QueueStage, detail: str = "") -> None:
+        with self._lock:
+            unit = self._pending.get(key)
+            if unit is None:
+                return
+            unit.stage = stage
+            if detail:
+                unit.detail = detail
+        self._save()
+
+    def status_for(self, segments: Sequence[str]) -> Optional[dict]:
+        unit = self.get(segments)
+        if unit is None:
+            return None
+        return {
+            "path": unit.path,
+            "stage": unit.stage.value,
+            "attempts": unit.attempts,
+            "detail": unit.detail,
+            "accounts": list(unit.accounts),
+        }
 
     def _adopt_leftovers(self) -> None:
         """Pick up staged files left behind by a crash.
@@ -141,15 +238,25 @@ class UploadStager:
         The parent folder is re-resolved from the backend rather than
         remembered — folders outside /game are real and outlive a crash —
         so a leftover is never orphaned without a destination to register to.
+        The persisted record supplies only the attempt count and the last
+        error, so a file that has already burnt four attempts is not handed a
+        fresh five by a restart.
         """
         now = time.time()
-        for root, _dirs, files in os.walk(_ext(self.cfg.upload_dir)):
+        remembered = self._load_state()
+        # Walked through the extended-length form so a deep staged tree is
+        # still readable, but the destination segments come from the walk's own
+        # relative root: ``Path(r"\\?\D:\...")`` is never ``relative_to`` the
+        # plain ``upload_dir``, so deriving them that way silently adopted
+        # nothing on Windows and every crashed upload was dropped from the
+        # queue while its bytes stayed on disk forever.
+        base = _ext(self.cfg.upload_dir)
+        for root, _dirs, files in os.walk(base):
+            relative = os.path.relpath(root, base)
+            prefix = () if relative == "." else tuple(Path(relative).parts)
             for fn in files:
                 full = Path(root) / fn
-                try:
-                    segments = tuple(full.relative_to(self.cfg.upload_dir).parts)
-                except ValueError:
-                    continue
+                segments = prefix + (fn,)
                 try:
                     idle = max(0.0, now - full.stat().st_mtime)
                 except OSError:
@@ -158,10 +265,27 @@ class UploadStager:
                 if len(segments) > 1:
                     parent = self.api.resolve(list(segments[:-1]))
                     parent_id = parent.file_id if parent is not None else None
-                self._pending[segments] = PendingUpload(
+                unit = PendingUpload(
                     segments=segments, parent_id=parent_id, last_write=time.monotonic() - idle,
                 )
-                log.info("adopted leftover upload %s (idle %.0fs)", "/".join(segments), idle)
+                record = remembered.get("/".join(segments))
+                if isinstance(record, dict):
+                    unit.attempts = int(record.get("attempts") or 0)
+                    unit.detail = str(record.get("detail") or "")
+                    unit.accounts = tuple(int(a) for a in record.get("accounts") or ())
+                    if parent_id is None and record.get("parent_id"):
+                        unit.parent_id = record["parent_id"]
+                    try:
+                        stage = QueueStage(record.get("stage"))
+                    except ValueError:
+                        stage = QueueStage.STAGING
+                    # An in-flight stage did not survive the process that owned
+                    # it: the source is still here, so it is staged again.
+                    unit.stage = stage if stage in _RESTING else QueueStage.STAGING
+                self._pending[segments] = unit
+                log.info("adopted leftover upload %s (idle %.0fs, %s)",
+                         unit.path, idle, unit.stage.value)
+        self._save()
 
     # -- background loop -------------------------------------------------- #
 
@@ -179,10 +303,11 @@ class UploadStager:
         with self._lock:
             pending = [
                 {
-                    "path": "/".join(p.segments),
-                    "state": p.state,
+                    "path": p.path,
+                    "stage": p.stage.value,
                     "idle_seconds": round(now - p.last_write, 1),
                     "attempts": p.attempts,
+                    "accounts": list(p.accounts),
                     "detail": p.detail,
                 }
                 for p in self._pending.values()
@@ -193,8 +318,9 @@ class UploadStager:
         debounce = self.cfg.debounce_minutes * 60
         while not self._stop.wait(TICK_SECONDS):
             try:
-                for key in self._due(debounce):
-                    self._process(key)
+                due = self._due(debounce)
+                if due:
+                    self.process_due(due)
             except Exception:  # pragma: no cover - keep the loop alive
                 log.exception("upload staging loop error")
 
@@ -206,42 +332,139 @@ class UploadStager:
                 path = self.path_for(key)
                 if path is None or not path.exists():
                     # Uploaded and cleaned up, or removed behind our back.
-                    if pending.state != "uploading":
+                    if pending.stage is not QueueStage.UPLOADING:
                         self._pending.pop(key, None)
                     continue
-                if pending.state not in ("staging", "failed"):
+                if pending.stage not in (QueueStage.STAGING, QueueStage.FAILED):
                     continue
-                if pending.state == "failed" and now < pending.retry_after:
+                if pending.stage is QueueStage.FAILED and now < pending.retry_after:
                     continue
                 if now - pending.last_write >= debounce:
-                    pending.state = "uploading"
+                    pending.stage = QueueStage.UPLOADING
                     ready.append(key)
         return ready
 
-    def _process(self, key: Tuple[str, ...]) -> None:
-        path = self.path_for(key)
-        pending = self.get(key)
-        if pending is None or path is None:
-            return
-        label = "/".join(key)
+    # -- one due batch ---------------------------------------------------- #
+
+    def process_due(self, keys: Sequence[Sequence[str]]) -> None:
+        """Transfer every due file in one streaming batch, then settle each.
+
+        One batch rather than a loop of single files: the engine's fingerprint
+        claims only collapse duplicates that are in flight together, and its
+        album queue only fills from a batch. Registration runs on its own pool
+        so a slow backend never holds up the next file's bytes.
+        """
+        keys = [tuple(key) for key in keys]
+        requests: Dict[str, Tuple[str, ...]] = {}
+        failures: Dict[Tuple[str, ...], str] = {}
+        registrations: Dict[Tuple[str, ...], object] = {}
+        dispatched: List[Tuple[str, ...]] = []
+        lock = threading.Lock()
+
+        def key_of(request) -> Optional[Tuple[str, ...]]:
+            return requests.get(str(request.source))
+
+        def generate():
+            for key in keys:
+                request = self._request_for(key)
+                if request is None:
+                    continue
+                requests[str(request.source)] = key
+                dispatched.append(key)
+                log.info("uploading %s", "/".join(key))
+                yield request
+
+        def status_sink(request, stage, detail=""):
+            key = key_of(request)
+            if key is None:  # pragma: no cover - every request came from generate()
+                return
+            if stage is QueueStage.FAILED:
+                with lock:
+                    failures.setdefault(key, detail)
+                return
+            self._set_stage(key, stage)
+
+        pool = ThreadPoolExecutor(
+            max_workers=max(1, int(getattr(self.cfg, "register_concurrency", 8))),
+            thread_name_prefix="uploadstage-register",
+        )
+
+        def on_result(result):
+            key = key_of(result.request)
+            if key is None:  # pragma: no cover - every request came from generate()
+                return
+            with self._lock:
+                unit = self._pending.get(key)
+                if unit is not None:
+                    unit.accounts = tuple(sorted({p.telegram_user_id for p in result.parts}))
+            self._set_stage(key, QueueStage.REGISTERING)
+            with lock:
+                registrations[key] = pool.submit(self.engine.register_result, result)
+
         try:
-            log.info("uploading %s", label)
-            mime_type = mimetypes.guess_type(pending.name)[0] or "application/octet-stream"
-            upload_and_register(self.api, self.worker, path, pending.name, pending.parent_id, mime_type)
-            log.info("uploaded %s — clearing staging", label)
-            path.unlink(missing_ok=True)
-            with self._lock:
-                self._pending.pop(key, None)
+            self.engine.transfer_batch(
+                generate(), status_sink, on_result=on_result,
+                lookahead=max(1, int(getattr(self.cfg, "hash_concurrency", 2))),
+            )
         except Exception as exc:
-            log.exception("upload of %s failed", label)
-            with self._lock:
-                unit = self._pending.get(key) or PendingUpload(segments=key, parent_id=pending.parent_id)
-                unit.attempts += 1
-                unit.detail = f"{type(exc).__name__}: {exc}"
-                if unit.attempts >= MAX_ATTEMPTS:
-                    unit.state = "abandoned"
-                    log.error("giving up on %s after %s attempts — staging kept", label, unit.attempts)
-                else:
-                    unit.state = "failed"
-                    unit.retry_after = time.monotonic() + RETRY_SECONDS
-                self._pending[key] = unit
+            # Per-request failures already arrived through status_sink; this is
+            # only the batch's first one surfacing again.
+            log.warning("upload batch reported %s", redact(exc))
+        finally:
+            pool.shutdown(wait=True)
+
+        for key, future in registrations.items():
+            try:
+                future.result()
+            except Exception as exc:
+                log.exception("registering %s failed", "/".join(key))
+                with lock:
+                    failures.setdefault(key, redact(exc))
+
+        for key in dispatched:
+            detail = failures.get(key)
+            if detail is None:
+                self._complete(key)
+            else:
+                self._record_failure(key, detail)
+
+    def _request_for(self, key: Tuple[str, ...]) -> Optional[TransferRequest]:
+        path = self.path_for(key)
+        unit = self.get(key)
+        if unit is None or path is None or not path.exists():
+            return None
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return None
+        mime_type = mimetypes.guess_type(unit.name)[0] or "application/octet-stream"
+        return TransferRequest(
+            source=path, upload_name=unit.name, mime_type=mime_type,
+            parent_id=unit.parent_id, logical_size=size,
+        )
+
+    def _complete(self, key: Tuple[str, ...]) -> None:
+        """Registration settled: only now may the one local copy go away."""
+        path = self.path_for(key)
+        if path is not None:
+            path.unlink(missing_ok=True)
+        with self._lock:
+            self._pending.pop(key, None)
+        log.info("uploaded %s — clearing staging", "/".join(key))
+        self._save()
+
+    def _record_failure(self, key: Tuple[str, ...], detail: str) -> None:
+        label = "/".join(key)
+        with self._lock:
+            unit = self._pending.get(key)
+            if unit is None:
+                return
+            unit.attempts += 1
+            unit.detail = detail
+            if unit.attempts >= MAX_ATTEMPTS:
+                unit.stage = QueueStage.ABANDONED
+                log.error("giving up on %s after %s attempts — staging kept", label, unit.attempts)
+            else:
+                unit.stage = QueueStage.FAILED
+                unit.retry_after = time.monotonic() + RETRY_SECONDS
+        self._save()

@@ -12,6 +12,7 @@ and registration, fetchlocal's copying. Only two things are substituted:
 This is what makes M1-M4 verifiable without credentials, rclone or WinFsp.
 """
 
+import contextlib
 import hashlib
 import os
 import io
@@ -36,6 +37,7 @@ from config import Config  # noqa: E402
 from fetchlocal import LocalFetcher  # noqa: E402
 from gamestage import GameStager  # noqa: E402
 from tdapi import TeleDriveClient  # noqa: E402
+from upload_engine import UploadEngine  # noqa: E402
 from uploadstage import UploadStager  # noqa: E402
 
 PAGE_SIZE = 10000
@@ -60,6 +62,8 @@ class FakeWorker:
         self.media = {}
         self.uploads = []
         self.reads = []
+        self.prepared = {}
+        self.albums = []
         self._next_id = 1000
 
     def add_message(self, blob: bytes) -> int:
@@ -117,6 +121,84 @@ class FakeWorker:
             {"name": file_name, "size": size, "message_id": message_id, "preview": preview}
         )
         return {"message_id": message_id, "file_id": f"doc{message_id}", "access_hash": "ah", "size": size}
+
+    # -- the engine's two-phase API ------------------------------------ #
+    # Preparation moves the bytes while a file lease is held; the message is
+    # sent afterwards. Everything still lands in ``uploads`` so the assertions
+    # about names, sizes and previews do not care which path a file took.
+
+    @staticmethod
+    def _drain(stream, size):
+        data = bytearray()
+        while len(data) < size:
+            chunk = stream.read(min(1 << 16, size - len(data)))
+            if not chunk:
+                break
+            data += chunk
+        assert len(data) == size, f"segment short read: {len(data)} != {size}"
+        return bytes(data)
+
+    @staticmethod
+    def _preview_bytes(preview):
+        if preview is None:
+            return None
+        source, width, height = preview
+        if isinstance(source, bytes):
+            return (source, width, height)
+        assert source.exists() and source.suffix == ".jpg"
+        return (source.read_bytes(), width, height)
+
+    def prepare_segment(self, stream, size, file_name, progress=None, *, force_big=None):
+        data = self._drain(stream, size)
+        if progress:
+            progress(size, size)
+        return {"data": data, "name": file_name}
+
+    def prepare_thumbnail(self, preview):
+        return self._preview_bytes(preview)
+
+    def send_uploaded_segment(self, handle, size, file_name, preview=None, *, mime_type=None, message_limiter=None):
+        message_id = self.add_message(handle["data"])
+        self.uploads.append(
+            {"name": file_name, "size": size, "message_id": message_id, "preview": preview}
+        )
+        return {"message_id": message_id, "file_id": f"doc{message_id}", "access_hash": "ah", "size": size}
+
+    def prepare_album_item(self, source, size, file_name, mime_type, preview=None, *, message_limiter=None):
+        from pathlib import Path
+
+        from transfer_models import PreparedAlbumItem
+
+        self._next_id += 1
+        document_id = str(self._next_id)
+        self.prepared[document_id] = {
+            "data": Path(source).read_bytes(),
+            "preview": self._preview_bytes(preview),
+        }
+        return PreparedAlbumItem(
+            source=Path(source), upload_name=file_name, mime_type=mime_type, size=size,
+            telegram_user_id=int(self.user_id), document_id=document_id,
+            access_hash="ah", has_thumbnail=preview is not None,
+        )
+
+    def send_album(self, items, timeout=60, *, message_limiter=None):
+        from transfer_models import UploadedPart
+
+        parts = []
+        for item in items:
+            prepared = self.prepared.pop(item.document_id)
+            message_id = self.add_message(prepared["data"])
+            self.uploads.append({
+                "name": item.upload_name, "size": item.size,
+                "message_id": message_id, "preview": prepared["preview"],
+            })
+            self.albums.append([i.upload_name for i in items])
+            parts.append(UploadedPart(
+                index=0, message_id=message_id, file_id=item.document_id,
+                access_hash=item.access_hash, size=item.size,
+                telegram_user_id=item.telegram_user_id, has_thumbnail=item.has_thumbnail,
+            ))
+        return parts
 
     def stop(self):
         pass
@@ -411,20 +493,41 @@ def rig(tmp_path):
     api = FakeClient(cfg, backend)
     api.login()  # as bridge.main does, and for the same reason: nothing works without it
     class FakePool:
+        """One account, real admission: the engine takes and frees a lease."""
+
         def __init__(self, worker):
-            self.primary = SimpleNamespace(worker=worker)
+            self.primary = SimpleNamespace(
+                worker=worker, telegram_user_id=int(worker.user_id), label="primary",
+                file_slots=threading.BoundedSemaphore(cfg.upload_files),
+                message_limiter=None, online=True, linked=True,
+            )
 
         def for_read(self, account_id):
-            assert account_id == 0
+            assert account_id in (0, self.primary.telegram_user_id)
             return self.primary
+
+        @contextlib.contextmanager
+        def acquire_upload(self, timeout=None):
+            self.primary.file_slots.acquire()
+            try:
+                yield self.primary
+            finally:
+                self.primary.file_slots.release()
 
         def status(self):
             return {"accounts": [], "eligible_upload_ids": []}
 
-    resolver = bridge.Resolver(cfg, api, FakePool(worker))
+    pool = FakePool(worker)
+    engine = UploadEngine(
+        api, pool, register_concurrency=cfg.register_concurrency,
+        hash_concurrency=cfg.hash_concurrency,
+        hash_check_concurrency=cfg.hash_check_concurrency,
+        album_batch=cfg.album_batch, album_timeout=cfg.album_timeout_seconds,
+    )
+    resolver = bridge.Resolver(cfg, api, pool)
     stager = GameStager(cfg, api, worker)
     resolver.stager = stager
-    upload_stager = UploadStager(cfg, api, worker)
+    upload_stager = UploadStager(cfg, api, engine)
     resolver.upload_stager = upload_stager
     app = bridge.build_app(cfg, resolver, stager, LocalFetcher(cfg, resolver), upload_stager)
 
@@ -599,7 +702,7 @@ def _upload_now(rig, *segments):
     key = tuple(segments)
     due = rig.upload_stager._due(0.0)
     assert key in due, f"{key} not due; pending={rig.upload_stager.status()}"
-    rig.upload_stager._process(key)
+    rig.upload_stager.process_due([key])
 
 
 def test_put_outside_game_is_visible_locally_before_upload(rig):
