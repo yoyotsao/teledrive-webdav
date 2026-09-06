@@ -83,14 +83,33 @@ CASES = (
 )
 
 
-def payload(size: int, seed: int) -> bytes:
-    """Deterministic, incompressible-ish bytes, so a rerun hashes the same."""
-    out = bytearray()
+CHUNK = 1 << 20
+
+
+def payload_chunks(size: int, seed: int):
+    """Deterministic bytes in 1 MiB pieces, so a rerun hashes the same.
+
+    A generator rather than one buffer: the segment-boundary cases are half a
+    gigabyte each, and materialising the whole matrix before writing any of it
+    is what got an earlier run of this script killed for memory while the
+    bridge was mid-upload.
+    """
+    produced = 0
     block = 0
-    while len(out) < size:
-        out += hashlib.sha256(f"{seed}:{block}".encode()).digest()
-        block += 1
-    return bytes(out[:size])
+    buffer = bytearray()
+    while produced < size:
+        while len(buffer) < CHUNK and produced + len(buffer) < size:
+            buffer += hashlib.sha256(f"{seed}:{block}".encode()).digest()
+            block += 1
+        take = min(len(buffer), size - produced)
+        yield bytes(buffer[:take])
+        del buffer[:take]
+        produced += take
+
+
+def payload(size: int, seed: int) -> bytes:
+    """The whole thing at once; only for sizes small enough to hold."""
+    return b"".join(payload_chunks(size, seed))
 
 
 def jpeg_payload(size: int, seed: int) -> bytes:
@@ -129,12 +148,23 @@ class Planned:
     case: str
     name: str
     size: int
-    sha256: str
+    suffix: str
+    seed: int
     expect: str
     expect_thumbnail: bool
     local: Path
+    sha256: str = ""
     findings: list[str] = field(default_factory=list)
     observed: dict = field(default_factory=dict)
+
+    def chunks(self):
+        """Regenerate this file's bytes, a piece at a time."""
+        if self.suffix == ".jpg":
+            yield jpeg_payload(self.size, self.seed)
+        elif self.suffix == ".webp":
+            yield webp_payload(self.size, self.seed)
+        else:
+            yield from payload_chunks(self.size, self.seed)
 
 
 def plan(cases, mount: Path, folder: str) -> list[Planned]:
@@ -144,31 +174,44 @@ def plan(cases, mount: Path, folder: str) -> list[Planned]:
         for index in range(case.count):
             size = case.sizes[index % len(case.sizes)]
             seed = seed if case.identical else seed + 1
-            if case.suffix == ".jpg":
-                body = jpeg_payload(size, seed)
-            elif case.suffix == ".webp":
-                body = webp_payload(size, seed)
-            else:
-                body = payload(size, seed)
             name = f"{case.name}-{index}{case.suffix}"
             planned.append(Planned(
-                case=case.name, name=name, size=len(body),
-                sha256=hashlib.sha256(body).hexdigest(),
+                case=case.name, name=name, size=size, suffix=case.suffix, seed=seed,
                 expect=case.expect, expect_thumbnail=case.expect_thumbnail,
                 local=mount / folder / name,
-                observed={"bytes": len(body)},
+                observed={"bytes": size},
             ))
-            planned[-1].__dict__["_body"] = body
     return planned
+
+
+def fingerprint_all(planned: list[Planned]) -> None:
+    """Fill in each file's SHA-256 without holding more than one chunk."""
+    for item in planned:
+        digest = hashlib.sha256()
+        produced = 0
+        for chunk in item.chunks():
+            digest.update(chunk)
+            produced += len(chunk)
+        item.size = produced
+        item.sha256 = digest.hexdigest()
+        item.observed["bytes"] = produced
 
 
 def write_all(planned: list[Planned], mount: Path, folder: str) -> None:
     target = mount / folder
     target.mkdir(parents=True, exist_ok=True)
     for item in planned:
-        body = item.__dict__.pop("_body")
         print(f"  writing {item.name} ({item.size / MiB:.1f} MiB)", flush=True)
-        item.local.write_bytes(body)
+        digest = hashlib.sha256()
+        produced = 0
+        with open(item.local, "wb") as handle:
+            for chunk in item.chunks():
+                handle.write(chunk)
+                digest.update(chunk)
+                produced += len(chunk)
+        item.size = produced
+        item.sha256 = digest.hexdigest()
+        item.observed["bytes"] = produced
 
 
 def wait_for_quiet(rpc: str, expected: set[str], deadline: float) -> bool:
@@ -371,8 +414,7 @@ def main(argv=None) -> int:
         print(f"writing into {mount / args.folder} ...")
         write_all(planned, mount, args.folder)
     else:
-        for item in planned:
-            item.__dict__.pop("_body", None)
+        fingerprint_all(planned)
 
     deadline = time.monotonic() + args.timeout_minutes * 60
     print(f"waiting for the debounce ({cfg.debounce_minutes} min) and the uploads ...")
