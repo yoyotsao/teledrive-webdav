@@ -19,6 +19,11 @@ from tgio import (  # noqa: E402
     map_range,
     plan_segments,
 )
+from transfer_models import RemotePart  # noqa: E402
+
+
+def routed(message_id, size, account_id=0, file_id=None):
+    return RemotePart(message_id, size, account_id, file_id or str(message_id))
 
 
 # --------------------------------------------------------------------------- #
@@ -27,13 +32,13 @@ from tgio import (  # noqa: E402
 
 
 def test_part_table_accumulates_offsets():
-    table, total = build_part_table([(11, 100), (22, 50), (33, 7)])
+    table, total = build_part_table([routed(11, 100), routed(22, 50), routed(33, 7)])
     assert total == 157
     assert [(p.message_id, p.start, p.size) for p in table] == [(11, 0, 100), (22, 100, 50), (33, 150, 7)]
 
 
 def test_part_table_drops_empty_parts():
-    table, total = build_part_table([(11, 10), (22, 0), (33, 5)])
+    table, total = build_part_table([routed(11, 10), routed(22, 0), routed(33, 5)])
     assert total == 15
     assert [p.message_id for p in table] == [11, 33]
 
@@ -50,7 +55,7 @@ def test_part_table_empty():
 
 @pytest.fixture
 def table():
-    return build_part_table([(1, 100), (2, 100), (3, 30)])
+    return build_part_table([routed(1, 100), routed(2, 100), routed(3, 30)])
 
 
 def test_map_inside_one_part(table):
@@ -152,7 +157,16 @@ class FakeReader:
         self.parts = parts  # message_id -> bytes
         self.calls = []
 
-    def read(self, message_id, offset, length):
+    def for_read(self, telegram_user_id):
+        assert telegram_user_id == 0
+        return self
+
+    @property
+    def worker(self):
+        return self
+
+    def read(self, message_id, expected_file_id, offset, length):
+        assert expected_file_id == str(message_id)
         self.calls.append((message_id, offset, length))
         return self.parts[message_id][offset : offset + length]
 
@@ -170,7 +184,12 @@ def remote():
 
 
 def _open(reader, block_size=64):
-    return SeekableRemoteFile(reader, [(1, 300), (2, 300), (3, 40)], name="x.bin", block_size=block_size)
+    return SeekableRemoteFile(
+        reader,
+        [routed(1, 300), routed(2, 300), routed(3, 40)],
+        name="x.bin",
+        block_size=block_size,
+    )
 
 
 def test_remote_file_size_is_the_sum_of_parts(remote):
@@ -305,7 +324,10 @@ def test_read_wider_than_the_cache_still_returns_everything(remote):
     reader, whole = remote
     # 8 blocks cached, but the read spans 10 — assembly must not lose a block
     fh = SeekableRemoteFile(
-        reader, [(1, 300), (2, 300), (3, 40)], block_size=64, blocks_cached=8
+        reader,
+        [routed(1, 300), routed(2, 300), routed(3, 40)],
+        block_size=64,
+        blocks_cached=8,
     )
     assert fh.read() == whole
 
@@ -318,7 +340,7 @@ def test_read_wider_than_the_cache_still_returns_everything(remote):
 def test_head_serves_the_front_without_touching_the_reader(remote):
     reader, whole = remote
     fh = SeekableRemoteFile(
-        reader, [(1, 300), (2, 300), (3, 40)], block_size=64, head=whole[:128]
+        reader, [routed(1, 300), routed(2, 300), routed(3, 40)], block_size=64, head=whole[:128]
     )
     assert fh.read(128) == whole[:128]
     assert reader.calls == []
@@ -327,7 +349,7 @@ def test_head_serves_the_front_without_touching_the_reader(remote):
 def test_head_shorter_than_the_read_falls_through_for_the_rest(remote):
     reader, whole = remote
     fh = SeekableRemoteFile(
-        reader, [(1, 300), (2, 300), (3, 40)], block_size=64, head=whole[:100]
+        reader, [routed(1, 300), routed(2, 300), routed(3, 40)], block_size=64, head=whole[:100]
     )
     # 100 bytes of head plus the remainder, which must be whole and correct
     assert fh.read(250) == whole[:250]
@@ -337,7 +359,7 @@ def test_head_shorter_than_the_read_falls_through_for_the_rest(remote):
 def test_head_does_not_disturb_reads_past_it(remote):
     reader, whole = remote
     fh = SeekableRemoteFile(
-        reader, [(1, 300), (2, 300), (3, 40)], block_size=64, head=whole[:128]
+        reader, [routed(1, 300), routed(2, 300), routed(3, 40)], block_size=64, head=whole[:128]
     )
     fh.seek(400)
     assert fh.read(100) == whole[400:500]
@@ -345,7 +367,7 @@ def test_head_does_not_disturb_reads_past_it(remote):
 
 def test_head_longer_than_the_file_is_clipped(remote):
     reader, _ = remote
-    small = SeekableRemoteFile(reader, [(3, 40)], block_size=64, head=b"\x00" * 4096)
+    small = SeekableRemoteFile(reader, [routed(3, 40)], block_size=64, head=b"\x00" * 4096)
     assert small.size == 40
     assert len(small.read()) == 40
 
@@ -353,7 +375,7 @@ def test_head_longer_than_the_file_is_clipped(remote):
 def test_head_survives_seek_and_reread(remote):
     reader, whole = remote
     fh = SeekableRemoteFile(
-        reader, [(1, 300), (2, 300), (3, 40)], block_size=64, head=whole[:128]
+        reader, [routed(1, 300), routed(2, 300), routed(3, 40)], block_size=64, head=whole[:128]
     )
     assert fh.read() == whole
     fh.seek(0)
@@ -375,7 +397,7 @@ def test_a_full_width_streamed_read_stays_in_the_cache():
     width = tgio.STREAM_BLOCK_SIZE
     blob = bytes((i % 251) for i in range(width * 2))
     reader = FakeReader({1: blob})
-    fh = SeekableRemoteFile(reader, [(1, len(blob))], name="video.mp4")
+    fh = SeekableRemoteFile(reader, [routed(1, len(blob))], name="video.mp4")
 
     assert fh.read(width) == blob[:width]
     fetched = len(reader.calls)

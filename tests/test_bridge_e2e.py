@@ -12,6 +12,7 @@ and registration, fetchlocal's copying. Only two things are substituted:
 This is what makes M1-M4 verifiable without credentials, rclone or WinFsp.
 """
 
+import contextlib
 import hashlib
 import os
 import io
@@ -22,6 +23,7 @@ import uuid
 import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import requests
@@ -31,6 +33,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import bridge  # noqa: E402
 import gamestage  # noqa: E402
 import tgio  # noqa: E402
+import tgupload  # noqa: E402
+import upload_engine  # noqa: E402
 from config import Config  # noqa: E402
 from fetchlocal import LocalFetcher  # noqa: E402
 from gamestage import GameStager  # noqa: E402
@@ -59,6 +63,8 @@ class FakeWorker:
         self.media = {}
         self.uploads = []
         self.reads = []
+        self.prepared = {}
+        self.albums = []
         self._next_id = 1000
 
     def add_message(self, blob: bytes) -> int:
@@ -66,7 +72,7 @@ class FakeWorker:
         self.messages[self._next_id] = blob
         return self._next_id
 
-    def read(self, message_id: int, offset: int, length: int) -> bytes:
+    def read(self, message_id: int, expected_file_id: str, offset: int, length: int) -> bytes:
         self.reads.append((message_id, offset, length))
         blob = self.messages[message_id]
         return blob[offset : offset + length]
@@ -74,20 +80,26 @@ class FakeWorker:
     def set_thumb(self, message_id: int, data: bytes) -> None:
         self.thumbs[message_id] = data
 
-    def thumbnails(self, message_ids):
+    def thumbnails(self, parts):
         self.thumb_batches = getattr(self, "thumb_batches", [])
-        self.thumb_batches.append(list(message_ids))
-        return {m: self.thumbs[m] for m in message_ids if m in self.thumbs}
+        self.thumb_batches.append(list(parts))
+        return {
+            (part.message_id, str(part.file_id)): self.thumbs[part.message_id]
+            for part in parts if part.message_id in self.thumbs
+        }
 
     def set_media(self, message_id: int, info: dict) -> None:
         self.media[message_id] = info
 
-    def media_info(self, message_ids):
+    def media_info(self, parts):
         self.media_batches = getattr(self, "media_batches", [])
-        self.media_batches.append(list(message_ids))
+        self.media_batches.append(list(parts))
         # Like the real one: every message that could be read gets an entry, and
         # one with nothing to report answers {} rather than going missing.
-        return {m: self.media.get(m, {}) for m in message_ids if m in self.messages}
+        return {
+            (part.message_id, str(part.file_id)): self.media.get(part.message_id, {})
+            for part in parts if part.message_id in self.messages
+        }
 
     def upload_segment(self, stream, size, file_name, progress=None, preview=None):
         data = bytearray()
@@ -110,6 +122,84 @@ class FakeWorker:
             {"name": file_name, "size": size, "message_id": message_id, "preview": preview}
         )
         return {"message_id": message_id, "file_id": f"doc{message_id}", "access_hash": "ah", "size": size}
+
+    # -- the engine's two-phase API ------------------------------------ #
+    # Preparation moves the bytes while a file lease is held; the message is
+    # sent afterwards. Everything still lands in ``uploads`` so the assertions
+    # about names, sizes and previews do not care which path a file took.
+
+    @staticmethod
+    def _drain(stream, size):
+        data = bytearray()
+        while len(data) < size:
+            chunk = stream.read(min(1 << 16, size - len(data)))
+            if not chunk:
+                break
+            data += chunk
+        assert len(data) == size, f"segment short read: {len(data)} != {size}"
+        return bytes(data)
+
+    @staticmethod
+    def _preview_bytes(preview):
+        if preview is None:
+            return None
+        source, width, height = preview
+        if isinstance(source, bytes):
+            return (source, width, height)
+        assert source.exists() and source.suffix == ".jpg"
+        return (source.read_bytes(), width, height)
+
+    def prepare_segment(self, stream, size, file_name, progress=None, *, force_big=None):
+        data = self._drain(stream, size)
+        if progress:
+            progress(size, size)
+        return {"data": data, "name": file_name}
+
+    def prepare_thumbnail(self, preview):
+        return self._preview_bytes(preview)
+
+    def send_uploaded_segment(self, handle, size, file_name, preview=None, *, mime_type=None, message_limiter=None):
+        message_id = self.add_message(handle["data"])
+        self.uploads.append(
+            {"name": file_name, "size": size, "message_id": message_id, "preview": preview}
+        )
+        return {"message_id": message_id, "file_id": f"doc{message_id}", "access_hash": "ah", "size": size}
+
+    def prepare_album_item(self, source, size, file_name, mime_type, preview=None, *, message_limiter=None):
+        from pathlib import Path
+
+        from transfer_models import PreparedAlbumItem
+
+        self._next_id += 1
+        document_id = str(self._next_id)
+        self.prepared[document_id] = {
+            "data": Path(source).read_bytes(),
+            "preview": self._preview_bytes(preview),
+        }
+        return PreparedAlbumItem(
+            source=Path(source), upload_name=file_name, mime_type=mime_type, size=size,
+            telegram_user_id=int(self.user_id), document_id=document_id,
+            access_hash="ah", has_thumbnail=preview is not None,
+        )
+
+    def send_album(self, items, timeout=60, *, message_limiter=None):
+        from transfer_models import UploadedPart
+
+        parts = []
+        for item in items:
+            prepared = self.prepared.pop(item.document_id)
+            message_id = self.add_message(prepared["data"])
+            self.uploads.append({
+                "name": item.upload_name, "size": item.size,
+                "message_id": message_id, "preview": prepared["preview"],
+            })
+            self.albums.append([i.upload_name for i in items])
+            parts.append(UploadedPart(
+                index=0, message_id=message_id, file_id=item.document_id,
+                access_hash=item.access_hash, size=item.size,
+                telegram_user_id=item.telegram_user_id, has_thumbnail=item.has_thumbnail,
+            ))
+        return parts
 
     def stop(self):
         pass
@@ -320,7 +410,10 @@ class Rig:
         than the file.
         """
         entry = self.entry_for(path)
-        whole = b"".join(self.worker.messages[mid] for mid, _ in self.resolver.api.parts_for(entry))
+        whole = b"".join(
+            self.worker.messages[part.message_id]
+            for part in self.resolver.api.parts_for(entry)
+        )
         return whole[: self.resolver.api.total_size(entry)]
 
     def prop(self, path, name, depth="0"):
@@ -400,10 +493,42 @@ def rig(tmp_path):
 
     api = FakeClient(cfg, backend)
     api.login()  # as bridge.main does, and for the same reason: nothing works without it
-    resolver = bridge.Resolver(cfg, api, worker)
-    stager = GameStager(cfg, api, worker)
+    class FakePool:
+        """One account, real admission: the engine takes and frees a lease."""
+
+        def __init__(self, worker):
+            self.primary = SimpleNamespace(
+                worker=worker, telegram_user_id=int(worker.user_id), label="primary",
+                file_slots=threading.BoundedSemaphore(cfg.upload_files),
+                message_limiter=None, online=True, linked=True,
+            )
+
+        def for_read(self, account_id):
+            assert account_id in (0, self.primary.telegram_user_id)
+            return self.primary
+
+        @contextlib.contextmanager
+        def acquire_upload(self, timeout=None):
+            self.primary.file_slots.acquire()
+            try:
+                yield self.primary
+            finally:
+                self.primary.file_slots.release()
+
+        def status(self):
+            return {"accounts": [], "eligible_upload_ids": []}
+
+    pool = FakePool(worker)
+    engine = upload_engine.UploadEngine(
+        api, pool, register_concurrency=cfg.register_concurrency,
+        hash_concurrency=cfg.hash_concurrency,
+        hash_check_concurrency=cfg.hash_check_concurrency,
+        album_batch=cfg.album_batch, album_timeout=cfg.album_timeout_seconds,
+    )
+    resolver = bridge.Resolver(cfg, api, pool)
+    stager = GameStager(cfg, api, engine)
     resolver.stager = stager
-    upload_stager = UploadStager(cfg, api, worker)
+    upload_stager = UploadStager(cfg, api, engine)
     resolver.upload_stager = upload_stager
     app = bridge.build_app(cfg, resolver, stager, LocalFetcher(cfg, resolver), upload_stager)
 
@@ -578,7 +703,7 @@ def _upload_now(rig, *segments):
     key = tuple(segments)
     due = rig.upload_stager._due(0.0)
     assert key in due, f"{key} not due; pending={rig.upload_stager.status()}"
-    rig.upload_stager._process(key)
+    rig.upload_stager.process_due([key])
 
 
 def test_put_outside_game_is_visible_locally_before_upload(rig):
@@ -713,9 +838,9 @@ def test_browsing_a_zip_does_not_download_it(rig):
     read = {"bytes": 0}
     original = rig.worker.read
 
-    def counting(message_id, offset, length):
+    def counting(message_id, expected_file_id, offset, length):
         read["bytes"] += length
-        return original(message_id, offset, length)
+        return original(message_id, expected_file_id, offset, length)
 
     rig.worker.read = counting
     rig.resolver._zips.clear()  # force a fresh central-directory parse
@@ -815,8 +940,11 @@ def test_a_single_file_dropped_into_game_is_uploaded_as_is(rig):
 
 
 def test_large_pack_is_split_and_reads_back_intact(rig, monkeypatch):
-    # 500 MiB segments cannot be exercised in a test; shrink the boundary instead.
-    monkeypatch.setattr(gamestage, "SEGMENT_SIZE", 4096)
+    # 500 MiB segments cannot be exercised in a test; shrink both boundaries
+    # instead. SMALL_FILE_MAX has to come down too, or decide_protocol answers
+    # "small" for anything under 10 MiB and never plans a second segment.
+    monkeypatch.setattr(tgupload, "MESSAGE_MAX", 4096)
+    monkeypatch.setattr(tgupload, "SMALL_FILE_MAX", 4096)
     rig.request("MKCOL", "/game/Huge")
     payload = bytes((i * 7) % 251 for i in range(30_000))
     rig.request("PUT", "/game/Huge/blob.bin", data=payload)
@@ -840,7 +968,8 @@ def test_split_segment_sizes_are_exact_not_inflated(rig, monkeypatch):
     # -- tdapi's real_size/_clip_parts exists specifically to undo that
     # padding on read. webdav's own segment planning must never regress to
     # it: every part's registered filesize must be the exact byte count.
-    monkeypatch.setattr(gamestage, "SEGMENT_SIZE", 4096)
+    monkeypatch.setattr(tgupload, "MESSAGE_MAX", 4096)
+    monkeypatch.setattr(tgupload, "SMALL_FILE_MAX", 4096)
     payload = bytes((i * 3) % 256 for i in range(4096 + 1))
     rig.request("PUT", "/game/Exact.zip", data=payload)
     _pack_now(rig, "Exact.zip")
@@ -918,7 +1047,7 @@ def test_canonical_existing_parts_collapses_corrupt_groups():
         {"file_id": "d", "filesize": 10, "telegram_message_id": 9, "is_split_file": True,
          "split_group_id": "g2", "part_index": 0, "mime_type": None},
     ]
-    parts = gamestage.canonical_existing_parts(rows, original_size=15)
+    parts = upload_engine.canonical_existing_parts(rows, original_size=15)
     assert [p.index for p in parts] == [0, 1]
     assert [p.message_id for p in parts] == [1, 2]
 
@@ -1498,7 +1627,7 @@ def test_needs_warming_does_not_check_for_a_head(rig):
     _, todo = warmer.pending()
     warmer.fill(todo)
     png = rig.entry_for("photos/shot.png")
-    assert not (rig.cfg.cache_dir / "heads" / f"{png.file_id}.head").exists()
+    assert not rig.resolver._head_path(png).exists()
     assert rig.resolver.needs_warming(png) is False
 
 

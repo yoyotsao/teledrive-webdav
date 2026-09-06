@@ -7,6 +7,8 @@ so a Telethon upgrade that changes their shape fails here.
 """
 
 import asyncio
+from contextlib import asynccontextmanager
+import io
 import sys
 from pathlib import Path
 
@@ -23,6 +25,7 @@ from tgupload import (  # noqa: E402
     _PartReader,
     plan_parts,
     send_part,
+    upload_big_file_parts,
     upload_file_parts,
 )
 
@@ -210,6 +213,42 @@ def test_send_part_retries_through_flood_then_succeeds():
     assert gate.stats()["floods"] == 1
 
 
+def test_send_part_classifies_premium_flood_before_retrying():
+    from telethon.errors import FloodPremiumWaitError
+
+    class Limiter:
+        def __init__(self):
+            self.floods = []
+
+        @asynccontextmanager
+        async def acquire(self):
+            yield
+
+        def now(self):
+            return 0.0
+
+        def success(self, _duration):
+            pass
+
+        def flood(self, seconds, *, premium=False):
+            self.floods.append((seconds, premium))
+
+    request = make_request()
+    limiter = Limiter()
+    attempts = {"n": 0}
+
+    class PremiumThenSuccess:
+        async def send(self, req):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise FloodPremiumWaitError(req, capture=17)
+
+    run(send_part(lambda: PremiumThenSuccess(), request, limiter, "part"))
+
+    assert attempts["n"] == 2
+    assert limiter.floods == [(17.0, True)]
+
+
 def test_send_part_gives_up_after_max_flood_retries():
     from telethon.errors import FloodWaitError
 
@@ -230,7 +269,7 @@ def test_send_part_gives_up_after_max_flood_retries():
     assert attempts["n"] == MAX_FLOOD_RETRIES + 1
 
 
-def test_send_part_retries_through_disconnect_then_succeeds():
+def test_send_part_leaves_non_flood_failures_for_the_three_attempt_primitive_retry():
     gate = fast_gate()
     request = make_request()
     attempts = {"n": 0}
@@ -243,9 +282,96 @@ def test_send_part_retries_through_disconnect_then_succeeds():
 
     sender = DropsOnce()
 
-    run(send_part(lambda: sender, request, gate, "part"))
+    with pytest.raises(ConnectionError):
+        run(send_part(lambda: sender, request, gate, "part"))
 
-    assert attempts["n"] == 2
+    assert attempts["n"] == 1
+
+
+def test_big_primitive_retries_a_non_flood_failure_three_times_with_web_backoff():
+    class Limiter:
+        def __init__(self):
+            self.sleeps = []
+
+        @asynccontextmanager
+        async def acquire(self):
+            yield
+
+        def now(self):
+            return 0.0
+
+        def success(self, _duration):
+            pass
+
+        def flood(self, _seconds, *, premium=False):
+            pass
+
+        async def sleep(self, seconds):
+            self.sleeps.append(seconds)
+
+    class FailsTwice:
+        def __init__(self):
+            self.attempts = 0
+
+        async def send(self, _request):
+            self.attempts += 1
+            if self.attempts < 3:
+                raise RuntimeError("temporary")
+
+    async def scenario():
+        sender, limiter = FailsTwice(), Limiter()
+        async with _PartReader(io.BytesIO(b"x")) as reader:
+            await upload_big_file_parts(sender, limiter, reader, 1, "tail", force_big=True)
+        return sender, limiter
+
+    sender, limiter = run(scenario())
+    assert sender.attempts == 3
+    assert limiter.sleeps == [1, 2]
+
+
+def test_big_primitive_does_not_wrap_final_flood_wait_in_non_flood_retry():
+    from telethon.errors import FloodWaitError
+
+    class Limiter:
+        def __init__(self):
+            self.sleeps = []
+            self.floods = []
+
+        @asynccontextmanager
+        async def acquire(self):
+            yield
+
+        def now(self):
+            return 0.0
+
+        def success(self, _duration):
+            pass
+
+        def flood(self, seconds, *, premium=False):
+            self.floods.append((seconds, premium))
+
+        async def sleep(self, seconds):
+            self.sleeps.append(seconds)
+
+    class AlwaysFloods:
+        def __init__(self):
+            self.attempts = 0
+
+        async def send(self, request):
+            self.attempts += 1
+            raise FloodWaitError(request, capture=1)
+
+    async def scenario():
+        sender, limiter = AlwaysFloods(), Limiter()
+        async with _PartReader(io.BytesIO(b"x")) as reader:
+            with pytest.raises(FloodWaitError):
+                await upload_big_file_parts(sender, limiter, reader, 1, "tail", force_big=True)
+        return sender, limiter
+
+    sender, limiter = run(scenario())
+    assert sender.attempts == MAX_FLOOD_RETRIES + 1
+    assert len(limiter.floods) == MAX_FLOOD_RETRIES
+    assert limiter.sleeps == []
 
 
 def test_send_part_raises_on_missing_sender():

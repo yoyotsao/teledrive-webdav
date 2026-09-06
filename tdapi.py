@@ -31,6 +31,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import requests
 
+from transfer_models import RemotePart
+
 log = logging.getLogger("tdapi")
 
 PAGE_SIZE = 10000
@@ -38,7 +40,7 @@ TIMEOUT = 60
 
 # Bumped whenever the shape stored in meta/dirs/ changes, so an old file is
 # re-listed instead of being read as if it meant the same thing.
-DIR_CACHE_VERSION = 1
+DIR_CACHE_VERSION = 2
 # The backend expires a challenge nonce after 120s (bot_challenge.TTL_SECONDS);
 # give up a shade earlier rather than redeem one it has already pruned.
 CHALLENGE_TTL = 110
@@ -67,6 +69,7 @@ class Entry:
     split_group_id: Optional[str] = None
     file_hash: Optional[str] = None
     has_thumbnail: bool = False
+    telegram_user_id: int = 0
 
     @property
     def real_size(self) -> Optional[int]:
@@ -111,6 +114,41 @@ def _clip_parts(parts: List[Tuple[int, int]], real: Optional[int]) -> List[Tuple
     return out
 
 
+def _clip_remote_parts(parts: Sequence[RemotePart], real: Optional[int]) -> List[RemotePart]:
+    """Apply the existing size clipping rule without dropping routing metadata."""
+    clipped = _clip_parts([(part.message_id, part.size) for part in parts], real)
+    return [
+        RemotePart(part.message_id, size, part.telegram_user_id, part.file_id)
+        for part, (_, size) in zip(parts, clipped)
+    ]
+
+
+def _cached_remote_parts(cached) -> Optional[List[RemotePart]]:
+    """Decode current and historical split-cache rows.
+
+    Earlier cache files held ``[message_id, size]`` only. A containing entry's
+    file ID identifies only part zero, so applying it to every cached part would
+    fabricate immutable Telegram identities. Any incomplete row invalidates the
+    whole cached table and makes the caller refresh authoritative metadata.
+    """
+    parts = []
+    for row in cached:
+        if (
+            not isinstance(row, (list, tuple))
+            or len(row) < 4
+            or row[3] in (None, "")
+        ):
+            return None
+        message_id, size, telegram_user_id, file_id = row[:4]
+        parts.append(RemotePart(
+            int(message_id),
+            int(size),
+            int(telegram_user_id or 0),
+            str(file_id),
+        ))
+    return parts
+
+
 def _parse_time(value) -> float:
     if not value:
         return time.time()
@@ -139,6 +177,7 @@ def _to_entry(row: dict) -> Entry:
         split_group_id=row.get("split_group_id"),
         file_hash=row.get("file_hash"),
         has_thumbnail=bool(row.get("has_thumbnail")),
+        telegram_user_id=int(row.get("telegram_user_id") or 0),
     )
 
 
@@ -214,7 +253,7 @@ class JsonStore:
 class TeleDriveClient:
     def __init__(self, cfg):
         self.cfg = cfg
-        self._session = requests.Session()
+        self._http_local = threading.local()
         self._token: Optional[str] = None
         self._dm_sender = None  # set_dm_sender(); the bot challenge needs a Telegram client
         self._auth_lock = threading.Lock()
@@ -228,6 +267,19 @@ class TeleDriveClient:
         except OSError:
             self._token = None
 
+    def _http_session(self) -> requests.Session:
+        """The requests session owned by this calling thread.
+
+        ``requests.Session`` pools connections but is not safe to share among
+        WsgiDAV's request threads. JWT and login coordination intentionally
+        remain client-wide; only the HTTP transport is thread-local.
+        """
+        session = getattr(self._http_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            self._http_local.session = session
+        return session
+
     # -- auth ------------------------------------------------------------- #
 
     def _post_unauth(self, path: str, payload: dict, *, waiting_ok: bool = False):
@@ -236,7 +288,7 @@ class TeleDriveClient:
 
         Returns None for the backend's 202 "keep polling" when `waiting_ok`.
         """
-        resp = self._session.post(f"{self.cfg.api_base}{path}", json=payload, timeout=TIMEOUT)
+        resp = self._http_session().post(f"{self.cfg.api_base}{path}", json=payload, timeout=TIMEOUT)
         if waiting_ok and resp.status_code == 202:
             return None
         if resp.status_code != 200:
@@ -311,7 +363,7 @@ class TeleDriveClient:
         token = self._token or self.login()
         url = f"{self.cfg.api_base}{path}"
         try:
-            resp = self._session.request(
+            resp = self._http_session().request(
                 method,
                 url,
                 params=params,
@@ -532,8 +584,8 @@ class TeleDriveClient:
 
     # -- split parts ------------------------------------------------------ #
 
-    def parts_for(self, entry: Entry) -> List[Tuple[int, int]]:
-        """``[(message_id, size), ...]`` making up a logical file, in order.
+    def parts_for(self, entry: Entry) -> List[RemotePart]:
+        """Routed Telegram parts making up a logical file, in order.
 
         Sizes are clipped to ``entry.real_size`` so the table never claims bytes
         the Telegram documents do not hold — see ``Entry.real_size``.
@@ -541,32 +593,55 @@ class TeleDriveClient:
         if not (entry.is_split and entry.split_group_id):
             if entry.message_id is None:
                 raise ApiError(404, f"{entry.name} has no Telegram message")
-            return _clip_parts([(entry.message_id, entry.size)], entry.real_size)
+            return _clip_remote_parts(
+                [RemotePart(int(entry.message_id), entry.size, entry.telegram_user_id, entry.file_id)],
+                entry.real_size,
+            )
 
-        cached = self._split_cache.get(entry.split_group_id)
+        cache_key = f"{entry.telegram_user_id}:{entry.file_id}"
+        cached = self._split_cache.get(cache_key)
+        # Old single-account caches were keyed only by split group. They are
+        # safe to reuse only for legacy route zero; a nonzero account must never
+        # inherit bytes cached for another account with the same identifiers.
+        if cached is None and entry.telegram_user_id == 0:
+            cached = self._split_cache.get(entry.split_group_id)
         if cached:
-            return _clip_parts([(int(m), int(s)) for m, s in cached], entry.real_size)
+            cached_parts = _cached_remote_parts(cached)
+            if cached_parts is not None:
+                return _clip_remote_parts(cached_parts, entry.real_size)
 
         data = self._call("GET", f"/files/by-split-group/{entry.split_group_id}")
         rows = sorted(data.get("files") or [], key=lambda r: r.get("part_index") or 0)
-        parts: List[Tuple[int, int]] = []
+        parts: List[RemotePart] = []
         seen = set()
         for row in rows:
             message_id = row.get("telegram_message_id")
+            telegram_user_id = int(row.get("telegram_user_id") or 0)
+            file_id = row.get("file_id")
+            identity = (telegram_user_id, message_id)
             # A genuine split never reuses a message across parts. Collapsing
             # duplicates guards against the historical dedup bug that registered
-            # one message thousands of times.
-            if message_id is None or message_id in seen:
+            # one account-local message thousands of times. The same numeric ID
+            # on another account is a different Telegram message.
+            if message_id is None or not file_id or identity in seen:
                 continue
-            seen.add(message_id)
-            parts.append((int(message_id), int(row.get("filesize") or 0)))
+            seen.add(identity)
+            parts.append(RemotePart(
+                int(message_id),
+                int(row.get("filesize") or 0),
+                telegram_user_id,
+                str(file_id),
+            ))
         if len(seen) != len(rows):
             log.warning("split group %s had %s duplicate part rows", entry.split_group_id, len(rows) - len(seen))
         if not parts:
             raise ApiError(404, f"split group {entry.split_group_id} has no usable parts")
         # Cache the raw table: clipping is cheap and depends on the entry.
-        self._split_cache.put(entry.split_group_id, [[m, s] for m, s in parts])
-        return _clip_parts(parts, entry.real_size)
+        self._split_cache.put(cache_key, [
+            [part.message_id, part.size, part.telegram_user_id, part.file_id]
+            for part in parts
+        ])
+        return _clip_remote_parts(parts, entry.real_size)
 
     def total_size(self, entry: Entry) -> int:
         """Logical size, never larger than the bytes Telegram actually holds.
@@ -581,7 +656,7 @@ class TeleDriveClient:
         if not (entry.is_split and entry.split_group_id):
             available = entry.size
         else:
-            available = sum(size for _, size in self.parts_for(entry))
+            available = sum(part.size for part in self.parts_for(entry))
         real = entry.real_size
         return min(available, real) if real is not None else available
 
@@ -592,6 +667,10 @@ class TeleDriveClient:
 
     def check_hash(self, file_hash: str) -> dict:
         return self._call("GET", "/files/check-hash", params={"hash": file_hash})
+
+    def linked_account_ids(self) -> set[int]:
+        body = self._call("GET", "/accounts")
+        return {int(row["telegram_user_id"]) for row in body.get("accounts", [])}
 
     def create_folder(self, name: str, parent_id: Optional[str] = None) -> Entry:
         data = self._call("POST", "/folders", payload={"name": name, "parent_id": parent_id})
@@ -606,13 +685,14 @@ class TeleDriveClient:
 
     def register(
         self,
-        *,
         filename: str,
         filesize: int,
+        mime_type: Optional[str],
         message_id: int,
         file_id: str,
         access_hash: Optional[str] = None,
-        mime_type: Optional[str] = None,
+        *,
+        telegram_user_id: int = 0,
         parent_id: Optional[str] = None,
         is_split_file: bool = False,
         original_name: Optional[str] = None,
@@ -628,6 +708,7 @@ class TeleDriveClient:
             "mime_type": mime_type,
             "message_id": message_id,
             "file_id": file_id,
+            "telegram_user_id": telegram_user_id,
             "access_hash": access_hash,
             "parent_id": parent_id,
             # The backend's own definition of this field is "a thumbnail is

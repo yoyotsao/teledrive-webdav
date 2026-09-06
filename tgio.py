@@ -20,6 +20,7 @@ import asyncio
 import inspect
 import io
 import logging
+import mimetypes
 import threading
 import time
 from collections import OrderedDict
@@ -27,6 +28,8 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 import tgupload
+from media_thumbnail import PREVIEW_BOX, PREVIEW_MAX_BYTES, capture_thumbnail
+from transfer_models import PreparedAlbumItem, RemotePart, UploadedPart
 
 log = logging.getLogger("tgio")
 
@@ -68,8 +71,6 @@ THUMB_REQUEST_SIZE = 256 * 1024
 # client-supplied document thumbnail only inside tight limits -- Telethon's
 # guidance, matching what the API actually accepts, is a .jpg under 20 kB and
 # 320x320 -- and 320 also covers the cx=256 Explorer asks for.
-PREVIEW_BOX = 320
-PREVIEW_MAX_BYTES = 20 * 1024
 
 # How many preview GetFiles may be in flight at once, across every batch.
 #
@@ -130,15 +131,32 @@ STREAM_BLOCK_SIZE = REQUEST_SIZE * DOWNLOAD_CONNECTIONS * READS_IN_FLIGHT
 # Same split boundary as the browser uploader: MAX_PARTS (1000) x CHUNK_SIZE
 # (512 KB) = 500 MiB, see frontend/src/lib/gramjs.ts:502 and frontend config.ts.
 # Not 512 MiB — that would exceed the browser's 1000-part-per-message ceiling.
-# tgupload.PART_SIZE is now the authoritative part size for segments over
-# tgupload.BIG_FILE_THRESHOLD; UPLOAD_PART_KB only feeds Telethon's own
-# client.upload_file for the small-segment path below.
-UPLOAD_PART_KB = 512
-SEGMENT_SIZE = 1000 * UPLOAD_PART_KB * 1024
+# The sender's message maximum is authoritative, so split planning and wire
+# limits cannot drift apart.
+SEGMENT_SIZE = tgupload.MESSAGE_MAX
 assert SEGMENT_SIZE == tgupload.MAX_PARTS_PER_MESSAGE * tgupload.PART_SIZE
 
 DOC_CACHE_TTL = 45 * 60  # file_reference lives a few hours; refresh well before
 MAX_FLOOD_WAIT = 120
+
+
+class RemoteIdentityError(RuntimeError):
+    """Telegram returned media other than the immutable file we expected."""
+
+
+def _assert_media_id(media, expected_file_id: str) -> None:
+    actual = str(getattr(media, "id", ""))
+    if actual != str(expected_file_id):
+        raise RemoteIdentityError(
+            f"Telegram file mismatch: expected {expected_file_id}, got {actual}"
+        )
+
+
+def read_part(pool, part: RemotePart, offset: int, length: int) -> bytes:
+    """Read one routed part without weakening a nonzero account identity."""
+    return pool.for_read(part.telegram_user_id).worker.read(
+        part.message_id, part.file_id, offset, length
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -150,24 +168,31 @@ MAX_FLOOD_WAIT = 120
 class Part:
     """One Telegram message holding a contiguous slice of a logical file."""
 
-    message_id: int
-    size: int
+    remote: RemotePart
     start: int  # offset of this part's first byte within the logical file
 
+    @property
+    def message_id(self) -> int:
+        return self.remote.message_id
 
-def build_part_table(parts: Sequence[Tuple[int, int]]) -> Tuple[List[Part], int]:
-    """Turn ``[(message_id, size), ...]`` (ordered by part_index) into a table.
+    @property
+    def size(self) -> int:
+        return self.remote.size
+
+
+def build_part_table(parts: Sequence[RemotePart]) -> Tuple[List[Part], int]:
+    """Add logical offsets to routed remote parts ordered by part index.
 
     Returns the table plus the logical total size. Zero-sized parts are dropped:
     they carry no bytes and would only create ambiguous offset boundaries.
     """
     table: List[Part] = []
     offset = 0
-    for message_id, size in parts:
-        if size <= 0:
+    for remote in parts:
+        if remote.size <= 0:
             continue
-        table.append(Part(message_id=message_id, size=size, start=offset))
-        offset += size
+        table.append(Part(remote=remote, start=offset))
+        offset += remote.size
     return table, offset
 
 
@@ -236,6 +261,7 @@ class TelegramWorker:
         connections: int = DOWNLOAD_CONNECTIONS,
         *,
         upload_parts: int = 12,
+        upload_limiter=None,
     ):
         self._api_id = api_id
         self._api_hash = api_hash
@@ -247,13 +273,14 @@ class TelegramWorker:
         self._ready = threading.Event()
         self._client = None
         self._me = None
-        self._docs = {}  # message_id -> (document, fetched_at)
+        self._docs = {}  # (message_id, expected_file_id) -> (media, fetched_at)
         self._docs_lock = threading.Lock()
         self._pool: Optional[list] = None
         self._pool_lock: Optional[asyncio.Lock] = None
         self._rr = 0  # round-robin cursor over the pool, see _next_client
         self._upload = None  # dedicated client for part sends, see _upload_client
-        self._gate: Optional[tgupload.UploadGate] = None
+        self._upload_limiter = upload_limiter
+        self._gate = upload_limiter
         self._thumb_gate: Optional[asyncio.Semaphore] = None  # see THUMB_CONCURRENCY
 
     # -- lifecycle -------------------------------------------------------- #
@@ -264,14 +291,23 @@ class TelegramWorker:
         self._thread = threading.Thread(target=self._run_loop, name="tg-loop", daemon=True)
         self._thread.start()
         self._ready.wait()
-        self.run(self._connect())
+        try:
+            self.run(self._connect())
+        except Exception:
+            # A bad or expired session must not leave a live loop behind, and
+            # the worker must remain retryable after configuration is fixed.
+            self.stop()
+            raise
         log.info("Telegram connected as %s (id=%s)", getattr(self._me, "username", None), getattr(self._me, "id", None))
 
     def _run_loop(self) -> None:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
         self._ready.set()
-        self._loop.run_forever()
+        try:
+            self._loop.run_forever()
+        finally:
+            self._loop.close()
 
     async def _connect(self) -> None:
         # Constructed on the loop thread so Telethon binds to the right loop.
@@ -330,7 +366,13 @@ class TelegramWorker:
             from telethon import TelegramClient
             from telethon.sessions import StringSession
 
-            client = TelegramClient(StringSession(self._session), self._api_id, self._api_hash)
+            # Surface every upload/message flood to the account limiters.
+            # Telethon's default short-wait retry would bypass their feedback
+            # and admission when send_file creates a message.
+            client = TelegramClient(
+                StringSession(self._session), self._api_id, self._api_hash,
+                flood_sleep_threshold=0,
+            )
             await client.connect()
             log.info("upload connection ready")
             self._upload = client
@@ -341,14 +383,35 @@ class TelegramWorker:
             self._gate = tgupload.UploadGate(self._upload_parts)
         return self._gate
 
+    def set_upload_limiter(self, limiter) -> None:
+        """Bind the AccountRuntime-owned limiter before this worker starts."""
+        if self._gate is not None and self._gate is not limiter:
+            raise RuntimeError("upload limiter cannot change after upload admission starts")
+        self._upload_limiter = limiter
+        self._gate = limiter
+
     def stop(self) -> None:
-        if self._loop is None:
+        loop = self._loop
+        thread = self._thread
+        if loop is None:
             return
         try:
             self.run(self._disconnect_all(), timeout=15)
         except Exception:  # pragma: no cover - best effort on shutdown
             pass
-        self._loop.call_soon_threadsafe(self._loop.stop)
+        loop.call_soon_threadsafe(loop.stop)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=15)
+        self._loop = None
+        self._thread = None
+        self._ready.clear()
+        self._client = None
+        self._me = None
+        self._pool = None
+        self._pool_lock = None
+        self._upload = None
+        self._gate = self._upload_limiter
+        self._thumb_gate = None
 
     async def _disconnect_all(self) -> None:
         clients = list(self._pool or [self._client])
@@ -384,15 +447,17 @@ class TelegramWorker:
 
     # -- documents -------------------------------------------------------- #
 
-    def get_document(self, message_id: int, refresh: bool = False):
+    def get_document(self, message_id: int, expected_file_id: str, refresh: bool = False):
         """Resolve a message id to its Document, with a TTL cache.
 
         ``file_reference`` inside the Document expires after a few hours, so both
         the TTL and the explicit ``refresh`` path exist to re-fetch it.
         """
-        return self.run(self._document(message_id, refresh))
+        return self.run(self._document(message_id, expected_file_id, refresh))
 
-    async def _document(self, message_id: int, refresh: bool = False):
+    async def _document(
+        self, message_id: int, expected_file_id: str, refresh: bool = False
+    ):
         """Async half of get_document, so batch paths can await it directly.
 
         Calling get_document from a coroutine already on the client loop would
@@ -400,14 +465,16 @@ class TelegramWorker:
         loop comes through here instead.
         """
         now = time.monotonic()
+        key = (int(message_id), str(expected_file_id))
         if not refresh:
             with self._docs_lock:
-                hit = self._docs.get(message_id)
+                hit = self._docs.get(key)
             if hit and now - hit[1] < DOC_CACHE_TTL:
                 return hit[0]
         doc = await self._fetch_document(message_id)
+        _assert_media_id(doc, expected_file_id)
         with self._docs_lock:
-            self._docs[message_id] = (doc, now)
+            self._docs[key] = (doc, now)
         return doc
 
     async def _fetch_document(self, message_id: int):
@@ -429,23 +496,23 @@ class TelegramWorker:
 
     # -- thumbnails ------------------------------------------------------- #
 
-    def thumbnails(self, message_ids: Sequence[int]) -> dict:
-        """``{message_id: jpeg_bytes}`` for whichever messages have a thumbnail.
+    def thumbnails(self, parts: Sequence[RemotePart]) -> dict:
+        """``{(message_id, file_id): jpeg}`` for routed media with a thumbnail.
 
         Telegram already stores a small preview beside every photo and video, so
         listing a folder of previews costs a few KB per file instead of the whole
         image — measured on one pixiv folder, 120.9 MB of originals against 52 KB
         of thumbnails. Ids without a usable thumbnail are simply absent.
         """
-        ids = list(dict.fromkeys(int(m) for m in message_ids))
-        if not ids:
+        unique = list({(p.message_id, str(p.file_id)): p for p in parts}.values())
+        if not unique:
             return {}
-        return self.run(self._thumbnails(ids))
+        return self.run(self._thumbnails(unique))
 
-    async def _thumbnails(self, message_ids: List[int]) -> dict:
+    async def _thumbnails(self, parts: List[RemotePart]) -> dict:
         # One get_messages covers the whole batch; asking per file turned a
         # 30-file listing into 30 round trips.
-        await self._prefetch_documents(message_ids)
+        await self._prefetch_documents(parts)
 
         # Created here rather than in __init__ so it binds to the client loop,
         # and shared across batches: a folder prefetch and a foreground request
@@ -454,20 +521,21 @@ class TelegramWorker:
             self._thumb_gate = asyncio.Semaphore(THUMB_CONCURRENCY)
         gate = self._thumb_gate
 
-        async def one(message_id):
+        async def one(part: RemotePart):
+            key = (part.message_id, str(part.file_id))
             try:
-                doc = await self._document(message_id)
+                doc = await self._document(part.message_id, part.file_id)
                 async with gate:
-                    return message_id, await self._thumbnail_bytes(doc)
+                    return key, await self._thumbnail_bytes(doc)
             except Exception as exc:
-                log.warning("thumbnail for message %s failed: %s", message_id, exc)
-                return message_id, None
+                log.warning("thumbnail for message %s failed: %s", part.message_id, exc)
+                return key, None
 
-        pairs = await asyncio.gather(*[one(m) for m in message_ids])
-        return {message_id: data for message_id, data in pairs if data}
+        pairs = await asyncio.gather(*[one(part) for part in parts])
+        return {key: data for key, data in pairs if data}
 
-    def media_info(self, message_ids: Sequence[int]) -> dict:
-        """``{message_id: {...}}`` describing each message's media.
+    def media_info(self, parts: Sequence[RemotePart]) -> dict:
+        """``{(message_id, file_id): {...}}`` describing routed media.
 
         Pixel dimensions and duration ride along in the document's attributes, so
         this costs one ``get_messages`` per hundred files and downloads nothing.
@@ -475,46 +543,61 @@ class TelegramWorker:
         out its size (measured, 258 KB of a 2 MB JPEG), and those reads are what
         make a folder crawl.
         """
-        ids = list(dict.fromkeys(int(m) for m in message_ids))
-        if not ids:
+        unique = list({(p.message_id, str(p.file_id)): p for p in parts}.values())
+        if not unique:
             return {}
-        return self.run(self._media_info(ids))
+        return self.run(self._media_info(unique))
 
-    async def _media_info(self, message_ids: List[int]) -> dict:
-        await self._prefetch_documents(message_ids)
+    async def _media_info(self, parts: List[RemotePart]) -> dict:
+        await self._prefetch_documents(parts)
         out = {}
-        for message_id in message_ids:
+        for part in parts:
+            key = (part.message_id, str(part.file_id))
             try:
-                doc = await self._document(message_id)
+                doc = await self._document(part.message_id, part.file_id)
             except Exception as exc:
-                log.warning("media info for message %s failed: %s", message_id, exc)
+                log.warning("media info for message %s failed: %s", part.message_id, exc)
                 continue
             # Recorded even when empty. An entry here means "the document was
             # read and it has nothing to report", which is a cacheable answer;
             # dropping it would make a file with no dimensions look uncached
             # forever, and the whole-tree warm-up would ask about it on every
             # pass. A lookup that actually failed raises above and stays absent.
-            out[message_id] = _media_attributes(doc)
+            out[key] = _media_attributes(doc)
         return out
 
-    async def _prefetch_documents(self, message_ids: List[int]) -> None:
+    async def _prefetch_documents(self, parts: List[RemotePart]) -> None:
         now = time.monotonic()
         with self._docs_lock:
             wanted = [
-                m for m in message_ids
-                if not (self._docs.get(m) and now - self._docs[m][1] < DOC_CACHE_TTL)
+                part for part in parts
+                if not (
+                    self._docs.get((part.message_id, str(part.file_id)))
+                    and now - self._docs[(part.message_id, str(part.file_id))][1]
+                    < DOC_CACHE_TTL
+                )
             ]
         for batch in (wanted[i : i + 100] for i in range(0, len(wanted), 100)):
             try:
-                messages = await self._client.get_messages("me", ids=batch)
+                messages = await self._client.get_messages(
+                    "me", ids=list(dict.fromkeys(part.message_id for part in batch))
+                )
             except Exception as exc:
                 log.warning("batch document fetch failed (%s ids): %s", len(batch), exc)
                 return  # per-file lookups below still work, just slower
+            by_message = {
+                msg.id: _message_media(msg) for msg in messages or [] if msg is not None
+            }
             with self._docs_lock:
-                for msg in messages or []:
-                    media = _message_media(msg)
-                    if media is not None:
-                        self._docs[msg.id] = (media, now)
+                for part in batch:
+                    media = by_message.get(part.message_id)
+                    if media is None:
+                        continue
+                    try:
+                        _assert_media_id(media, part.file_id)
+                    except RemoteIdentityError:
+                        continue
+                    self._docs[(part.message_id, str(part.file_id))] = (media, now)
 
     async def _thumbnail_bytes(self, doc) -> Optional[bytes]:
         """One preview, fetched over the pool rather than the control client.
@@ -579,24 +662,26 @@ class TelegramWorker:
                 log.warning("preview retry %s after %ss: %s", attempt, wait, exc)
                 await asyncio.sleep(wait + 1)
 
-    def invalidate_document(self, message_id: int) -> None:
+    def invalidate_document(self, message_id: int, expected_file_id: str) -> None:
         with self._docs_lock:
-            self._docs.pop(message_id, None)
+            self._docs.pop((int(message_id), str(expected_file_id)), None)
 
     # -- reading ---------------------------------------------------------- #
 
-    def read(self, message_id: int, offset: int, length: int) -> bytes:
+    def read(
+        self, message_id: int, expected_file_id: str, offset: int, length: int
+    ) -> bytes:
         """Read ``length`` bytes at ``offset`` from one message's document."""
         if length <= 0:
             return b""
-        doc = self.get_document(message_id)
+        doc = self.get_document(message_id, expected_file_id)
         try:
             return self.run(self._read(doc, offset, length))
         except Exception as exc:
             if not _is_file_reference_error(exc):
                 raise
             log.warning("file_reference expired for message %s — refetching", message_id)
-            doc = self.get_document(message_id, refresh=True)
+            doc = self.get_document(message_id, expected_file_id, refresh=True)
             return self.run(self._read(doc, offset, length))
 
     async def _read(self, doc, offset: int, length: int) -> bytes:
@@ -711,7 +796,7 @@ class TelegramWorker:
 
     # -- uploading -------------------------------------------------------- #
 
-    def upload_segment(self, stream, size: int, file_name: str, progress=None, preview=None) -> dict:
+    def upload_segment(self, stream, size: int, file_name: str, progress=None, preview=None, *, force_big=None) -> dict:
         """Upload one segment as a single Telegram document message.
 
         ``stream`` is a binary file object positioned at the segment start and
@@ -725,111 +810,239 @@ class TelegramWorker:
         image; a zip or one part of a split file has no preview to give.
         """
         return self.run(
-            self._upload_segment(stream, size, file_name, progress, preview), timeout=None
+            self._upload_segment(stream, size, file_name, progress, preview, force_big), timeout=None
         )
 
-    async def _upload_segment(self, stream, size: int, file_name: str, progress, preview=None) -> dict:
+    async def _upload_segment(self, stream, size: int, file_name: str, progress, preview=None, force_big=None) -> dict:
+        handle = await self._prepare_segment(stream, size, file_name, progress, force_big)
+        return await self._send_uploaded_segment(handle, size, file_name, preview)
+
+    def prepare_segment(self, stream, size: int, file_name: str, progress=None, *, force_big=None):
+        """Upload bytes without sending a message or retaining a file lease."""
+        return self.run(self._prepare_segment(stream, size, file_name, progress, force_big), timeout=None)
+
+    async def _prepare_segment(self, stream, size, file_name, progress=None, force_big=None):
+        decision = tgupload.decide_protocol(size, album_eligible=False)
+        if force_big is None:
+            force_big = bool(getattr(stream, "force_big", False))
+        client = await self._upload_client()
+        async with tgupload._PartReader(stream) as reader:
+            if force_big or decision.force_big:
+                handle = await tgupload.upload_big_file_parts(
+                    client, self._upload_gate(), reader, size, file_name,
+                    force_big=True, progress=progress,
+                )
+            else:
+                handle = await tgupload.upload_small_file_parts(
+                    client, self._upload_gate(), reader, size, file_name, progress=progress,
+                )
+        return handle
+
+    def prepare_thumbnail(self, preview):
+        """Upload a JPEG through this account's chunk limiter before message send."""
+        return self.run(self._prepare_thumbnail(preview), timeout=None)
+
+    async def _prepare_thumbnail(self, preview):
+        import io
+        from pathlib import Path
+
+        source, width, height = preview
+        data = source if isinstance(source, bytes) else Path(source).read_bytes()
+        client = await self._upload_client()
+        async with tgupload._PartReader(io.BytesIO(data)) as reader:
+            handle = await tgupload.upload_small_file_parts(
+                client, self._upload_gate(), reader, len(data), "thumbnail.jpg",
+            )
+        return handle, width, height
+
+    def prepare_album_item(self, source, size, file_name, mime_type, preview=None, *, message_limiter=None):
+        """Prepare a document on this account while the caller owns a file lease."""
+        return self.run(self._prepare_album_item(
+            source, size, file_name, mime_type, preview, message_limiter=message_limiter,
+        ), timeout=None)
+
+    async def _prepare_album_file(self, stream, size, file_name):
+        """Albums use 512 KiB SaveFilePart, including optional thumbnail bytes."""
+        import hashlib
+        from telethon.tl.functions.upload import SaveFilePartRequest
+        from telethon.tl.types import InputFile
+
+        if not 0 < size <= tgupload.SMALL_FILE_MAX:
+            raise ValueError("album upload size must be between 1 byte and 10 MiB")
+        client = await self._upload_client()
+        async with tgupload._PartReader(stream) as reader:
+            file_id, total, payloads = await tgupload._upload_parts(
+                client, self._upload_gate(), reader, size,
+                parts=[(offset, min(REQUEST_SIZE, size - offset))
+                       for offset in range(0, size, REQUEST_SIZE)],
+                request_factory=lambda file_id, index, _total, data: SaveFilePartRequest(file_id, index, data),
+                workers=4, progress=None, collect_payloads=True,
+            )
+        return InputFile(file_id, total, file_name, hashlib.md5(b"".join(payloads)).hexdigest())
+
+    async def _prepare_album_item(self, source, size, file_name, mime_type, preview=None, *, message_limiter=None):
+        from pathlib import Path
+        from config import ext_path
+        from telethon.tl.functions.messages import UploadMediaRequest
+        from telethon.tl.types import (
+            DocumentAttributeFilename, DocumentAttributeImageSize,
+            InputMediaUploadedDocument, InputPeerSelf,
+        )
+
+        with open(ext_path(source), "rb") as stream:
+            handle = await self._prepare_album_file(stream, size, file_name)
+        attributes = [DocumentAttributeFilename(file_name)]
+        thumb = None
+        if preview is not None:
+            thumbnail, width, height = preview
+            data = thumbnail if isinstance(thumbnail, bytes) else Path(thumbnail).read_bytes()
+            thumb = await self._prepare_album_file(io.BytesIO(data), len(data), "thumbnail.jpg")
+            attributes.append(DocumentAttributeImageSize(width, height))
+        request = UploadMediaRequest(InputPeerSelf(), InputMediaUploadedDocument(
+            file=handle, mime_type=mime_type, attributes=attributes, thumb=thumb,
+        ))
+        media = await self._album_rpc(request, message_limiter)
+        document = getattr(media, "document", None)
+        if document is None:
+            raise RemoteIdentityError("album preparation returned no document")
+        return PreparedAlbumItem(
+            source=Path(source), upload_name=file_name, mime_type=mime_type, size=size,
+            telegram_user_id=int(self.user_id), document_id=str(document.id),
+            access_hash=str(document.access_hash), has_thumbnail=thumb is not None,
+            file_reference=document.file_reference,
+        )
+
+    async def _album_rpc(self, request, message_limiter):
+        client = await self._upload_client()
+        for attempt in range(3):
+            if message_limiter is not None:
+                await message_limiter.acquire()
+            try:
+                return await client(request)
+            except Exception as exc:
+                wait = _flood_seconds(exc)
+                if wait is None or message_limiter is None:
+                    raise
+                message_limiter.flood(wait)
+                if attempt == 2:
+                    raise
+
+    def send_album(self, items, timeout=60, *, message_limiter=None):
+        """Send one account's prepared items and match exact document identities."""
+        return self.run(self._send_album(items, timeout, message_limiter=message_limiter), timeout=None)
+
+    async def _send_album(self, items, timeout=60, *, message_limiter=None):
+        from telethon import helpers
+        from telethon.tl.functions.messages import SendMultiMediaRequest
+        from telethon.tl.types import InputDocument, InputMediaDocument, InputPeerSelf, InputSingleMedia
+
+        if not 1 <= len(items) <= 10:
+            raise ValueError("an album must contain between one and ten items")
+        if any(item.telegram_user_id != int(self.user_id) for item in items):
+            raise ValueError("an album cannot mix Telegram accounts")
+        if len({item.document_id for item in items}) != len(items):
+            raise RemoteIdentityError("album preparation returned duplicate document IDs")
+        request = SendMultiMediaRequest(InputPeerSelf(), [InputSingleMedia(
+            media=InputMediaDocument(InputDocument(int(item.document_id), int(item.access_hash), item.file_reference)),
+            random_id=helpers.generate_random_long(), message="",
+        ) for item in items])
+        response = await asyncio.wait_for(self._album_rpc(request, message_limiter), timeout=timeout)
+        by_document = {}
+        for update in response.updates:
+            message = getattr(update, "message", None)
+            document = getattr(getattr(message, "media", None), "document", None)
+            if document is not None:
+                key = str(document.id)
+                if key in by_document:
+                    raise RemoteIdentityError("album returned duplicate document IDs")
+                by_document[key] = message
+        parts = []
+        for item in items:
+            message = by_document.get(str(item.document_id))
+            if message is None:
+                raise RemoteIdentityError(f"album returned no message for document {item.document_id}")
+            document = message.media.document
+            parts.append(UploadedPart(
+                index=0, message_id=int(message.id), file_id=str(document.id),
+                access_hash=str(document.access_hash), size=item.size,
+                telegram_user_id=item.telegram_user_id, has_thumbnail=item.has_thumbnail,
+            ))
+        return parts
+
+    def prepare_album_fallback(self, stream, size, file_name):
+        """Reread fallback bytes using exactly one ordinary small-upload worker."""
+        return self.run(self._prepare_album_fallback(stream, size, file_name), timeout=None)
+
+    async def _prepare_album_fallback(self, stream, size, file_name):
+        client = await self._upload_client()
+        async with tgupload._PartReader(stream) as reader:
+            return await tgupload.upload_small_file_parts(
+                client, self._upload_gate(), reader, size, file_name, workers=1,
+            )
+
+    def send_uploaded_segment(self, handle, size, file_name, preview=None, *, mime_type=None, message_limiter=None):
+        """Send an already uploaded document on the account's event loop."""
+        return self.run(self._send_uploaded_segment(
+            handle, size, file_name, preview, mime_type=mime_type, message_limiter=message_limiter,
+        ), timeout=None)
+
+    async def _send_uploaded_segment(self, handle, size, file_name, preview=None, *, mime_type=None, message_limiter=None):
         from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeImageSize
 
-        if size <= tgupload.BIG_FILE_THRESHOLD:
-            # A handful of parts at most: parallelism buys nothing over one
-            # round trip per part, and Telethon's own MD5-verified small-file
-            # path is worth leaving untouched.
-            client = self._client
-            handle = await client.upload_file(
-                stream,
-                file_size=size,
-                file_name=file_name,
-                part_size_kb=UPLOAD_PART_KB,
-                progress_callback=progress,
-            )
-        else:
-            client = await self._upload_client()
-            async with tgupload._PartReader(stream) as reader:
-                handle = await tgupload.upload_file_parts(
-                    client=client,
-                    gate=self._upload_gate(),
-                    reader=reader,
-                    size=size,
-                    file_name=file_name,
-                    progress=progress,
-                )
-
+        client = await self._upload_client()
         attributes = [DocumentAttributeFilename(file_name)]
         thumb = None
         if preview is not None:
             thumb, width, height = preview
-            # Both, or neither: Telegram drops a document thumbnail when the
-            # document does not also declare its size. And ``thumb`` has to be a
-            # path to a real .jpg — Telethon uploads it by name and Telegram
-            # ignores anything that does not look like a JPEG file.
+            # Telegram needs image dimensions alongside the thumbnail. The
+            # engine supplies a pre-uploaded JPEG handle; legacy callers may
+            # still supply a .jpg path for Telethon to upload.
             attributes.append(DocumentAttributeImageSize(width, height))
-        msg = await client.send_file(
-            "me",
-            handle,
-            force_document=True,
-            attributes=attributes,
-            thumb=thumb,
-        )
+        options = {"mime_type": mime_type} if mime_type else {}
+        for attempt in range(3):
+            if message_limiter is not None:
+                await message_limiter.acquire()
+            try:
+                msg = await client.send_file(
+                    "me", handle, force_document=True, attributes=attributes,
+                    thumb=thumb, **options,
+                )
+                break
+            except Exception as exc:
+                wait = _flood_seconds(exc)
+                if wait is None or message_limiter is None:
+                    raise
+                message_limiter.flood(wait)
+                if attempt == 2:
+                    raise
         doc = msg.document
         if doc is None:
-            raise RuntimeError("Telegram accepted the upload but returned no document")
+            raise RemoteIdentityError("Telegram accepted the upload but returned no document")
         return {
             "message_id": msg.id,
             "file_id": str(doc.id),
             "access_hash": str(doc.access_hash),
-            "size": size,
+            "size": getattr(doc, "size", size),
         }
 
 
-def make_preview(path) -> Optional[Tuple[bytes, int, int]]:
-    """A JPEG preview and the true pixel size of the still image at ``path``.
+def make_preview(
+    path, mime_type: str = "", ffmpeg: Optional[str] = None
+) -> Optional[Tuple[bytes, int, int]]:
+    """Adapt classified media thumbnails to Telethon's document-thumb tuple.
 
-    Everything uploaded through H: used to reach Telegram as a bare document
-    carrying nothing but a filename, so ``doc.thumbs`` was empty and there was
-    no ``DocumentAttributeImageSize``. That loses both halves of this project's
-    browsing story for its own uploads: ``/rpc/thumb`` answers 404,
-    ``/rpc/props`` answers ``{}``, and the shell handler -- which cannot tell
-    "no preview" from "fetch failed" -- delegates to the built-in handler,
-    which reads the whole image back down from Telegram to draw one icon. So a
-    folder of freshly uploaded photos behaves exactly like a folder this project
-    was never installed for.
-
-    Both halves are produced here together because Telegram wants them
-    together: it discards a document thumbnail when the document does not also
-    declare its dimensions.
-
-    Returns None for anything that is not a decodable still image -- a /game
-    zip, a split part, a video, a truncated file, or a machine without Pillow.
-    A preview is a nicety; it must never be the reason an upload fails.
+    ``not_media`` and ``undecodable`` files deliberately upload without a
+    preview. A ``ThumbnailError`` is allowed to propagate: it means a decoder
+    accepted media but failed to produce a usable frame, which must not be
+    silently registered as an ordinary no-thumbnail upload.
     """
-    try:
-        from PIL import Image, ImageOps
-    except ImportError:  # pragma: no cover - depends on the environment
-        log.warning("Pillow is not installed — uploads will have no preview")
+    mime = mime_type or mimetypes.guess_type(str(path))[0] or ""
+    result = capture_thumbnail(path, mime, ffmpeg)
+    if result.kind != "ready":
+        if result.error:
+            log.info("no preview for %s: %s", getattr(path, "name", path), result.error)
         return None
-    try:
-        with Image.open(path) as src:
-            width, height = src.size
-            # EXIF orientation is what a viewer shows, so it is also what the
-            # dimensions have to say; read it before draft()/transpose change
-            # the size out from under us.
-            if (src.getexif() or {}).get(274, 1) in (5, 6, 7, 8):
-                width, height = height, width
-            # JPEG can decode straight to roughly the size we want, which is
-            # most of the cost of this function on a 20 MB photo.
-            src.draft("RGB", (PREVIEW_BOX, PREVIEW_BOX))
-            img = ImageOps.exif_transpose(src) or src
-            img = img.convert("RGB")  # a PNG with alpha cannot be saved as JPEG
-            img.thumbnail((PREVIEW_BOX, PREVIEW_BOX), Image.LANCZOS)
-            for quality in (75, 60, 45):
-                buf = io.BytesIO()
-                img.save(buf, "JPEG", quality=quality, optimize=True)
-                if buf.tell() <= PREVIEW_MAX_BYTES or quality == 45:
-                    return buf.getvalue(), width, height
-    except Exception as exc:
-        log.info("no preview for %s: %s", getattr(path, "name", path), exc)
-    return None
+    return result.jpeg, result.width, result.height
 
 
 def _media_attributes(doc) -> dict:
@@ -1082,8 +1295,8 @@ class SeekableRemoteFile(io.RawIOBase):
 
     def __init__(
         self,
-        reader,
-        parts: Sequence[Tuple[int, int]],
+        pool,
+        parts: Sequence[RemotePart],
         *,
         name: str = "",
         head: bytes = b"",
@@ -1091,7 +1304,7 @@ class SeekableRemoteFile(io.RawIOBase):
         blocks_cached: int = BLOCKS_CACHED,
     ):
         super().__init__()
-        self._reader = reader
+        self._pool = pool
         self._table, self._total = build_part_table(parts)
         self._name = name
         # Bytes from the start of the file that the caller already has on disk.
@@ -1237,7 +1450,7 @@ class SeekableRemoteFile(io.RawIOBase):
         out = bytearray()
         for index, inner, nbytes in map_range(self._table, self._total, offset, length):
             part = self._table[index]
-            out += self._reader.read(part.message_id, inner, nbytes)
+            out += read_part(self._pool, part.remote, inner, nbytes)
         return bytes(out)
 
 
@@ -1324,13 +1537,14 @@ class SegmentReader(io.RawIOBase):
     loop.
     """
 
-    def __init__(self, path, start: int, size: int):
+    def __init__(self, path, start: int, size: int, *, force_big: bool = False):
         super().__init__()
         self._fh = open(path, "rb")
         self._fh.seek(start)
         self._start = start
         self._size = size
         self._pos = 0
+        self.force_big = bool(force_big)
 
     def readable(self) -> bool:
         return True

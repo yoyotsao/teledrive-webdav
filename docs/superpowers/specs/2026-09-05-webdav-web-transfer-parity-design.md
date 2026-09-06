@@ -1,7 +1,7 @@
 # WebDAV / Web transfer parity design
 
 **Date:** 2026-09-05  
-**Status:** Approved
+**Status:** Implemented (2026-09-06; offline suite green, no live TeleDrive run — see CLAUDE.md's manual checklist items 8 and 9)
 **Source analysis:** `UPLOAD_DOWNLOAD_COMPARISON.md`
 
 ## Goal

@@ -24,15 +24,15 @@ import shutil
 import tempfile
 import threading
 import time
-import uuid
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from config import ext_path as _ext
-from tgio import SEGMENT_SIZE, SegmentReader, make_preview, plan_segments
-from upload_engine import UploadedPart, assert_parts_cover_file, canonical_existing_parts
+from tgio import make_preview
+from transfer_models import TransferRequest
+from upload_engine import guess_mime_type
 
 log = logging.getLogger("gamestage")
 
@@ -45,13 +45,11 @@ TICK_SECONDS = 15
 RETRY_SECONDS = 600
 MAX_ATTEMPTS = 5
 
-# One segment failing outright (a part permanently exhausted its retries)
-# shouldn't cost a whole unit retry — that re-packs the archive from scratch
-# and re-uploads every already-committed segment. A couple of quick retries
-# with a fresh upload (fresh file_id, since tgio/tgupload generate one per
-# call) rides out the common transient case instead.
-SEGMENT_RETRIES = 2
-SEGMENT_RETRY_SECONDS = 30
+# A transient failure used to be retried here, a whole segment at a time, so
+# that one bad part did not cost a re-pack of a 60 GB tree. That now happens
+# one level down and far more cheaply: tgupload.send_part retries each 512 KiB
+# part three times before giving up, so the only retry left at this level is
+# the unit's own, ten minutes later.
 ZIP_MIME = "application/zip"
 
 
@@ -83,10 +81,10 @@ class Unit:
 
 
 class GameStager:
-    def __init__(self, cfg, api, worker):
+    def __init__(self, cfg, api, engine):
         self.cfg = cfg
         self.api = api
-        self.worker = worker
+        self.engine = engine
         self._units: Dict[str, Unit] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -267,9 +265,9 @@ class GameStager:
         packed: Optional[Path] = None
         try:
             log.info("packing %s", top)
-            packed, upload_name, temporary = self._pack(top, source)
+            packed, upload_name, temporary, archived = self._pack(top, source)
             self._set_state(top, "uploading")
-            self._upload_and_register(packed, upload_name)
+            self._upload_and_register(packed, upload_name, archived=archived)
             self._set_state(top, "done")
             log.info("uploaded %s — clearing staging", upload_name)
             shutil.rmtree(_ext(source), ignore_errors=True)
@@ -306,10 +304,16 @@ class GameStager:
     # -- packing ---------------------------------------------------------- #
 
     def _pack(self, top: str, source: Path):
-        """Return ``(archive_path, upload_name, is_temporary)``."""
+        """Return ``(archive_path, upload_name, is_temporary, is_archive)``.
+
+        ``is_archive`` is whether *this* code made the zip, which is not the
+        same question as whether the name ends in ``.zip``: a user who drops
+        their own archive in gets it uploaded verbatim, and a user who drops a
+        photo in must keep ``image/jpeg`` or lose its preview on both clients.
+        """
         if source.is_file():
             # Already a single file — upload verbatim.
-            return source, source.name, False
+            return source, source.name, False, False
 
         target = self.cfg.pack_dir / f"{top}.zip"
         if target.exists():
@@ -319,7 +323,7 @@ class GameStager:
                 # see the exception handler there) — reuse it instead of
                 # re-zipping a potentially 60 GB tree.
                 log.info("reusing existing pack %s from a previous attempt", target.name)
-                return target, f"{top}.zip", True
+                return target, f"{top}.zip", True, True
             target.unlink()
         root = _ext(source)
         count = 0
@@ -341,115 +345,37 @@ class GameStager:
                     except OSError as exc:
                         raise OSError(f"cannot read {full}: {exc}") from exc
         log.info("packed %s files into %s (%.1f GiB)", count, target.name, target.stat().st_size / 2**30)
-        return target, f"{top}.zip", True
+        return target, f"{top}.zip", True, True
 
     # -- uploading -------------------------------------------------------- #
 
-    def _upload_and_register(self, archive: Path, upload_name: str) -> None:
+    def _upload_and_register(self, archive: Path, upload_name: str, *, archived: bool) -> None:
+        """Hand the finished archive to the one engine every write shares.
+
+        Dedup, protocol choice, account routing and registration all live
+        there; the only thing /game knows that the engine does not is that a
+        zip it built itself is not media -- no preview to attach, and nothing
+        to group into an album with the next one.
+        """
         game = self.api.ensure_folder(self.cfg.game_folder)
-        upload_and_register(self.api, self.worker, archive, upload_name, game.file_id, ZIP_MIME)
-
-
-# -- uploading (shared with uploadstage.py's generic, non-/game writes) --- #
-
-
-def upload_and_register(
-    api, worker, archive: Path, upload_name: str, parent_id: Optional[str], mime_type: str
-) -> None:
-    """Upload one already-local file to Telegram and register it in TeleDrive.
-
-    Dedups against ``check_hash`` first, same fingerprint the browser uses, so
-    content already on Telegram is registered without a second upload.
-    """
-    size = archive.stat().st_size
-    if size == 0:
-        # Telegram rejects a 0-part file with an opaque RPC error; fail
-        # fast and readably instead of reaching that path.
-        raise ValueError(f"{upload_name} is empty (0 bytes) — nothing to upload")
-    file_hash = sample_hash(archive)
-
-    existing = _lookup_duplicate(api, file_hash, size)
-    if existing:
-        log.info("%s already on Telegram (%s parts) — registering without uploading", upload_name, len(existing))
-        parts = existing
-    else:
-        parts = [
-            UploadedPart(
-                index=index,
-                message_id=int(part["message_id"]),
-                file_id=str(part.get("file_id") or ""),
-                access_hash=part.get("access_hash"),
-                size=int(part["filesize"]),
-                # The legacy worker is the primary account. Routed uploads
-                # provide their explicit storage account through the engine.
-                telegram_user_id=int(part.get("telegram_user_id") or 0),
-                has_thumbnail=bool(part.get("has_thumbnail")),
-            )
-            for index, part in enumerate(_upload_segments(worker, archive, size, upload_name, mime_type))
-        ]
-    assert_parts_cover_file(parts, size)
-
-    split_group_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:7]}"
-    total = len(parts)
-    for index, part in enumerate(parts):
-        api.register(
-            filename=upload_name,
-            filesize=part.size,
-            message_id=part.message_id,
-            file_id=part.file_id or f"{split_group_id}-{index}",
-            access_hash=part.access_hash,
+        mime_type = ZIP_MIME if archived else guess_mime_type(upload_name)
+        request = TransferRequest(
+            source=archive,
+            upload_name=upload_name,
             mime_type=mime_type,
-            parent_id=parent_id,
-            is_split_file=total > 1,
-            original_name=upload_name,
-            part_index=index,
-            total_parts=total,
-            split_group_id=split_group_id,
-            file_hash=file_hash,
-            has_thumbnail=part.has_thumbnail,
+            parent_id=game.file_id,
+            logical_size=archive.stat().st_size,
+            allow_album=not archived,
         )
-    api.invalidate(parent_id)
+        self.engine.register_result(self.engine.transfer(request))
 
 
-def _lookup_duplicate(api, file_hash: str, original_size: int) -> List[UploadedPart]:
-    try:
-        result = api.check_hash(file_hash)
-    except Exception as exc:
-        log.warning("dedup check failed (%s) — uploading anyway", exc)
-        return []
-    if not result or not result.get("found"):
-        return []
-    return canonical_existing_parts(result.get("files") or [], original_size)
-
-
-def _upload_segments(
-    worker, archive: Path, size: int, upload_name: str, mime_type: str = ""
-) -> List[dict]:
-    segments = plan_segments(size, SEGMENT_SIZE)
-    # Only a whole still image gets a preview. One part of a split file is not
-    # an image, and neither is a /game zip.
-    single_image = len(segments) == 1 and mime_type.startswith("image/")
-    with _preview_file(archive if single_image else None) as preview:
-        parts: List[dict] = []
-        for index, (offset, seg_size) in enumerate(segments):
-            name = upload_name if len(segments) == 1 else f"{upload_name}.part{index + 1}"
-            log.info(
-                "uploading %s (%s/%s, %.1f MiB)", name, index + 1, len(segments), seg_size / 2**20
-            )
-            reader = SegmentReader(_ext(archive), offset, seg_size)
-            try:
-                result = _upload_one_segment(worker, reader, seg_size, name, preview)
-            finally:
-                reader.close()
-            parts.append(
-                {**result, "filesize": result["size"], "has_thumbnail": preview is not None}
-            )
-        return parts
+# -- shared with upload_engine.py: the on-disk preview a message needs --- #
 
 
 @contextlib.contextmanager
-def _preview_file(image: Optional[Path]):
-    """Yield ``(jpeg_path, width, height)`` for ``image``, or None.
+def _preview_file(image: Optional[Path], mime_type: str = "", ffmpeg: Optional[str] = None):
+    """Yield ``(jpeg_path, width, height)`` for media ``image``, or None.
 
     On disk rather than in memory because Telethon uploads a thumbnail by name
     and Telegram ignores one that does not look like a ``.jpg`` file. In the
@@ -457,7 +383,8 @@ def _preview_file(image: Optional[Path]):
     ``staging/`` are both scanned for work, and a stray file there would be
     read back as something the user asked to upload.
     """
-    made = make_preview(image) if image is not None else None
+    made = (make_preview(image, mime_type, ffmpeg) if ffmpeg is not None
+            else make_preview(image, mime_type)) if image is not None else None
     if made is None:
         yield None
         return
@@ -473,34 +400,3 @@ def _preview_file(image: Optional[Path]):
             os.unlink(name)
         except OSError:  # pragma: no cover - the upload already succeeded
             pass
-
-
-def _upload_one_segment(
-    worker, reader: SegmentReader, seg_size: int, name: str, preview=None
-) -> dict:
-    for attempt in range(SEGMENT_RETRIES + 1):
-        try:
-            return worker.upload_segment(
-                reader, seg_size, name, progress=_progress_logger(name, seg_size), preview=preview
-            )
-        except Exception:
-            if attempt >= SEGMENT_RETRIES:
-                raise
-            log.warning(
-                "segment %s failed (attempt %s/%s) — retrying in %ss",
-                name, attempt + 1, SEGMENT_RETRIES + 1, SEGMENT_RETRY_SECONDS,
-            )
-            reader.seek(0)
-            time.sleep(SEGMENT_RETRY_SECONDS)
-
-
-def _progress_logger(name: str, total: int):
-    state = {"last": 0.0}
-
-    def report(sent: int, _total: int = total) -> None:
-        pct = (sent / total * 100) if total else 100.0
-        if pct - state["last"] >= 10:
-            state["last"] = pct
-            log.info("  %s: %.0f%%", name, pct)
-
-    return report

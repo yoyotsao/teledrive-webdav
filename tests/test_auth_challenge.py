@@ -66,7 +66,7 @@ class Cfg:
 
 def client(tmp_path, session):
     api = TeleDriveClient(Cfg(tmp_path))
-    api._session = session
+    api._http_session = lambda: session
     return api
 
 

@@ -1,0 +1,30 @@
+{
+  "_readme": [
+    "Copy to a file outside the repo and point config.ini's accounts_file at it.",
+    "Order matters: the first account is the primary. It is the only one that",
+    "authenticates to the TeleDrive backend (the bot challenge proves the drive",
+    "owner's identity), and it is the account a row with telegram_user_id 0 --",
+    "everything registered before multi-account support -- is read back from.",
+    "Every other account must already be linked to the same drive on the web",
+    "client, or it is read-only here: the pool will serve its existing files but",
+    "will not route new uploads to it.",
+    "telegram_user_id must match the account the session actually belongs to;",
+    "a mismatch disables that one account and says so, and leaves the rest up.",
+    "session takes a Telethon StringSession (TeleDrive's generate_session.py).",
+    "It stays on this machine: only MTProto ever sees it, never the backend.",
+    "Keep the real file out of version control and off pastebins -- a session",
+    "string is the whole Telegram account, not a password that can be rotated."
+  ],
+  "accounts": [
+    {
+      "telegram_user_id": 123456789,
+      "label": "primary",
+      "session": ""
+    },
+    {
+      "telegram_user_id": 987654321,
+      "label": "secondary",
+      "session": ""
+    }
+  ]
+}

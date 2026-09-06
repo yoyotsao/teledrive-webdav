@@ -52,7 +52,7 @@ def run(coro):
 # --------------------------------------------------------------------------- #
 
 
-def test_pace_does_not_sleep_without_a_flood():
+def test_pace_applies_web_initial_rate_before_a_flood():
     clock = FakeClock()
     sleeper = make_sleeper(clock)
     gate = UploadGate(max_window=12, clock=clock, sleeper=sleeper)
@@ -62,7 +62,7 @@ def test_pace_does_not_sleep_without_a_flood():
             await gate.pace()
 
     run(scenario())
-    assert sleeper.calls == []
+    assert sleeper.calls == [0.25, 0.25]
 
 
 def test_window_slot_bounds_concurrency():
@@ -115,7 +115,6 @@ def test_window_slot_releases_on_failure():
 def test_distinct_event_guard_on_simultaneous_floods():
     clock = FakeClock()
     gate = UploadGate(max_window=8, clock=clock)
-    gate.report_success(1.0)  # seed rtt_ewma so the first cut has a basis
 
     before = gate.stats()
     for _ in range(12):
@@ -123,24 +122,22 @@ def test_distinct_event_guard_on_simultaneous_floods():
 
     after = gate.stats()
     assert after["floods"] == 12
-    # window/rate were cut exactly once, not twelve times, even though every
-    # call landed at the same instant (frozen fake clock).
-    assert after["window"] == max(1, before["window"] // 2)
-    assert after["rate"] == pytest.approx(before["window"] / 1.0 * 0.5)
+    assert after["window"] == before["window"]
+    assert after["rate"] == pytest.approx(before["rate"] * 0.5)
+    assert after["ceiling"] == 2
 
 
-def test_flood_cap_uses_measured_throughput_not_a_constant():
+def test_flood_backoff_is_independent_of_measured_rtt():
     clock = FakeClock()
     gate = UploadGate(max_window=3, clock=clock)
-    gate.report_success(2.0)  # rtt_ewma = 2.0s, window still 3 (no room to grow)
+    gate.report_success(2.0)
 
     gate.report_flood(5)
 
-    # baseline = window/rtt_ewma (Little's law), not a fixed initial rate.
-    assert gate.stats()["rate"] == pytest.approx((3 / 2.0) * 0.5)
+    assert gate.stats()["rate"] == pytest.approx(2.25)
 
 
-def test_window_floor_is_one_after_repeated_distinct_floods():
+def test_concurrency_window_is_unchanged_by_floods():
     clock = FakeClock()
     gate = UploadGate(max_window=8, clock=clock)
 
@@ -150,7 +147,7 @@ def test_window_floor_is_one_after_repeated_distinct_floods():
         windows.append(gate.stats()["window"])
         clock.advance(100.0)  # clear the penalty window before the next flood
 
-    assert windows == [4, 2, 1, 1, 1]
+    assert windows == [8, 8, 8, 8, 8]
 
 
 def test_min_rate_floor():
@@ -165,15 +162,14 @@ def test_min_rate_floor():
     assert gate.stats()["rate"] == pytest.approx(MIN_RATE)
 
 
-def test_rate_teardown_and_window_recovery_lifecycle():
+def test_learned_ceiling_is_held_until_probe_cooldown():
     clock = FakeClock()
     gate = UploadGate(max_window=4, clock=clock)
-    gate.report_success(1.0)  # rtt_ewma = 1.0s
 
     gate.report_flood(2)
     stats = gate.stats()
-    assert stats["window"] == 2
-    assert stats["rate"] == pytest.approx(2.0)  # 4/1.0 * 0.5
+    assert stats["window"] == 4
+    assert stats["rate"] == pytest.approx(2.0)
 
     # Climb the rate: each successful report needs a clean window since the
     # flood and a minimum gap since the last increase.
@@ -183,21 +179,15 @@ def test_rate_teardown_and_window_recovery_lifecycle():
         gate.report_success(1.0)
 
     stats = gate.stats()
-    # rate climbed 2.0 -> 4.0 in 0.5 steps, hit max_window/rtt_ewma (4.0) and
-    # was torn down -- window alone is now the tighter constraint.
-    assert stats["rate"] is None
-    assert stats["window"] == 2  # untouched while rate was doing the climbing
+    assert stats["rate"] == 2.0
+    assert stats["ceiling"] == 2.0
+    assert stats["window"] == 4
 
-    # Now growth resumes on window, capped at max_window.
-    clock.advance(INCREASE_INTERVAL)
+    clock.advance(300)
     gate.report_success(1.0)
-    assert gate.stats()["window"] == 3
-    clock.advance(INCREASE_INTERVAL)
-    gate.report_success(1.0)
+    assert gate.stats()["rate"] == 2.2
+    assert gate.stats()["ceiling"] == 2.0
     assert gate.stats()["window"] == 4
-    clock.advance(INCREASE_INTERVAL)
-    gate.report_success(1.0)
-    assert gate.stats()["window"] == 4  # capped
 
 
 def test_success_clean_window_gate():
