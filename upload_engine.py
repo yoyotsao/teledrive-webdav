@@ -405,8 +405,37 @@ class UploadEngine:
         return sample_hash(request.source)
 
     def _check_existing(self, request, fingerprint):
+        """Reuse a prior upload only under the exact name it was registered as.
+
+        The backend's ``files`` table has ``file_id`` as its PRIMARY KEY and
+        registers with INSERT OR REPLACE, so a row is *addressed* by the
+        Telegram document id. Registering a reused document under a second name
+        therefore does not add a row -- it overwrites the first one, and that
+        file disappears from the drive while the stager, having seen a
+        successful registration, deletes the only local copy.
+
+        So dedup is scoped to (filename, parent): re-uploading over the same
+        name still costs nothing, and two names for one payload each get their
+        own document, which is the only shape this schema can hold. Measured on
+        the real backend before this rule existed: two identical 1 MiB files
+        under different names left exactly one row.
+        """
         response = self.api.check_hash(fingerprint) or {}
-        return canonical_existing_parts(response.get("files") or [], request.logical_size)
+        rows = [
+            row for row in (response.get("files") or [])
+            if str(row.get("filename") or "") == request.upload_name
+            and (row.get("parent_id") or None) == (request.parent_id or None)
+        ]
+        return canonical_existing_parts(rows, request.logical_size)
+
+    @staticmethod
+    def _claim_key(request, fingerprint: str) -> str:
+        """Same rule for in-batch collapsing as for backend reuse.
+
+        Sharing a claim by fingerprint alone would hand the second name the
+        first one's document id, which is the same overwrite by another route.
+        """
+        return f"{fingerprint}|{request.parent_id or ''}|{request.upload_name}"
 
     def _submit_inspection(self, request, hash_pool, check_pool):
         """Chain hash -> check-hash so the two caps stay independent.
@@ -536,7 +565,9 @@ class UploadEngine:
                             future.set_result(existing)
                             owner = False
                         else:
-                            future, owner = self.claims._claim(fingerprint)
+                            future, owner = self.claims._claim(
+                                self._claim_key(request, fingerprint)
+                            )
                         pending.append((request, fingerprint, future))
                         if owner:
                             notify(request, QueueStage.UPLOADING, "")
@@ -706,6 +737,10 @@ class UploadEngine:
         try:
             with _timed(metrics, "register_ms"):
                 self._register_parts(request, parts, result.fingerprint, group, total)
+                # Only the reuse path can be swallowed: a fresh upload mints a
+                # document id nobody else owns, so its row cannot replace one.
+                if metrics is not None and metrics.protocol == "duplicate":
+                    self._assert_registered(request, result.fingerprint)
         except BaseException as exc:  # noqa: BLE001 - logged, then re-raised
             log.warning("registration failed name=%s %s", request.upload_name, redact(exc))
             raise
@@ -744,6 +779,25 @@ class UploadEngine:
             ]
             for future in futures:
                 future.result()
+
+    def _assert_registered(self, request, fingerprint: str) -> None:
+        """Confirm the row is really addressable under the name we asked for.
+
+        The caller deletes its only copy of the bytes on the strength of this
+        call returning, and a registration can be accepted and still leave no
+        row under that name -- INSERT OR REPLACE keyed on the Telegram document
+        id means one document holds one name. Better a retained staging file
+        and a visible failure than a file that quietly is not there.
+        """
+        response = self.api.check_hash(fingerprint) or {}
+        for row in response.get("files") or []:
+            if (str(row.get("filename") or "") == request.upload_name
+                    and (row.get("parent_id") or None) == (request.parent_id or None)):
+                return
+        raise CoverageError(
+            f"{request.upload_name} registered but no row answers to that name "
+            f"under its parent; the drive stores one name per Telegram document"
+        )
 
     def _register_part(self, **payload):
         with self._register_slots:

@@ -242,14 +242,25 @@ def test_fallback_failure_still_sends_other_account_tail(rig):
     assert len(r.workers[2].client.albums) == 1
 
 
-def test_batch_alias_claim_does_not_deadlock_or_upload_twice(rig):
+def test_a_repeat_of_one_name_in_a_batch_claims_a_single_preparation(rig):
+    """The same destination twice in one batch is one document, not two."""
+    r = rig()
+    request = r.request(0)
+    results = r.engine.transfer_batch([request, request])
+    assert results[0].parts == results[1].parts
+    assert len(r.workers[1].client.media) == 1
+
+
+def test_two_names_for_one_payload_each_get_their_own_document(rig):
+    """A shared claim would hand the second name the first one's document id,
+    which the backend stores by primary key -- so the first name would vanish."""
     r = rig()
     request = r.request(0)
     alias = replace(request, upload_name="second.jpg", parent_id="other")
     results = r.engine.transfer_batch([request, alias])
-    assert results[0].parts == results[1].parts
+    assert results[0].parts != results[1].parts
     assert results[1].request == alias
-    assert len(r.workers[1].client.media) == 1
+    assert len(r.workers[1].client.media) == 2
 
 
 def test_disallowed_album_uses_existing_non_album_sender(rig):

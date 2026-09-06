@@ -221,8 +221,11 @@ def test_exact_coverage_is_checked_before_any_registration(rig):
 
 def test_duplicate_reuse_preserves_storage_identity_without_upload(rig):
     request = rig.request(10)
+    # filename and parent_id are part of the match now: reuse is only safe
+    # under the name the row already answers to.
     rig.api.rows = [{"telegram_message_id": 78, "file_id": "98", "filesize": 10,
-                     "telegram_user_id": 42, "has_thumbnail": True}]
+                     "telegram_user_id": 42, "has_thumbnail": True,
+                     "filename": "file.bin", "parent_id": "parent"}]
     result = rig.engine().transfer(request)
     assert [(p.message_id, p.telegram_user_id, p.has_thumbnail) for p in result.parts] == [(78, 42, True)]
     assert all(not w.client.messages for w in rig.workers.values())
@@ -315,7 +318,8 @@ def test_upload_failure_releases_slot_and_a_retry_can_upload(rig, monkeypatch):
     assert rig.api.payloads == []
 
 
-def test_concurrent_aliases_share_one_upload_and_register_separately(rig, monkeypatch):
+def test_concurrent_writes_to_one_name_share_a_single_upload(rig, monkeypatch):
+    """Two writers racing on the same destination pay for one upload."""
     engine = rig.engine()
     request = rig.request(10 * MiB + 1)
     barrier = threading.Barrier(2)
@@ -332,14 +336,38 @@ def test_concurrent_aliases_share_one_upload_and_register_separately(rig, monkey
     rig.api.check_hash = check_hash
     monkeypatch.setattr(tgupload, "upload_big_file_parts", big)
     with ThreadPoolExecutor(2) as executor:
-        futures = [executor.submit(engine.transfer, item) for item in (
-            request, replace(request, upload_name="alias.bin", parent_id="other"),
-        )]
+        futures = [executor.submit(engine.transfer, item) for item in (request, request)]
         results = [f.result(timeout=3) for f in futures]
     for result in results:
         engine.register_result(result)
     assert len(uploaded) == 1
     assert results[0].parts == results[1].parts
+
+
+def test_identical_bytes_under_two_names_are_uploaded_twice(rig, monkeypatch):
+    """One Telegram document can only carry one name, so two names need two.
+
+    The backend's files table keys on file_id and registers with INSERT OR
+    REPLACE, so handing the second name the first one's document id does not
+    add a row -- it overwrites the first, and the stager then deletes the only
+    local copy of a file that is no longer in the drive. Measured against the
+    real backend: two identical 1 MiB files under different names left one row.
+    """
+    engine = rig.engine()
+    request = rig.request(10 * MiB + 1)
+    alias = replace(request, upload_name="alias.bin", parent_id="other")
+    uploaded = []
+
+    async def big(*args, **kwargs):
+        uploaded.append(1)
+        return object()
+
+    monkeypatch.setattr(tgupload, "upload_big_file_parts", big)
+    results = [engine.transfer(item) for item in (request, alias)]
+    for result in results:
+        engine.register_result(result)
+    assert len(uploaded) == 2
+    assert results[0].parts != results[1].parts
     assert {(p["filename"], p["parent_id"]) for p in rig.api.payloads} == {
         ("file.bin", "parent"), ("alias.bin", "other"),
     }

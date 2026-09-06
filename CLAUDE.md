@@ -211,8 +211,28 @@ file/part，bridge 一律讀不到**，跨帳號的 split file 只是最明顯�
 - **結果一產生就交給 `on_result`，不等整批結束。** 所以第一個檔在註冊的同時，
   第二個檔已經在送位元組、第三個已經在算指紋。`on_result` 因此**不可以阻塞**——
   stager 的做法是丟進 register pool 就回來。
-- **`FingerprintClaims`：同一批裡位元組相同的兩個檔只上傳一次，但各自註冊。**
-  失敗的 claim 會被移除，之後的重試拿得到新的 claim。
+- **去重的範圍是 `(檔名, parent)`，不是只有指紋。** 這一條是線上探測 2026-09-06
+  量出來的，而且它推翻了原本的設計：**後端 `files` 表的主鍵是 `file_id`，
+  `insert_file` 是 `INSERT OR REPLACE`**（TeleDrive `backend/app/services/database.py`），
+  所以拿同一個 Telegram document id 用第二個名字去註冊**不會新增一筆 row，
+  而是把第一筆蓋掉** —— 這個 drive 在資料模型上就是「一份 document 一個名字」。
+  實測：兩個位元組相同、名字不同的 1 MiB 檔案上傳完，後端只剩一筆 row，
+  而 `uploadstage` 因為看到「註冊成功」把**兩份暫存都刪了**，暫存是唯一副本。
+  離線測試抓不到是因為 `tests/test_bridge_e2e.py` 的假 backend 是 append rows；
+  現在它照著真的做 replace，同一個缺陷在 `/game` 也立刻現形（四個不同名、內容相同
+  的 zip 塌成一筆）。
+  代價要說清楚：**內容相同但名字不同就會真的再上傳一次**，多佔一份上行與 Telegram
+  空間。換來的是使用者丟兩個檔就看到兩個檔。同名覆寫仍然命中去重、完全免費。
+  連帶結果是 **`/game` 現在永遠不會命中去重** —— 已經打包過的名字再 stage 會被
+  `PACKED_MESSAGE` 擋掉（見「已知限制」第 10 點旁邊那條），所以 `/game` 的 check-hash
+  必然是 miss，只剩一次 backend 呼叫的成本。
+- **`FingerprintClaims` 的 key 同樣帶 `(檔名, parent)`。** 只按指紋收斂，等於用另一條
+  路徑把第一個名字的 document id 交給第二個名字，結果一模一樣。同一批裡**同名**寫兩次
+  才共用一次上傳。失敗的 claim 會被移除，之後的重試拿得到新的 claim。
+- **走去重那條路的註冊，事後會回頭確認那個名字真的讀得回來**（`_assert_registered`）。
+  呼叫端就是靠這個回傳值決定刪掉唯一一份位元組的，而註冊可以「成功」卻沒有留下
+  任何以那個名字作答的 row。讀不回來就丟 `CoverageError`：暫存留著、標成失敗，
+  比一個安靜消失的檔案好。全新上傳不做這個檢查，它的 document id 沒有別人擁有。
 - **覆蓋率是精確比對，不是「有就好」。** `assert_parts_cover_file` 要求 part index
   從 0 連續、沒有負數大小、而且**加總完全等於**檔案長度。去重也套同一條：
   歷史上那些只註冊了 part 0 的殘缺 split group（見「已知限制」第 6 點）因此

@@ -192,7 +192,12 @@ def test_dedup_registration_forwards_reused_part_storage_account(tmp_path):
     """A reused secondary-account message must remain routed to that account."""
     archive = tmp_path / "reused.bin"
     archive.write_bytes(b"0123456789")
-    api = _DedupApi([row(size=10, account=42, split=False, message=77)])
+    # The row has to answer to the same name and parent, which is the only
+    # shape of reuse the backend's file_id primary key can actually hold.
+    reused = row(size=10, account=42, split=False, message=77)
+    reused["filename"] = "reused.bin"
+    reused["parent_id"] = "parent"
+    api = _DedupApi([reused])
 
     # pool=None on purpose: a complete duplicate must be registered without
     # ever asking for an upload lease.

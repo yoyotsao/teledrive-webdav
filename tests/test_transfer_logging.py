@@ -112,6 +112,7 @@ def test_a_reused_duplicate_reports_no_upload_time(rig, caplog):
     rig.api.rows = [{
         "telegram_message_id": 78, "file_id": "98", "filesize": 10,
         "telegram_user_id": 42, "has_thumbnail": False,
+        "filename": "file.bin", "parent_id": "parent",
     }]
 
     rig.engine.register_result(rig.engine.transfer(rig.request(size=10)))

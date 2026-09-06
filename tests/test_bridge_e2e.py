@@ -325,6 +325,13 @@ class FakeBackend:
                 file_hash=payload.get("file_hash"),
             )
             row["file_id"] = payload["file_id"]
+            row["telegram_user_id"] = payload.get("telegram_user_id") or 0
+            # INSERT OR REPLACE on a file_id PRIMARY KEY, exactly as the real
+            # backend does (backend/app/services/database.py). Appending instead
+            # is what let "one upload, two registered names" look like it worked:
+            # a dedup registration reuses the Telegram document id, so the second
+            # name does not add a row, it replaces the first one.
+            self.rows = [r for r in self.rows if r["file_id"] != row["file_id"]]
             self.rows.append(row)
             return row
         raise AssertionError(f"unexpected API call {method} {path}")
@@ -778,7 +785,32 @@ def test_overwriting_an_existing_remote_file_registers_a_newer_row(rig):
     assert rig.request("GET", "/photos/small.txt").content == new_payload
 
 
-def test_put_dedup_reuses_an_identical_upload(rig):
+def test_put_dedup_reuses_an_upload_of_the_same_name(rig):
+    """Rewriting a name with the content it already has costs nothing."""
+    payload = b"shared bytes" * 200
+    rig.request("PUT", "/photos/one.bin", data=payload)
+    _upload_now(rig, "photos", "one.bin")
+    uploads_after_first = len(rig.worker.uploads)
+
+    rig.request("PUT", "/photos/one.bin", data=payload)
+    _upload_now(rig, "photos", "one.bin")
+
+    assert len(rig.worker.uploads) == uploads_after_first, "identical content should not re-upload"
+    rows = [r for r in rig.backend.rows if r["filename"] == "one.bin"]
+    assert len(rows) == 1
+    assert rig.request("GET", "/photos/one.bin").content == payload
+
+
+def test_the_same_bytes_under_a_second_name_are_uploaded_again(rig):
+    """One Telegram document holds one name, so a second name needs its own.
+
+    files.file_id is the backend's PRIMARY KEY and registration is INSERT OR
+    REPLACE, so reusing the first document for the second name would not add a
+    row -- it would overwrite the first, and uploadstage would then delete the
+    only local copy of a file that is no longer in the drive. This was measured
+    against the real backend: two identical 1 MiB files written under different
+    names left exactly one row behind.
+    """
     payload = b"shared bytes" * 200
     rig.request("PUT", "/photos/one.bin", data=payload)
     _upload_now(rig, "photos", "one.bin")
@@ -787,9 +819,12 @@ def test_put_dedup_reuses_an_identical_upload(rig):
     rig.request("PUT", "/two.bin", data=payload)
     _upload_now(rig, "two.bin")
 
-    assert len(rig.worker.uploads) == uploads_after_first, "identical content should not re-upload"
+    assert len(rig.worker.uploads) == uploads_after_first + 1
     rows = [r for r in rig.backend.rows if r["filename"] in ("one.bin", "two.bin")]
-    assert len({r["telegram_message_id"] for r in rows}) == 1
+    assert sorted(r["filename"] for r in rows) == ["one.bin", "two.bin"]
+    assert len({r["telegram_message_id"] for r in rows}) == 2
+    assert rig.request("GET", "/photos/one.bin").content == payload
+    assert rig.request("GET", "/two.bin").content == payload
 
 
 def test_upload_status_reports_pending_then_clears(rig):
@@ -999,30 +1034,27 @@ def _stage_and_pack(rig, top, member, payload, mtime=1_770_000_000):
     _pack_now(rig, top)
 
 
-def test_repacking_identical_content_deduplicates(rig):
+def test_two_archives_with_identical_content_keep_both_names(rig):
+    """Same reason as the general-path case: a document holds one name.
+
+    Note what this means for /game specifically: dedup is scoped to (name,
+    parent), and re-staging a name that is already a packed archive is refused
+    outright (see test_writing_over_a_packed_archive_is_refused), so no /game
+    upload can ever hit the dedup path. The check still runs -- it is one
+    backend call and the general path needs it -- but for /game it is now
+    always a miss. The row-multiplication guard it used to provide lives in
+    test_put_dedup_reuses_an_upload_of_the_same_name.
+    """
     _stage_and_pack(rig, "DupA", "x.bin", b"same bytes" * 1000)
     uploads_after_first = len(rig.worker.uploads)
 
     _stage_and_pack(rig, "DupB", "x.bin", b"same bytes" * 1000)
 
-    assert len(rig.worker.uploads) == uploads_after_first, "should not re-upload a known hash"
-    hashes = {r["file_hash"] for r in rig.backend.rows if r["filename"] in ("DupA.zip", "DupB.zip")}
-    assert len(hashes) == 1
-    # Both names exist, pointing at the same Telegram message.
+    assert len(rig.worker.uploads) == uploads_after_first + 1
     rows = [r for r in rig.backend.rows if r["filename"] in ("DupA.zip", "DupB.zip")]
-    assert len(rows) == 2
-    assert len({r["telegram_message_id"] for r in rows}) == 1
-
-
-def test_dedup_registration_does_not_multiply_rows(rig):
-    """Guards the historical bug where each re-upload doubled a hash's row count."""
-    for i in range(4):
-        _stage_and_pack(rig, f"Stable{i}", "y.bin", b"stable" * 500)
-    rows = [r for r in rig.backend.rows if r["filename"].startswith("Stable")]
-    assert len(rows) == 4, f"expected exactly one row per registration, got {len(rows)}"
-    assert all(r["is_split_file"] is False for r in rows)
+    assert sorted(r["filename"] for r in rows) == ["DupA.zip", "DupB.zip"]
     assert len({r["file_hash"] for r in rows}) == 1
-    assert len(rig.worker.uploads) == 1
+    assert len({r["telegram_message_id"] for r in rows}) == 2
 
 
 def test_writing_over_a_packed_archive_is_refused(rig):
