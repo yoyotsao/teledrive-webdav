@@ -29,7 +29,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import tgupload
 from media_thumbnail import PREVIEW_BOX, PREVIEW_MAX_BYTES, capture_thumbnail
-from transfer_models import RemotePart
+from transfer_models import PreparedAlbumItem, RemotePart, UploadedPart
 
 log = logging.getLogger("tgio")
 
@@ -854,6 +854,131 @@ class TelegramWorker:
                 client, self._upload_gate(), reader, len(data), "thumbnail.jpg",
             )
         return handle, width, height
+
+    def prepare_album_item(self, source, size, file_name, mime_type, preview=None, *, message_limiter=None):
+        """Prepare a document on this account while the caller owns a file lease."""
+        return self.run(self._prepare_album_item(
+            source, size, file_name, mime_type, preview, message_limiter=message_limiter,
+        ), timeout=None)
+
+    async def _prepare_album_file(self, stream, size, file_name):
+        """Albums use 512 KiB SaveFilePart, including optional thumbnail bytes."""
+        import hashlib
+        from telethon.tl.functions.upload import SaveFilePartRequest
+        from telethon.tl.types import InputFile
+
+        if not 0 < size <= tgupload.SMALL_FILE_MAX:
+            raise ValueError("album upload size must be between 1 byte and 10 MiB")
+        client = await self._upload_client()
+        async with tgupload._PartReader(stream) as reader:
+            file_id, total, payloads = await tgupload._upload_parts(
+                client, self._upload_gate(), reader, size,
+                parts=[(offset, min(REQUEST_SIZE, size - offset))
+                       for offset in range(0, size, REQUEST_SIZE)],
+                request_factory=lambda file_id, index, _total, data: SaveFilePartRequest(file_id, index, data),
+                workers=4, progress=None, collect_payloads=True,
+            )
+        return InputFile(file_id, total, file_name, hashlib.md5(b"".join(payloads)).hexdigest())
+
+    async def _prepare_album_item(self, source, size, file_name, mime_type, preview=None, *, message_limiter=None):
+        from pathlib import Path
+        from config import ext_path
+        from telethon.tl.functions.messages import UploadMediaRequest
+        from telethon.tl.types import (
+            DocumentAttributeFilename, DocumentAttributeImageSize,
+            InputMediaUploadedDocument, InputPeerSelf,
+        )
+
+        with open(ext_path(source), "rb") as stream:
+            handle = await self._prepare_album_file(stream, size, file_name)
+        attributes = [DocumentAttributeFilename(file_name)]
+        thumb = None
+        if preview is not None:
+            thumbnail, width, height = preview
+            data = thumbnail if isinstance(thumbnail, bytes) else Path(thumbnail).read_bytes()
+            thumb = await self._prepare_album_file(io.BytesIO(data), len(data), "thumbnail.jpg")
+            attributes.append(DocumentAttributeImageSize(width, height))
+        request = UploadMediaRequest(InputPeerSelf(), InputMediaUploadedDocument(
+            file=handle, mime_type=mime_type, attributes=attributes, thumb=thumb,
+        ))
+        media = await self._album_rpc(request, message_limiter)
+        document = getattr(media, "document", None)
+        if document is None:
+            raise RemoteIdentityError("album preparation returned no document")
+        return PreparedAlbumItem(
+            source=Path(source), upload_name=file_name, mime_type=mime_type, size=size,
+            telegram_user_id=int(self.user_id), document_id=str(document.id),
+            access_hash=str(document.access_hash), has_thumbnail=thumb is not None,
+            file_reference=document.file_reference,
+        )
+
+    async def _album_rpc(self, request, message_limiter):
+        client = await self._upload_client()
+        for attempt in range(3):
+            if message_limiter is not None:
+                await message_limiter.acquire()
+            try:
+                return await client(request)
+            except Exception as exc:
+                wait = _flood_seconds(exc)
+                if wait is None or message_limiter is None:
+                    raise
+                message_limiter.flood(wait)
+                if attempt == 2:
+                    raise
+
+    def send_album(self, items, timeout=60, *, message_limiter=None):
+        """Send one account's prepared items and match exact document identities."""
+        return self.run(self._send_album(items, timeout, message_limiter=message_limiter), timeout=None)
+
+    async def _send_album(self, items, timeout=60, *, message_limiter=None):
+        from telethon import helpers
+        from telethon.tl.functions.messages import SendMultiMediaRequest
+        from telethon.tl.types import InputDocument, InputMediaDocument, InputPeerSelf, InputSingleMedia
+
+        if not 1 <= len(items) <= 10:
+            raise ValueError("an album must contain between one and ten items")
+        if any(item.telegram_user_id != int(self.user_id) for item in items):
+            raise ValueError("an album cannot mix Telegram accounts")
+        if len({item.document_id for item in items}) != len(items):
+            raise RemoteIdentityError("album preparation returned duplicate document IDs")
+        request = SendMultiMediaRequest(InputPeerSelf(), [InputSingleMedia(
+            media=InputMediaDocument(InputDocument(int(item.document_id), int(item.access_hash), item.file_reference)),
+            random_id=helpers.generate_random_long(), message="",
+        ) for item in items])
+        response = await asyncio.wait_for(self._album_rpc(request, message_limiter), timeout=timeout)
+        by_document = {}
+        for update in response.updates:
+            message = getattr(update, "message", None)
+            document = getattr(getattr(message, "media", None), "document", None)
+            if document is not None:
+                key = str(document.id)
+                if key in by_document:
+                    raise RemoteIdentityError("album returned duplicate document IDs")
+                by_document[key] = message
+        parts = []
+        for item in items:
+            message = by_document.get(str(item.document_id))
+            if message is None:
+                raise RemoteIdentityError(f"album returned no message for document {item.document_id}")
+            document = message.media.document
+            parts.append(UploadedPart(
+                index=0, message_id=int(message.id), file_id=str(document.id),
+                access_hash=str(document.access_hash), size=item.size,
+                telegram_user_id=item.telegram_user_id, has_thumbnail=item.has_thumbnail,
+            ))
+        return parts
+
+    def prepare_album_fallback(self, stream, size, file_name):
+        """Reread fallback bytes using exactly one ordinary small-upload worker."""
+        return self.run(self._prepare_album_fallback(stream, size, file_name), timeout=None)
+
+    async def _prepare_album_fallback(self, stream, size, file_name):
+        client = await self._upload_client()
+        async with tgupload._PartReader(stream) as reader:
+            return await tgupload.upload_small_file_parts(
+                client, self._upload_gate(), reader, size, file_name, workers=1,
+            )
 
     def send_uploaded_segment(self, handle, size, file_name, preview=None, *, mime_type=None, message_limiter=None):
         """Send an already uploaded document on the account's event loop."""

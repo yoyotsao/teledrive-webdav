@@ -9,13 +9,19 @@ from uuid import uuid4
 
 from config import ext_path
 from tgio import SegmentReader
-from tgupload import decide_protocol
+from tgupload import SMALL_FILE_MAX, decide_protocol
 from transfer_models import TransferRequest, TransferResult, UploadedPart
 from upload_limiter import MessageTokenBucket
 
 
 class CoverageError(RuntimeError):
     """Metadata parts do not describe exactly the logical file bytes."""
+
+
+def album_eligible(mime_type: str, size: int) -> bool:
+    return size <= SMALL_FILE_MAX and mime_type != "image/webp" and (
+        mime_type.startswith("image/") or mime_type.startswith("video/")
+    )
 
 
 def assert_parts_cover_file(parts: Sequence[UploadedPart], size: int) -> None:
@@ -153,7 +159,14 @@ class FingerprintClaims:
                 return future, False
             future = Future()
             self._claims[key] = future
+            future.add_done_callback(lambda completed: self._release_failed(key, completed))
             return future, True
+
+    def _release_failed(self, key, future):
+        if future.cancelled() or future.exception() is not None:
+            with self._lock:
+                if self._claims.get(key) is future:
+                    self._claims.pop(key, None)
 
     def run(self, fingerprint: str, producer: Callable[[], list[UploadedPart]]) -> list[UploadedPart]:
         future, owner = self._claim(fingerprint)
@@ -162,16 +175,68 @@ class FingerprintClaims:
                 future.set_result(producer())
             except BaseException as exc:
                 future.set_exception(exc)
-                # A failed physical upload belongs to no later retry.  Wake
-                # current followers through this future before freeing the key.
-                with self._lock:
-                    if self._claims.get(fingerprint) is future:
-                        self._claims.pop(fingerprint, None)
         return future.result()
 
 
+class AlbumQueue:
+    """One account's prepared documents; flushes settle every item's future."""
+
+    def __init__(self, runtime, fallback, *, timeout=60):
+        self.runtime = runtime
+        self.fallback = fallback
+        self.timeout = timeout
+        self._pending = []
+        self._lock = Lock()
+
+    def add(self, item, future=None):
+        if item.telegram_user_id != self.runtime.telegram_user_id:
+            raise ValueError("prepared item belongs to another Telegram account")
+        future = future if future is not None else Future()
+        with self._lock:
+            self._pending.append((item, future))
+            batch = self._pending if len(self._pending) == 10 else []
+            if batch:
+                self._pending = []
+        if batch:
+            self._send(batch)
+        return future
+
+    def flush(self):
+        with self._lock:
+            batch, self._pending = self._pending, []
+        if batch:
+            self._send(batch)
+
+    def _send(self, batch):
+        items = [item for item, _ in batch]
+        try:
+            parts = self.runtime.worker.send_album(
+                items, timeout=self.timeout, message_limiter=self.runtime.message_limiter,
+            )
+            if len(parts) != len(items):
+                raise CoverageError("album did not return every prepared item")
+            for item, part in zip(items, parts):
+                assert_parts_cover_file([part], item.size)
+                if part.telegram_user_id != item.telegram_user_id or part.file_id != item.document_id:
+                    raise CoverageError("album changed a prepared document identity")
+        except Exception:
+            # A malformed response invalidates the whole batch, just like an
+            # RPC error. Each fallback reopens its own source and settles alone.
+            for item, future in batch:
+                try:
+                    part = self.fallback(self.runtime, item)
+                    assert_parts_cover_file([part], item.size)
+                except Exception as exc:
+                    future.set_exception(exc)
+                else:
+                    future.set_result([part])
+        else:
+            for (_, future), part in zip(batch, parts):
+                future.set_result([part])
+
+
 class UploadEngine:
-    """Upload non-album files; callers register results before deleting sources.
+    """Transfer files; callers register results before deleting sources.
 
     Share one engine within a due batch to share fingerprint claims. Account
     admission belongs to the pool, and registration admission to this engine.
@@ -193,6 +258,9 @@ class UploadEngine:
         self._message_burst = message_burst
 
     def transfer(self, request: TransferRequest) -> TransferResult:
+        return self.transfer_batch([request])[0]
+
+    def _inspect_request(self, request):
         # Imported lazily: gamestage also exposes the legacy upload wrapper.
         from gamestage import sample_hash
 
@@ -204,9 +272,90 @@ class UploadEngine:
         fingerprint = sample_hash(request.source)
         response = self.api.check_hash(fingerprint) or {}
         existing = canonical_existing_parts(response.get("files") or [], request.logical_size)
-        parts = existing or self.claims.run(fingerprint, lambda: self._upload_fresh(request))
-        assert_parts_cover_file(parts, request.logical_size)
-        return TransferResult(request, fingerprint, tuple(sorted(parts, key=lambda p: p.index)))
+        return fingerprint, existing
+
+    def transfer_batch(self, requests):
+        """Prepare during discovery, flush account tails, then return in input order.
+
+        No registration or source deletion occurs here. Pending aliases share
+        futures without blocking discovery, so a tail can always reach flush.
+        The streaming scheduler owns concurrent discovery in the next layer.
+        """
+        queues = {}
+        pending = []
+        errors = []
+        try:
+            for request in requests:
+                try:
+                    fingerprint, existing = self._inspect_request(request)
+                    if existing:
+                        future = Future()
+                        future.set_result(existing)
+                        owner = False
+                    else:
+                        future, owner = self.claims._claim(fingerprint)
+                    pending.append((request, fingerprint, future))
+                    if not owner:
+                        continue
+                    try:
+                        if request.allow_album and album_eligible(request.mime_type, request.logical_size):
+                            runtime, item = self._prepare_album(request)
+                            queue = queues.setdefault(runtime.telegram_user_id, AlbumQueue(runtime, self._album_fallback))
+                            queue.add(item, future)
+                        else:
+                            future.set_result(self._upload_fresh(request))
+                    except Exception as exc:
+                        future.set_exception(exc)
+                except Exception as exc:
+                    errors.append(exc)
+        finally:
+            for queue in queues.values():
+                queue.flush()
+        results = []
+        for request, fingerprint, future in pending:
+            try:
+                parts = future.result()
+                assert_parts_cover_file(parts, request.logical_size)
+                results.append(TransferResult(request, fingerprint, tuple(sorted(parts, key=lambda p: p.index))))
+            except Exception as exc:
+                errors.append(exc)
+        if errors:
+            raise errors[0]
+        return results
+
+    def _message_bucket(self, runtime):
+        with self._bucket_lock:
+            if runtime.message_limiter is None:
+                runtime.message_limiter = MessageTokenBucket(self._message_rate, self._message_burst)
+        return runtime.message_limiter
+
+    def _prepare_album(self, request):
+        from gamestage import _preview_file
+
+        with self.pool.acquire_upload() as runtime:
+            bucket = self._message_bucket(runtime)
+            with _preview_file(request.source, request.mime_type, self.ffmpeg) as preview:
+                item = runtime.worker.prepare_album_item(
+                    request.source, request.logical_size, request.upload_name,
+                    request.mime_type, preview, message_limiter=bucket,
+                )
+        return runtime, item
+
+    def _album_fallback(self, runtime, item):
+        # Reacquire this exact account; a different account cannot preserve the
+        # prepared item's routing. File admission ends before message admission.
+        with runtime.file_slots:
+            with open(ext_path(item.source), "rb") as stream:
+                handle = runtime.worker.prepare_album_fallback(stream, item.size, item.upload_name)
+        result = runtime.worker.send_uploaded_segment(
+            handle, item.size, item.upload_name, preview=None,
+            mime_type=item.mime_type, message_limiter=self._message_bucket(runtime),
+        )
+        return UploadedPart(
+            index=0, message_id=int(result["message_id"]), file_id=str(result["file_id"]),
+            access_hash=result.get("access_hash"), size=int(result["size"]),
+            telegram_user_id=item.telegram_user_id, has_thumbnail=False,
+        )
 
     def _upload_fresh(self, request):
         from gamestage import _preview_file
@@ -230,9 +379,7 @@ class UploadEngine:
     def _upload_segment(self, request, index, offset, size, force_big, split, preview):
         name = f"{request.upload_name}.part{index + 1}" if split else request.upload_name
         with self.pool.acquire_upload() as runtime:
-            with self._bucket_lock:
-                if runtime.message_limiter is None:
-                    runtime.message_limiter = MessageTokenBucket(self._message_rate, self._message_burst)
+            self._message_bucket(runtime)
             reader = SegmentReader(ext_path(request.source), offset, size, force_big=force_big)
             try:
                 handle = runtime.worker.prepare_segment(reader, size, name, force_big=force_big)

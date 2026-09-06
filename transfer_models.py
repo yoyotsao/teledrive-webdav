@@ -70,3 +70,4 @@ class PreparedAlbumItem:
     document_id: str
     access_hash: Optional[str]
     has_thumbnail: bool
+    file_reference: bytes = field(default=b"", repr=False)
