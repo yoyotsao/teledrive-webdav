@@ -747,6 +747,31 @@ GET /files    0.52s ┘
   不是為了那條閒置連線（上一條反而是刻意留著它），而是因為**只會往上加的計數跟「刻意
   釘住」分不出來**，而上一條的正確性就建立在那個計數上。
 
+- **舊 `/game` 的 `file_id` 不是 Telegram document id，拿它去驗身分等於把它們全部鎖死。**
+  舊版 `gamestage` 註冊 split part 時寫的是 `f"{split_group_id}-{index}"`（上傳沒回
+  document id 時的替代品），所以那些 row 的 `file_id` 長成 `1788435722109-52da4qq-3`。
+  Task 4 加上 `_assert_media_id` 之後，這種值跟 Telegram 回的 id 永遠不相等 ——
+  實測這個 drive 的 `/game` **143 筆裡有 127 筆**帶著它，全部讀不到，連 `H:` 都打不開。
+  修法是**只驗證看起來是 document id（純數字）的值**：不是 id 的東西不帶身分資訊，
+  沒有東西可以驗，退回加上這個檢查之前的行為（信任 message_id）。真的有 id 的照驗。
+- **列 `/game` 不可以打開每一個封存。** 解析 `/game/<name>` 曾經呼叫
+  `view.lookup([])` 只為了回答「這是不是目錄」—— 而那個答案 `.zip` 這個副檔名就給了。
+  PROPFIND `Depth: 1` 會解析每一個子項，所以 143 個封存就是 143 次 Telegram 往返、
+  每次約 6 秒：**一次列表 15 分鐘**，久到 rclone 放棄、整個掛載卡死。
+  現在 `Loc(ZIPDIR, node=None)` 表示「封存本身」，樹留到真的有人往裡面看才讀
+  （`Loc.zip_node()`）。實測 **15 分鐘 → 0.042 秒**。
+  這條之前之所以沒炸，純粹是因為上面那 127 筆瞬間失敗 —— 快而錯，不是對。
+- **`zip_dirs.json` 一份共用的 JSON 會變成每讀一個封存重寫幾十 MB。**
+  一個 central directory 可以是好幾 MB，這個 drive 上 276 個封存讓那份檔案長到
+  **132 MB**，而 `JsonStore.put` 是整份重寫 —— 列一次 `/game` 等於寫約 18 GB。
+  這跟 `meta/dirs/` 早就記下的教訓是同一條，只是 zip 快取沒跟著改。現在是
+  `ShardedJsonStore`：一個封存一個檔（`meta/zips/`），寫入只花自己那一份。
+- **`JsonStore.flush` 的暫存檔名不能固定。** wsgidav 用 16 條 worker thread 回答一次
+  列表，每條填完一個 zip 目錄就 flush，共用 `.tmp` 名字的結果是某條的 `os.replace`
+  打在另一條還開著的檔案上 —— Windows 上是硬邦邦的 `WinError 32`，那次寫入直接丟掉。
+  看起來像 merge-on-flush 要處理的「兩個行程互搶」，其實是**同一個行程跟自己搶**。
+  現在每個寫入者用 `mkstemp` 拿自己的名字。
+
 ## rclone 掛載參數
 
 `start.bat` 裡已經帶好，重點：
@@ -789,7 +814,7 @@ GET /files    0.52s ┘
 |---|---|
 | `tests/test_split_math.py` | offset→(part, 內部 offset) 映射、跨界切段、`SeekableRemoteFile` 的 seek/range/block 快取、block 快取裝得下一整個串流讀取寬度（不會把剛抓回來的那批丟掉） |
 | `tests/test_zipfs.py` | 虛擬樹結構（空目錄、非 ASCII、隱含目錄、traversal 防護）、local header 偏移、單 entry range |
-| `tests/test_sizes.py` | `filesize` 灌水的裁切（`_hash_size` / `_clip_parts` / `total_size`）、`JsonStore` 並行合併 |
+| `tests/test_sizes.py` | `filesize` 灌水的裁切（`_hash_size` / `_clip_parts` / `total_size`）、`JsonStore` 並行合併、`ShardedJsonStore` 只寫改動的那個 key（一個封存一個檔）、跨行程讀得回、任何 key 都產生安全檔名、不留 `.tmp` |
 | `tests/test_photo_media.py` | photo 型 media：progressive `sizes` 取最後一個而非總和、`_fetch_document` 接受 photo、預覽受 `THUMB_PREVIEW_MAX` 上限且全部超標時仍給答案、`InputPhotoFileLocation`、寬高從 `sizes[-1]`；document 那半的行為不變 |
 | `tests/test_backend_retry.py` | backend 斷掉閒置 keep-alive 時 `_call` 重試一次（GET 與 POST 都是，因為請求沒抵達 app）、不無限重試、真正的 HTTP 錯誤不重試、連線重試與 401 重登的預算互不吃掉 |
 | `tests/test_dir_cache.py` | listing 的往返次數：`/folders` 與 `/files` 真的併發（循序會卡住測試而不是靜靜通過）、一次點擊只付新的那一層、`meta/dirs/` 撐過換 client（重啟）、與記憶體共用同一個 TTL、舊格式的檔案重列而不是誤讀、`fresh` 兩層都繞過並改寫磁碟、`invalidate` 連磁碟一起清、root 與含 `..` 的 id 都產生安全檔名 |
