@@ -9,14 +9,15 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from transfer_models import TransferRequest  # noqa: E402
 from upload_engine import (  # noqa: E402
     CoverageError,
     FingerprintClaims,
+    UploadEngine,
     UploadedPart,
     assert_parts_cover_file,
     canonical_existing_parts,
 )
-import gamestage  # noqa: E402
 
 
 def row(*, group="g", index=0, size=10, account=1, message=None, file_id=None, split=True):
@@ -193,8 +194,10 @@ def test_dedup_registration_forwards_reused_part_storage_account(tmp_path):
     archive.write_bytes(b"0123456789")
     api = _DedupApi([row(size=10, account=42, split=False, message=77)])
 
-    gamestage.upload_and_register(
-        api, None, archive, "reused.bin", "parent", "application/octet-stream"
-    )
+    # pool=None on purpose: a complete duplicate must be registered without
+    # ever asking for an upload lease.
+    engine = UploadEngine(api, pool=None)
+    request = TransferRequest(archive, "reused.bin", "application/octet-stream", "parent", 10)
+    engine.register_result(engine.transfer(request))
 
     assert api.registered[0]["telegram_user_id"] == 42

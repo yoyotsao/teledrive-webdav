@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import mimetypes
+import os
 import re
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
@@ -38,6 +40,31 @@ def redact(value) -> str:
     for pattern, replacement in _SECRETS:
         text = pattern.sub(replacement, text)
     return text
+
+
+# mimetypes on Windows answers out of HKCR, so the same extension gets a
+# different name on different machines: .zip is "application/x-zip-compressed"
+# here and "application/zip" on the box that wrote the row the dedup check will
+# match. That is not cosmetic -- album_eligible() below keys off the "image/"
+# and "video/" prefixes and singles out image/webp, so a machine-local answer
+# silently changes which protocol a file is uploaded with. The extensions that
+# decide anything are pinned to their IANA names, which is also what the web
+# client sends.
+_MIME_OVERRIDES = {
+    ".zip": "application/zip",
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp",
+    ".mp4": "video/mp4", ".mkv": "video/x-matroska", ".webm": "video/webm",
+    ".mov": "video/quicktime", ".avi": "video/x-msvideo", ".m4v": "video/x-m4v",
+}
+
+
+def guess_mime_type(name: str) -> str:
+    """The mime type a row is registered with, independent of this machine."""
+    suffix = os.path.splitext(name)[1].lower()
+    if suffix in _MIME_OVERRIDES:
+        return _MIME_OVERRIDES[suffix]
+    return mimetypes.guess_type(name)[0] or "application/octet-stream"
 
 
 def album_eligible(mime_type: str, size: int) -> bool:

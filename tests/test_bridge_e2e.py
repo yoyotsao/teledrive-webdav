@@ -33,11 +33,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import bridge  # noqa: E402
 import gamestage  # noqa: E402
 import tgio  # noqa: E402
+import tgupload  # noqa: E402
+import upload_engine  # noqa: E402
 from config import Config  # noqa: E402
 from fetchlocal import LocalFetcher  # noqa: E402
 from gamestage import GameStager  # noqa: E402
 from tdapi import TeleDriveClient  # noqa: E402
-from upload_engine import UploadEngine  # noqa: E402
 from uploadstage import UploadStager  # noqa: E402
 
 PAGE_SIZE = 10000
@@ -518,14 +519,14 @@ def rig(tmp_path):
             return {"accounts": [], "eligible_upload_ids": []}
 
     pool = FakePool(worker)
-    engine = UploadEngine(
+    engine = upload_engine.UploadEngine(
         api, pool, register_concurrency=cfg.register_concurrency,
         hash_concurrency=cfg.hash_concurrency,
         hash_check_concurrency=cfg.hash_check_concurrency,
         album_batch=cfg.album_batch, album_timeout=cfg.album_timeout_seconds,
     )
     resolver = bridge.Resolver(cfg, api, pool)
-    stager = GameStager(cfg, api, worker)
+    stager = GameStager(cfg, api, engine)
     resolver.stager = stager
     upload_stager = UploadStager(cfg, api, engine)
     resolver.upload_stager = upload_stager
@@ -939,8 +940,11 @@ def test_a_single_file_dropped_into_game_is_uploaded_as_is(rig):
 
 
 def test_large_pack_is_split_and_reads_back_intact(rig, monkeypatch):
-    # 500 MiB segments cannot be exercised in a test; shrink the boundary instead.
-    monkeypatch.setattr(gamestage, "SEGMENT_SIZE", 4096)
+    # 500 MiB segments cannot be exercised in a test; shrink both boundaries
+    # instead. SMALL_FILE_MAX has to come down too, or decide_protocol answers
+    # "small" for anything under 10 MiB and never plans a second segment.
+    monkeypatch.setattr(tgupload, "MESSAGE_MAX", 4096)
+    monkeypatch.setattr(tgupload, "SMALL_FILE_MAX", 4096)
     rig.request("MKCOL", "/game/Huge")
     payload = bytes((i * 7) % 251 for i in range(30_000))
     rig.request("PUT", "/game/Huge/blob.bin", data=payload)
@@ -964,7 +968,8 @@ def test_split_segment_sizes_are_exact_not_inflated(rig, monkeypatch):
     # -- tdapi's real_size/_clip_parts exists specifically to undo that
     # padding on read. webdav's own segment planning must never regress to
     # it: every part's registered filesize must be the exact byte count.
-    monkeypatch.setattr(gamestage, "SEGMENT_SIZE", 4096)
+    monkeypatch.setattr(tgupload, "MESSAGE_MAX", 4096)
+    monkeypatch.setattr(tgupload, "SMALL_FILE_MAX", 4096)
     payload = bytes((i * 3) % 256 for i in range(4096 + 1))
     rig.request("PUT", "/game/Exact.zip", data=payload)
     _pack_now(rig, "Exact.zip")
@@ -1042,7 +1047,7 @@ def test_canonical_existing_parts_collapses_corrupt_groups():
         {"file_id": "d", "filesize": 10, "telegram_message_id": 9, "is_split_file": True,
          "split_group_id": "g2", "part_index": 0, "mime_type": None},
     ]
-    parts = gamestage.canonical_existing_parts(rows, original_size=15)
+    parts = upload_engine.canonical_existing_parts(rows, original_size=15)
     assert [p.index for p in parts] == [0, 1]
     assert [p.message_id for p in parts] == [1, 2]
 

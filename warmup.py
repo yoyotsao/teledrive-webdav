@@ -448,13 +448,16 @@ def main(argv: List[str]) -> int:
     # two would import each other.
     from bridge import Resolver
 
+    from telegram_accounts import TelegramAccountPool
+
     cfg = load_config()
-    # Worker first, then login: the bot challenge is answered over MTProto.
-    worker = TelegramWorker(cfg.api_id, cfg.api_hash, cfg.session, cfg.download_connections)
-    worker.start()
     api = TeleDriveClient(cfg)
-    api.set_dm_sender(worker.send_dm)
-    api.login()
+    # The pool, not one worker: a sweep reads previews and properties for rows
+    # that may be stored under any linked account, and Resolver routes each one
+    # by its own telegram_user_id. start() also connects before it logs in --
+    # the bot challenge is answered over MTProto by the primary.
+    pool = TelegramAccountPool.from_config(cfg)
+    pool.start(api)
 
     start_id = None
     label = base = ""
@@ -469,7 +472,7 @@ def main(argv: List[str]) -> int:
         start_id, base = entry.file_id, "/" + "/".join(parts)
         label = base
 
-    resolver = Resolver(cfg, api, worker)
+    resolver = Resolver(cfg, api, pool)
     (cfg.cache_dir / "thumbs").mkdir(parents=True, exist_ok=True)
 
     started = time.monotonic()  # reset once the walk is done and fetching starts
@@ -511,7 +514,7 @@ def main(argv: List[str]) -> int:
         print("\ninterrupted — rerun to continue where this stopped")
     finally:
         resolver.clear_heads()
-        worker.stop()
+        pool.stop()
 
     elapsed = time.monotonic() - started
     if warmed:

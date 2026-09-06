@@ -1287,11 +1287,17 @@ class RpcApp:
         return _text_response(start_response, "200 OK", body, "application/json")
 
     def _status(self, start_response):
+        """Both queues plus the account view, flat and credential-free.
+
+        Nothing here may render a session string or a JWT: this endpoint is the
+        first thing anybody pastes into a bug report. The pool redacts sessions
+        out of its own error strings, and the limiter reports numbers only.
+        """
         body = json.dumps(
             {
                 **(self.stager.status() if self.stager else {}),
                 "uploads": self.upload_stager.status() if self.upload_stager else {},
-                "telegram": self.resolver.pool.status(),
+                **self.resolver.pool.status(),
             },
             default=str,
         )
@@ -1555,7 +1561,7 @@ def main(argv=None) -> int:
     )
 
     resolver = Resolver(cfg, api, pool)
-    stager = GameStager(cfg, api, worker)
+    stager = GameStager(cfg, api, engine)
     resolver.stager = stager
     upload_stager = UploadStager(cfg, api, engine)
     resolver.upload_stager = upload_stager

@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import json
 import logging
-import mimetypes
 import os
 import threading
 import time
@@ -41,7 +40,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from config import ext_path as _ext
 from gamestage import MAX_ATTEMPTS, RETRY_SECONDS, TICK_SECONDS
 from transfer_models import QueueStage, TransferRequest
-from upload_engine import redact
+from upload_engine import guess_mime_type, redact
 
 log = logging.getLogger("uploadstage")
 
@@ -437,7 +436,7 @@ class UploadStager:
             size = path.stat().st_size
         except OSError:
             return None
-        mime_type = mimetypes.guess_type(unit.name)[0] or "application/octet-stream"
+        mime_type = guess_mime_type(unit.name)
         return TransferRequest(
             source=path, upload_name=unit.name, mime_type=mime_type,
             parent_id=unit.parent_id, logical_size=size,
