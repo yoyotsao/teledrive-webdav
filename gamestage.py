@@ -449,7 +449,7 @@ def _upload_segments(
 
 
 @contextlib.contextmanager
-def _preview_file(image: Optional[Path], mime_type: str = ""):
+def _preview_file(image: Optional[Path], mime_type: str = "", ffmpeg: Optional[str] = None):
     """Yield ``(jpeg_path, width, height)`` for media ``image``, or None.
 
     On disk rather than in memory because Telethon uploads a thumbnail by name
@@ -458,7 +458,8 @@ def _preview_file(image: Optional[Path], mime_type: str = ""):
     ``staging/`` are both scanned for work, and a stray file there would be
     read back as something the user asked to upload.
     """
-    made = make_preview(image, mime_type) if image is not None else None
+    made = (make_preview(image, mime_type, ffmpeg) if ffmpeg is not None
+            else make_preview(image, mime_type)) if image is not None else None
     if made is None:
         yield None
         return

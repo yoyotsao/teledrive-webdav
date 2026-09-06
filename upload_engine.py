@@ -1,37 +1,29 @@
-"""Small, shared primitives for safe upload deduplication.
-
-This module intentionally contains no upload scheduling or Telegram I/O.  It
-only turns a ``check-hash`` response into one verified, account-routed sequence
-of parts and coordinates same-batch callers of a physical upload.
-"""
+"""Account-routed transfers and exact, independently settled registration."""
 
 from __future__ import annotations
 
-from concurrent.futures import Future
-from dataclasses import dataclass
-from threading import Lock
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from threading import BoundedSemaphore, Lock
 from typing import Callable, Dict, Mapping, Sequence
+from uuid import uuid4
+
+from config import ext_path
+from tgio import SegmentReader
+from tgupload import decide_protocol
+from transfer_models import TransferRequest, TransferResult, UploadedPart
+from upload_limiter import MessageTokenBucket
 
 
-@dataclass(frozen=True)
-class UploadedPart:
-    """One immutable Telegram segment, including the account that owns it."""
-
-    index: int
-    message_id: int
-    file_id: str
-    access_hash: str | None
-    size: int
-    telegram_user_id: int
-    has_thumbnail: bool = False
-
-
-class CoverageError(ValueError):
+class CoverageError(RuntimeError):
     """Metadata parts do not describe exactly the logical file bytes."""
 
 
 def assert_parts_cover_file(parts: Sequence[UploadedPart], size: int) -> None:
     """Reject metadata that would advertise too few or too many bytes."""
+    if sorted(part.index for part in parts) != list(range(len(parts))):
+        raise CoverageError("uploaded part indices must be contiguous from zero")
+    if any(part.size < 0 for part in parts):
+        raise CoverageError("uploaded parts cannot have negative sizes")
     total = sum(part.size for part in parts)
     if total != size:
         raise CoverageError(f"uploaded parts cover {total} bytes, expected {size}")
@@ -176,3 +168,114 @@ class FingerprintClaims:
                     if self._claims.get(fingerprint) is future:
                         self._claims.pop(fingerprint, None)
         return future.result()
+
+
+class UploadEngine:
+    """Upload non-album files; callers register results before deleting sources.
+
+    Share one engine within a due batch to share fingerprint claims. Account
+    admission belongs to the pool, and registration admission to this engine.
+    """
+
+    def __init__(
+        self, api, pool, *, claims=None, register_concurrency=8,
+        segment_concurrency=32, ffmpeg=None, message_rate=3.0, message_burst=6,
+    ):
+        self.api = api
+        self.pool = pool
+        self.claims = claims if claims is not None else FingerprintClaims()
+        self.ffmpeg = ffmpeg
+        self._segment_concurrency = max(1, int(segment_concurrency))
+        self._register_concurrency = min(8, max(1, int(register_concurrency)))
+        self._register_slots = BoundedSemaphore(self._register_concurrency)
+        self._bucket_lock = Lock()
+        self._message_rate = message_rate
+        self._message_burst = message_burst
+
+    def transfer(self, request: TransferRequest) -> TransferResult:
+        # Imported lazily: gamestage also exposes the legacy upload wrapper.
+        from gamestage import sample_hash
+
+        if request.logical_size <= 0:
+            raise ValueError(f"{request.upload_name} is empty (0 bytes) or has an invalid size")
+        actual_size = request.source.stat().st_size
+        if actual_size != request.logical_size:
+            raise CoverageError(f"source has {actual_size} bytes, expected {request.logical_size}")
+        fingerprint = sample_hash(request.source)
+        response = self.api.check_hash(fingerprint) or {}
+        existing = canonical_existing_parts(response.get("files") or [], request.logical_size)
+        parts = existing or self.claims.run(fingerprint, lambda: self._upload_fresh(request))
+        assert_parts_cover_file(parts, request.logical_size)
+        return TransferResult(request, fingerprint, tuple(sorted(parts, key=lambda p: p.index)))
+
+    def _upload_fresh(self, request):
+        from gamestage import _preview_file
+
+        decision = decide_protocol(request.logical_size, album_eligible=False)
+        with _preview_file(request.source, request.mime_type, self.ffmpeg) as preview:
+            with ThreadPoolExecutor(max_workers=min(self._segment_concurrency, len(decision.segments))) as executor:
+                futures = [
+                    executor.submit(
+                        self._upload_segment, request, index, offset, size,
+                        decision.force_big, len(decision.segments) > 1,
+                        preview if index == 0 else None,
+                    )
+                    for index, (offset, size) in enumerate(decision.segments)
+                ]
+                parts = [future.result() for future in as_completed(futures)]
+        # Check inside the claim so a corrupt result is never cached for aliases.
+        assert_parts_cover_file(parts, request.logical_size)
+        return parts
+
+    def _upload_segment(self, request, index, offset, size, force_big, split, preview):
+        name = f"{request.upload_name}.part{index + 1}" if split else request.upload_name
+        with self.pool.acquire_upload() as runtime:
+            with self._bucket_lock:
+                if runtime.message_limiter is None:
+                    runtime.message_limiter = MessageTokenBucket(self._message_rate, self._message_burst)
+            reader = SegmentReader(ext_path(request.source), offset, size, force_big=force_big)
+            try:
+                handle = runtime.worker.prepare_segment(reader, size, name, force_big=force_big)
+                uploaded_preview = runtime.worker.prepare_thumbnail(preview) if preview else None
+            finally:
+                reader.close()
+        # A Telegram message and backend registration do not occupy file slots.
+        result = runtime.worker.send_uploaded_segment(
+            handle, size, name, preview=uploaded_preview,
+            mime_type=request.mime_type, message_limiter=runtime.message_limiter,
+        )
+        return UploadedPart(
+            index=index, message_id=int(result["message_id"]),
+            file_id=str(result["file_id"]), access_hash=result.get("access_hash"),
+            size=int(result["size"]), telegram_user_id=int(runtime.worker.user_id),
+            has_thumbnail=uploaded_preview is not None,
+        )
+
+    def register_result(self, result: TransferResult) -> None:
+        """Settle every part registration, propagating failure before success."""
+        request = result.request
+        parts = sorted(result.parts, key=lambda p: p.index)
+        assert_parts_cover_file(parts, request.logical_size)
+        group = uuid4().hex
+        total = len(parts)
+        with ThreadPoolExecutor(max_workers=self._register_concurrency) as executor:
+            futures = [
+                executor.submit(
+                    self._register_part,
+                    filename=request.upload_name, filesize=part.size,
+                    message_id=part.message_id, file_id=part.file_id,
+                    access_hash=part.access_hash, telegram_user_id=part.telegram_user_id,
+                    mime_type=request.mime_type, parent_id=request.parent_id,
+                    is_split_file=total > 1, original_name=request.upload_name,
+                    part_index=part.index, total_parts=total, split_group_id=group,
+                    file_hash=result.fingerprint, has_thumbnail=part.has_thumbnail,
+                )
+                for part in parts
+            ]
+            for future in futures:
+                future.result()
+        self.api.invalidate(request.parent_id)
+
+    def _register_part(self, **payload):
+        with self._register_slots:
+            return self.api.register(**payload)

@@ -808,8 +808,14 @@ class TelegramWorker:
         )
 
     async def _upload_segment(self, stream, size: int, file_name: str, progress, preview=None, force_big=None) -> dict:
-        from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeImageSize
+        handle = await self._prepare_segment(stream, size, file_name, progress, force_big)
+        return await self._send_uploaded_segment(handle, size, file_name, preview)
 
+    def prepare_segment(self, stream, size: int, file_name: str, progress=None, *, force_big=None):
+        """Upload bytes without sending a message or retaining a file lease."""
+        return self.run(self._prepare_segment(stream, size, file_name, progress, force_big), timeout=None)
+
+    async def _prepare_segment(self, stream, size, file_name, progress=None, force_big=None):
         decision = tgupload.decide_protocol(size, album_eligible=False)
         if force_big is None:
             force_big = bool(getattr(stream, "force_big", False))
@@ -824,31 +830,68 @@ class TelegramWorker:
                 handle = await tgupload.upload_small_file_parts(
                     client, self._upload_gate(), reader, size, file_name, progress=progress,
                 )
+        return handle
 
+    def prepare_thumbnail(self, preview):
+        """Upload a JPEG through this account's chunk limiter before message send."""
+        return self.run(self._prepare_thumbnail(preview), timeout=None)
+
+    async def _prepare_thumbnail(self, preview):
+        import io
+        from pathlib import Path
+
+        source, width, height = preview
+        data = source if isinstance(source, bytes) else Path(source).read_bytes()
+        client = await self._upload_client()
+        async with tgupload._PartReader(io.BytesIO(data)) as reader:
+            handle = await tgupload.upload_small_file_parts(
+                client, self._upload_gate(), reader, len(data), "thumbnail.jpg",
+            )
+        return handle, width, height
+
+    def send_uploaded_segment(self, handle, size, file_name, preview=None, *, mime_type=None, message_limiter=None):
+        """Send an already uploaded document on the account's event loop."""
+        return self.run(self._send_uploaded_segment(
+            handle, size, file_name, preview, mime_type=mime_type, message_limiter=message_limiter,
+        ), timeout=None)
+
+    async def _send_uploaded_segment(self, handle, size, file_name, preview=None, *, mime_type=None, message_limiter=None):
+        from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeImageSize
+
+        client = await self._upload_client()
         attributes = [DocumentAttributeFilename(file_name)]
         thumb = None
         if preview is not None:
             thumb, width, height = preview
-            # Both, or neither: Telegram drops a document thumbnail when the
-            # document does not also declare its size. And ``thumb`` has to be a
-            # path to a real .jpg — Telethon uploads it by name and Telegram
-            # ignores anything that does not look like a JPEG file.
+            # Telegram needs image dimensions alongside the thumbnail. The
+            # engine supplies a pre-uploaded JPEG handle; legacy callers may
+            # still supply a .jpg path for Telethon to upload.
             attributes.append(DocumentAttributeImageSize(width, height))
-        msg = await client.send_file(
-            "me",
-            handle,
-            force_document=True,
-            attributes=attributes,
-            thumb=thumb,
-        )
+        options = {"mime_type": mime_type} if mime_type else {}
+        for attempt in range(3):
+            if message_limiter is not None:
+                await message_limiter.acquire()
+            try:
+                msg = await client.send_file(
+                    "me", handle, force_document=True, attributes=attributes,
+                    thumb=thumb, **options,
+                )
+                break
+            except Exception as exc:
+                wait = _flood_seconds(exc)
+                if wait is None or message_limiter is None:
+                    raise
+                message_limiter.flood(wait)
+                if attempt == 2:
+                    raise
         doc = msg.document
         if doc is None:
-            raise RuntimeError("Telegram accepted the upload but returned no document")
+            raise RemoteIdentityError("Telegram accepted the upload but returned no document")
         return {
             "message_id": msg.id,
             "file_id": str(doc.id),
             "access_hash": str(doc.access_hash),
-            "size": size,
+            "size": getattr(doc, "size", size),
         }
 
 
