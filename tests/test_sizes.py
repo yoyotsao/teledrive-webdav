@@ -15,6 +15,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import tdapi  # noqa: E402
 from tdapi import Entry, _clip_parts, _hash_size  # noqa: E402
 from transfer_models import RemotePart  # noqa: E402
 
@@ -238,3 +239,52 @@ def test_later_value_wins_over_the_file(tmp_path):
     import json
 
     assert json.loads(path.read_text(encoding="utf-8")) == {"k": "new"}
+
+
+# --------------------------------------------------------------------------- #
+# ShardedJsonStore: what a write costs when the values are big
+# --------------------------------------------------------------------------- #
+
+
+def test_a_sharded_store_writes_only_the_key_that_changed(tmp_path):
+    """One archive's tree must not rewrite every other archive's.
+
+    zip_dirs.json reached 132 MB across 276 archives on the live drive, and
+    because it was one shared JSON, listing /game re-serialised the whole file
+    once per archive -- about 18 GB of writes for one listing, which never
+    finished and took the mount down with it.
+    """
+    store = tdapi.ShardedJsonStore(tmp_path / "zips")
+    store.put("a", {"tree": ["x"] * 100})
+    before = (tmp_path / "zips" / "a.json").stat().st_mtime_ns
+
+    store.put("b", {"tree": ["y"] * 100})
+
+    assert (tmp_path / "zips" / "a.json").stat().st_mtime_ns == before
+    assert sorted(p.name for p in (tmp_path / "zips").glob("*.json")) == ["a.json", "b.json"]
+
+
+def test_a_sharded_store_reads_back_across_processes(tmp_path):
+    tdapi.ShardedJsonStore(tmp_path / "zips").put("key", {"v": 1})
+
+    assert tdapi.ShardedJsonStore(tmp_path / "zips").get("key") == {"v": 1}
+    assert tdapi.ShardedJsonStore(tmp_path / "zips").get("missing") is None
+
+
+def test_a_sharded_store_makes_a_safe_filename_from_any_key(tmp_path):
+    store = tdapi.ShardedJsonStore(tmp_path / "zips")
+    store.put("../../escape", {"v": 1})
+
+    files = list((tmp_path / "zips").glob("*.json"))
+    assert len(files) == 1
+    assert files[0].parent == tmp_path / "zips"
+    assert store.get("../../escape") == {"v": 1}
+
+
+def test_a_sharded_store_leaves_no_temp_file_behind(tmp_path):
+    store = tdapi.ShardedJsonStore(tmp_path / "zips")
+    store.put("a", {"v": 1})
+    store.put("a", {"v": 2})
+
+    assert list((tmp_path / "zips").glob("*.tmp")) == []
+    assert store.get("a") == {"v": 2}

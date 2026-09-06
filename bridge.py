@@ -38,7 +38,7 @@ from wsgidav.wsgidav_app import WsgiDAVApp
 
 import zipfs
 from config import Config, ext_path as _ext, load_config
-from tdapi import ApiError, Entry, JsonStore, TeleDriveClient
+from tdapi import ApiError, Entry, JsonStore, ShardedJsonStore, TeleDriveClient
 from telegram_accounts import TelegramAccountPool
 from tgio import REQUEST_SIZE, STREAM_BLOCK_SIZE, SeekableRemoteFile
 from transfer_models import RemotePart
@@ -196,7 +196,10 @@ class Resolver:
         self.upload_stager = upload_stager
         self._zips: Dict[str, zipfs.ZipView] = {}
         self._zip_lock = threading.Lock()
-        self._zip_cache = JsonStore(cfg.cache_dir / "zip_dirs.json")
+        # One file per archive, not one shared JSON: a central directory can be
+        # megabytes and there are hundreds of them, so a shared file made each
+        # archive's first read rewrite every other archive's tree with it.
+        self._zip_cache = ShardedJsonStore(cfg.cache_dir / "zips")
         # Media properties never change once a message exists, same as previews.
         self._prop_cache = JsonStore(cfg.cache_dir / "media_props.json")
         self._thumb_lock = threading.Lock()

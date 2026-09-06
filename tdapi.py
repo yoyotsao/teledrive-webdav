@@ -267,6 +267,71 @@ class JsonStore:
                 pass
 
 
+class ShardedJsonStore:
+    """One file per key, for values large enough that sharing one file hurts.
+
+    Same ``get``/``put`` surface as :class:`JsonStore`, and the same premise --
+    the values are derived from immutable Telegram messages, so a key never has
+    to be invalidated. The difference is what a write costs. A zip's central
+    directory can be megabytes, and there are hundreds of archives; held in one
+    shared JSON, reading a folderful re-serialised the whole thing once per
+    archive. Measured on this drive: zip_dirs.json reached 132 MB with 276
+    archives in it, so a single listing of /game rewrote about 18 GB and the
+    listing never finished -- which is what wedged the mount.
+
+    This is the lesson meta/dirs/ already records, applied to the other cache
+    that grew big enough to need it.
+    """
+
+    def __init__(self, directory: Path):
+        self._dir = directory
+        self._lock = threading.Lock()
+        self._memory: dict = {}
+
+    def _path(self, key: str) -> Path:
+        safe = key if re.fullmatch(r"[A-Za-z0-9._-]{1,80}", key) else hashlib.sha1(
+            key.encode("utf-8")
+        ).hexdigest()
+        return self._dir / f"{safe}.json"
+
+    def get(self, key: str):
+        with self._lock:
+            if key in self._memory:
+                return self._memory[key]
+        try:
+            value = json.loads(self._path(key).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        with self._lock:
+            self._memory[key] = value
+        return value
+
+    def put(self, key: str, value, *, defer: bool = False) -> None:
+        with self._lock:
+            self._memory[key] = value
+        if defer:
+            return
+        target = self._path(key)
+        try:
+            self._dir.mkdir(parents=True, exist_ok=True)
+            handle, name = tempfile.mkstemp(dir=self._dir, prefix=target.name + ".", suffix=".tmp")
+            try:
+                with os.fdopen(handle, "w", encoding="utf-8") as fh:
+                    json.dump(value, fh)
+                os.replace(name, target)
+            except BaseException:
+                try:
+                    os.unlink(name)
+                except OSError:
+                    pass
+                raise
+        except OSError as exc:  # pragma: no cover - cache is best-effort
+            log.warning("could not persist %s: %s", target.name, exc)
+
+    def flush(self) -> None:
+        """Nothing to do: every put already wrote its own file."""
+
+
 class TeleDriveClient:
     def __init__(self, cfg):
         self.cfg = cfg
