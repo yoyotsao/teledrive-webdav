@@ -416,10 +416,14 @@ def main(argv=None) -> int:
     else:
         fingerprint_all(planned)
 
-    deadline = time.monotonic() + args.timeout_minutes * 60
-    print(f"waiting for the debounce ({cfg.debounce_minutes} min) and the uploads ...")
-    if not wait_for_quiet(rpc, {i.name for i in planned}, deadline):
-        print("[error] the upload queue did not drain within the timeout")
+    if not args.verify_only:
+        # Nothing to wait for when checking a previous run: those files left the
+        # queue when they were registered, so waiting for them to appear in it
+        # can only ever time out.
+        deadline = time.monotonic() + args.timeout_minutes * 60
+        print(f"waiting for the debounce ({cfg.debounce_minutes} min) and the uploads ...")
+        if not wait_for_quiet(rpc, {i.name for i in planned}, deadline):
+            print("[error] the upload queue did not drain within the timeout")
 
     api = TeleDriveClient(cfg)
     api.invalidate()
