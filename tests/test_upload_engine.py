@@ -383,3 +383,65 @@ def test_telegram_reported_short_size_is_rejected_without_registering(rig):
     with pytest.raises(upload_engine.CoverageError):
         rig.engine().transfer(rig.request(2))
     assert rig.api.payloads == []
+
+
+def test_upload_client_short_flood_reaches_message_bucket_before_sender_retry(monkeypatch):
+    """Telethon's own retry loop must not swallow short message FloodWaits."""
+    from datetime import datetime, timezone
+
+    from telethon import TelegramClient
+    from telethon.errors import FloodWaitError
+    from telethon.tl.types import InputFile, InputPeerSelf, Updates
+
+    events = []
+    requests = []
+
+    class Sender:
+        def send(self, request, ordered=False):
+            requests.append(request)
+            events.append("send")
+            future = asyncio.get_running_loop().create_future()
+            if len(requests) == 1:
+                future.set_exception(FloodWaitError(request=request, capture=2))
+            else:
+                future.set_result(Updates([], [], [], datetime.now(timezone.utc), 0))
+            return future
+
+    class Bucket:
+        async def acquire(self):
+            events.append("acquire")
+
+        def flood(self, seconds):
+            events.append(("flood", seconds))
+
+    async def connect(client):
+        client._loop = asyncio.get_running_loop()
+        client._sender = Sender()
+
+    async def get_input_entity(client, peer):
+        return InputPeerSelf()
+
+    async def unexpected_automatic_sleep(seconds):
+        events.append(("automatic_sleep", seconds))
+
+    monkeypatch.setattr(TelegramClient, "connect", connect)
+    monkeypatch.setattr(TelegramClient, "get_input_entity", get_input_entity)
+    monkeypatch.setattr(TelegramClient, "_get_response_message", lambda *_: SimpleNamespace(
+        id=10, document=SimpleNamespace(id=20, access_hash=30, size=1),
+    ))
+    monkeypatch.setattr("telethon.client.users.asyncio.sleep", unexpected_automatic_sleep)
+
+    worker = TelegramWorker(1, "hash", "")
+    handle = InputFile(99, 1, "file.bin", "checksum")
+
+    async def scenario():
+        worker._pool_lock = asyncio.Lock()
+        return await worker._send_uploaded_segment(
+            handle, 1, "file.bin", message_limiter=Bucket(),
+        )
+
+    result = asyncio.run(scenario())
+    assert result["message_id"] == 10
+    assert events == ["acquire", "send", ("flood", 2), "acquire", "send"]
+    assert [type(request).__name__ for request in requests] == ["SendMediaRequest", "SendMediaRequest"]
+    assert all(request.media.file is handle for request in requests)

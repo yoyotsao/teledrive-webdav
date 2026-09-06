@@ -366,7 +366,13 @@ class TelegramWorker:
             from telethon import TelegramClient
             from telethon.sessions import StringSession
 
-            client = TelegramClient(StringSession(self._session), self._api_id, self._api_hash)
+            # Surface every upload/message flood to the account limiters.
+            # Telethon's default short-wait retry would bypass their feedback
+            # and admission when send_file creates a message.
+            client = TelegramClient(
+                StringSession(self._session), self._api_id, self._api_hash,
+                flood_sleep_threshold=0,
+            )
             await client.connect()
             log.info("upload connection ready")
             self._upload = client
