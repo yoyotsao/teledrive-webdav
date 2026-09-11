@@ -1,0 +1,20 @@
+name: ChatGPT export
+
+on:
+  push:
+    branches:
+      - tmp/chatgpt-sqlite-failover-export
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp/chatgpt-sqlite-failover-export
+      - uses: actions/upload-artifact@v4
+        with:
+          name: teledrive-webdav-source
+          path: .
+          include-hidden-files: true
+          if-no-files-found: error
