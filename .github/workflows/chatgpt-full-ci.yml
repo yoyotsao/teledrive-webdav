@@ -48,6 +48,11 @@ jobs:
           echo "504ff452d0765de0a0caf66dd0ffa4bd1d0d59578e12edeed1bcafb038dce3f9  /tmp/full-suite-fix.patch" | sha256sum -c -
           git apply --check /tmp/full-suite-fix.patch
           git apply --index /tmp/full-suite-fix.patch
+          git show "origin/tmp/chatgpt-sqlite-failover-export:ci/limiter-lifecycle-fix-v3.00.patch" > /tmp/limiter-lifecycle-fix.patch
+          git show "origin/tmp/chatgpt-sqlite-failover-export:ci/limiter-lifecycle-fix-v3.01.patch" >> /tmp/limiter-lifecycle-fix.patch
+          echo "987210e6be5f1f4e26989af607f582062fd24c5a03e9cf52174cd034a0ca34ca  /tmp/limiter-lifecycle-fix.patch" | sha256sum -c -
+          git apply --check /tmp/limiter-lifecycle-fix.patch
+          git apply --index /tmp/limiter-lifecycle-fix.patch
           git diff --cached --check
 
       - name: Install complete dependencies
@@ -85,6 +90,15 @@ jobs:
       - name: Verify bridge E2E compatibility
         run: python -m pytest tests/test_bridge_e2e.py -q
 
+      - name: Verify upload regression files
+        run: >-
+          python -m pytest
+          tests/test_upload_album.py
+          tests/test_upload_engine.py
+          tests/test_upload_parts.py
+          tests/test_upload_protocol.py
+          -q
+
       - name: Run complete offline suite
         run: python -m pytest -q --ignore=tests/live
 
@@ -108,4 +122,4 @@ jobs:
           git commit -m 'feat: implement SQLite sessions and idle segment failover'
           git push origin HEAD:plan/sqlite-sessions-idle-segment-failover
 
-# original payload + verified full-suite compatibility fix
+# original payload + verified compatibility patches
