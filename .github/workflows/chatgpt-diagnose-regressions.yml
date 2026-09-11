@@ -42,6 +42,10 @@ jobs:
           git show "origin/tmp/chatgpt-sqlite-failover-export:ci/full-suite-fix.patch.gz.b64" | base64 -d | gzip -d > /tmp/full-suite-fix.patch
           echo "504ff452d0765de0a0caf66dd0ffa4bd1d0d59578e12edeed1bcafb038dce3f9  /tmp/full-suite-fix.patch" | sha256sum -c -
           git apply /tmp/full-suite-fix.patch
+          git show "origin/tmp/chatgpt-sqlite-failover-export:ci/limiter-lifecycle-fix.patch.gz.b64" | base64 -d | gzip -d > /tmp/limiter-lifecycle-fix.patch
+          echo "77dfda67f1bc7d1fef35ae4d0613808ccbf2a01aef5ae667ac48493f221dbe54  /tmp/limiter-lifecycle-fix.patch" | sha256sum -c -
+          git apply /tmp/limiter-lifecycle-fix.patch
+          git diff --check
       - name: Install dependencies
         run: python -m pip install -r requirements.txt pytest
       - name: Run regression file
