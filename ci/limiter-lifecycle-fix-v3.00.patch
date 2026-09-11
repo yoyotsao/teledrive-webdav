@@ -1,0 +1,106 @@
+diff --git a/tests/test_upload_album.py b/tests/test_upload_album.py
+index 5f7e0a1..f7f80b7 100644
+--- a/tests/test_upload_album.py
++++ b/tests/test_upload_album.py
+@@ -363,7 +363,10 @@ def test_album_default_timeout_is_sixty_seconds(rig, monkeypatch):
+ 
+     monkeypatch.setattr("tgio.asyncio.wait_for", wait_for)
+     r.engine.transfer_batch([r.request(0)])
+-    assert deadlines == [60]
++    # Part RPCs now have their own 120-second wrapper deadline; the album send
++    # still owns the final, independent 60-second default deadline.
++    assert deadlines[-1] == 60
++    assert all(timeout == 120.0 for timeout in deadlines[:-1])
+ 
+ 
+ def test_worker_rejects_mixed_accounts_before_sending(rig):
+diff --git a/tests/test_upload_engine.py b/tests/test_upload_engine.py
+index 17a9593..311f5e7 100644
+--- a/tests/test_upload_engine.py
++++ b/tests/test_upload_engine.py
+@@ -193,8 +193,8 @@ def test_only_segment_zero_has_thumbnail_and_upload_uses_chunk_limiter(rig, monk
+     monkeypatch.setattr("tgio.capture_thumbnail", lambda *_: ThumbnailResult("ready", b"jpeg", 640, 360))
+     result = rig.engine().transfer(rig.request(500 * MiB + 1, "video/mp4"))
+     assert [p.has_thumbnail for p in result.parts] == [True, False]
+-    first = rig.workers["1"].client
+-    second = rig.workers["2"].client
++    first = rig.workers[1].client
++    second = rig.workers[2].client
+     assert len(first.requests) == 1  # thumbnail uses explicit small-part upload
+     assert first.requests[0].bytes == b"jpeg"
+     assert first.messages[0][2]["thumb"] is not None
+@@ -422,7 +422,7 @@ def test_telegram_reported_short_size_is_rejected_without_registering(rig):
+     async def send(*args, **kwargs):
+         return SimpleNamespace(id=10, document=SimpleNamespace(id=20, access_hash=30, size=1))
+ 
+-    rig.workers["1"].client.send_file = send
++    rig.workers[1].client.send_file = send
+     with pytest.raises(upload_engine.CoverageError):
+         rig.engine().transfer(rig.request(2))
+     assert rig.api.payloads == []
+@@ -474,7 +474,13 @@ def test_upload_client_short_flood_reaches_message_bucket_before_sender_retry(mo
+     ))
+     monkeypatch.setattr("telethon.client.users.asyncio.sleep", unexpected_automatic_sleep)
+ 
++    from telethon.sessions import MemorySession
++
+     worker = TelegramWorker(1, "hash", 1, Path("unused.session"))
++    # Auxiliary upload clients now clone the validated control session.  This
++    # transport-level test does not exercise SQLite startup, so provide the
++    # minimal connected control-session state required by that lifecycle.
++    worker._client = SimpleNamespace(session=MemorySession())
+     handle = InputFile(99, 1, "file.bin", "checksum")
+ 
+     async def scenario():
+@@ -486,5 +492,6 @@ def test_upload_client_short_flood_reaches_message_bucket_before_sender_retry(mo
+     result = asyncio.run(scenario())
+     assert result["message_id"] == 10
+     assert events == ["acquire", "send", ("flood", 2), "acquire", "send"]
+-    assert [type(request).__name__ for request in requests] == ["SendMediaRequest", "SendMediaRequest"]
+-    assert all(request.media.file is handle for request in requests)
++    inner_requests = [getattr(request, "query", request) for request in requests]
++    assert [type(request).__name__ for request in inner_requests] == ["SendMediaRequest", "SendMediaRequest"]
++    assert all(request.media.file is handle for request in inner_requests)
+diff --git a/tests/test_upload_protocol.py b/tests/test_upload_protocol.py
+index a123eff..54c92b1 100644
+--- a/tests/test_upload_protocol.py
++++ b/tests/test_upload_protocol.py
+@@ -184,12 +184,10 @@ def test_big_upload_releases_completed_payloads_instead_of_retaining_all_parts()
+ 
+     class Sender:
+         def __init__(self):
+-            self.first_done = asyncio.Event()
+             self.release_second = asyncio.Event()
+ 
+         async def send(self, request):
+             if request.index == 0:
+-                self.first_done.set()
+                 return
+             await self.release_second.wait()
+ 
+@@ -197,6 +195,11 @@ def test_big_upload_releases_completed_payloads_instead_of_retaining_all_parts()
+     limiter = RecordingLimiter()
+     stream = Stream()
+     first_ref = weakref.ref(stream.payloads[0])
++    first_completed = asyncio.Event()
++
++    def progress(current, _total):
++        if current >= 1:
++            first_completed.set()
+ 
+     async def scenario():
+         async with _PartReader(stream) as reader:
+@@ -211,11 +214,14 @@ def test_big_upload_releases_completed_payloads_instead_of_retaining_all_parts()
+                         index=index, total=total, data=data
+                     ),
+                     workers=2,
+-                    progress=None,
++                    progress=progress,
+                     collect_payloads=False,
+                 )
+             )
+-            await sender.first_done.wait()
++            # The part is only complete after the shielded RPC has settled and
++            # send_one has advanced progress. At that boundary the payload must
++            # no longer be retained by the finished part task.
++            await first_completed.wait()
