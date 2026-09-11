@@ -1,0 +1,51 @@
+name: ChatGPT diagnose full suite
+
+on:
+  push:
+    branches:
+      - tmp/chatgpt-sqlite-failover-export
+    paths:
+      - .github/workflows/chatgpt-diagnose-full-suite.yml
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: plan/sqlite-sessions-idle-segment-failover
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Reconstruct verified patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "9ec9d8b6b53874334f579158ec5a3665e25adf1b"
+          git fetch origin tmp/chatgpt-sqlite-failover-export:refs/remotes/origin/tmp/chatgpt-sqlite-failover-export
+          : > /tmp/payload.b64
+          for part in 00 01 02a 02b 03 04 05 06 07 08 09 10; do
+            git show "origin/tmp/chatgpt-sqlite-failover-export:ci/final-upload.${part}" >> /tmp/payload.b64
+          done
+          base64 -d /tmp/payload.b64 | gzip -d > /tmp/final.patch
+          echo "8420bc759445fdb7f5cb538eb88a24cc3cf41d8a3e6562b55547ed4b03e8b5c6  /tmp/final.patch" | sha256sum -c -
+          git apply /tmp/final.patch
+
+      - name: Install complete dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+
+      - name: Run test files with timeout
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r test_file; do
+            echo "===== ${test_file} ====="
+            timeout 120s python -m pytest "${test_file}" -q
+          done < <(find tests -maxdepth 1 -type f -name 'test_*.py' | sort)
