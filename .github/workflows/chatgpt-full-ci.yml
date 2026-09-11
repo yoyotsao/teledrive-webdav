@@ -100,3 +100,5 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git commit -m 'feat: implement SQLite sessions and idle segment failover'
           git push origin HEAD:plan/sqlite-sessions-idle-segment-failover
+
+# payload complete: retry after all verified chunks uploaded
