@@ -1,0 +1,125 @@
+name: ChatGPT full dependency CI
+
+on:
+  push:
+    branches:
+      - tmp/chatgpt-sqlite-failover-export
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout helper payload
+        uses: actions/checkout@v4
+        with:
+          path: helper
+
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: plan/sqlite-sessions-idle-segment-failover
+          path: work
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Apply verified implementation payload
+        shell: python
+        run: |
+          import base64, io, pathlib, tarfile
+          root = pathlib.Path('helper/ci')
+          encoded = b''.join((root / f'final-changes.part{i:02d}').read_bytes() for i in range(4))
+          data = base64.b64decode(encoded)
+          with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as archive:
+              archive.extractall('work')
+          obsolete = pathlib.Path('work/accounts.example.json')
+          if obsolete.exists():
+              obsolete.unlink()
+
+      - name: Install complete dependencies
+        working-directory: work
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+
+      - name: Phase A focused tests
+        working-directory: work
+        run: >-
+          python -m pytest
+          tests/test_session_discovery.py
+          tests/test_session_clients.py
+          tests/test_session_lock.py
+          tests/test_sessionctl.py
+          tests/test_session_migration.py
+          tests/test_account_pool.py
+          tests/test_auth_challenge.py
+          tests/test_account_routing.py
+          tests/test_routed_metadata.py
+          -q
+
+      - name: Phase B focused tests
+        working-directory: work
+        run: >-
+          python -m pytest
+          tests/test_failover_logging.py
+          tests/test_transfer_status.py
+          tests/test_transfer_logging.py
+          tests/test_upload_failover.py
+          tests/test_segment_scheduler.py
+          tests/test_upload_activity.py
+          tests/test_upload_limiter.py
+          tests/test_upload_attempts.py
+          tests/test_account_failover.py
+          tests/test_upload_engine.py
+          tests/test_upload_album.py
+          tests/test_upload_parts.py
+          tests/test_upload_protocol.py
+          tests/test_account_routing.py
+          -q
+
+      - name: Full offline suite
+        working-directory: work
+        run: python -m pytest -q
+
+      - name: Diff check
+        working-directory: work
+        run: git diff --check
+
+      - name: Credential pattern scan
+        working-directory: work
+        shell: python
+        run: |
+          import pathlib, re, sys
+          paths = [
+              pathlib.Path('config.example.ini'), pathlib.Path('README.md'), pathlib.Path('CLAUDE.md'),
+              pathlib.Path('tests'), pathlib.Path('telegram_sessions.py'), pathlib.Path('telegram_accounts.py'),
+              pathlib.Path('tgio.py'), pathlib.Path('sessionctl.py'), pathlib.Path('upload_activity.py'),
+              pathlib.Path('segment_scheduler.py'), pathlib.Path('upload_engine.py'),
+          ]
+          patterns = [
+              re.compile(r'session\s*[=:]\s*[A-Za-z0-9_-]{40}', re.I),
+              re.compile(r'authorization:\s*bearer', re.I),
+              re.compile(r'ey[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.'),
+          ]
+          hits = []
+          for root in paths:
+              files = root.rglob('*') if root.is_dir() else [root]
+              for path in files:
+                  if not path.is_file() or '__pycache__' in path.parts:
+                      continue
+                  try:
+                      text = path.read_text('utf-8')
+                  except UnicodeDecodeError:
+                      continue
+                  for lineno, line in enumerate(text.splitlines(), 1):
+                      if any(p.search(line) for p in patterns):
+                          hits.append(f'{path}:{lineno}:{line}')
+          if hits:
+              print('\n'.join(hits))
+              sys.exit(1)
