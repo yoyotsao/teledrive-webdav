@@ -47,20 +47,21 @@ log = logging.getLogger("bridge")
 
 # Verbs that mutate. Everything outside /game/<something> gets 403 for these,
 # rather than mounting the whole drive read-only (which would kill /game too).
-# MKCOL, PUT, DELETE and COPY are exempted below (WriteGuard) — none of the
-# four needs /game specifically. MKCOL and PUT map onto real backend endpoints
-# (POST /folders, and the same stage-upload-register pipeline /game uses).
-# DELETE and COPY have no backend endpoint anywhere, /game included, but
-# neither needs /game either: the resources themselves already draw the real
-# line — still-staged writes (StagingFileResource/StagingCollection,
+# MKCOL, PUT, DELETE, COPY and MOVE are exempted below (WriteGuard) — none of
+# the five needs /game specifically. MKCOL and PUT map onto real backend
+# endpoints (POST /folders, and the same stage-upload-register pipeline
+# /game uses). DELETE, COPY and MOVE have real backend endpoints too now
+# (trash, register-reuse, and rename/reparent respectively) but none of them
+# needs /game either: the resources themselves already draw the real line —
+# still-staged writes (StagingFileResource/StagingCollection,
 # UploadFileResource) accept them as local filesystem operations,
-# already-uploaded resources (_ReadOnlyCollection, _ReadOnlyFile) refuse them
+# already-uploaded resources (_ReadOnlyCollection, _ReadOnlyFile,
+# RemoteFileResource, FolderCollection) call the matching backend operation
 # — so gating by path on top would only block the /game case for no reason.
-# MOVE/PROPPATCH/LOCK have no such per-resource distinction (no rename
-# primitive exists even for staged content outside /game) and stay
-# path-gated below.
+# PROPPATCH/LOCK have no such per-resource distinction and stay path-gated
+# below.
 WRITE_METHODS = {"PUT", "DELETE", "MKCOL", "MOVE", "COPY", "PROPPATCH", "LOCK", "UNLOCK"}
-UNGATED_METHODS = {"MKCOL", "PUT", "DELETE", "COPY"}
+UNGATED_METHODS = {"MKCOL", "PUT", "DELETE", "COPY", "MOVE"}
 
 ROOT = "root"
 FOLDER = "folder"
@@ -766,6 +767,43 @@ class RemoteFileResource(_ReadOnlyFile):
             return
         self.resolver.upload_stager.touch(self._upload_segments, self._upload_parent_id)
 
+    def delete(self):
+        self.resolver.api.trash(self.entry.file_id)
+
+    def support_recursive_move(self, dest_path):
+        # Override to enable move_recursive() instead of copy+delete fallback.
+        # move_recursive() calls api.move() which atomically reparents in place,
+        # avoiding duplicate's split-file problem: a MOVE of a split file via
+        # duplicate() creates new parts with new IDs, then delete() only trashes
+        # the part-0 representative row, leaving parts 1..N orphaned.
+        return True
+
+    def move_recursive(self, dest_path):
+        dest_segments = split_dav_path(dest_path)
+        if len(dest_segments) > 1:
+            parent_loc = self.resolver.resolve(dest_segments[:-1])
+            if parent_loc.kind in (STAGE_DIR, STAGE_FILE):
+                raise DAVError(HTTP_FORBIDDEN, "cannot move an already-uploaded file into a staging area")
+            parent = self.resolver.api.resolve(dest_segments[:-1])
+        else:
+            parent = None
+        parent_id = parent.file_id if parent is not None else None
+        filename = dest_segments[-1]
+        self.resolver.api.move(self.entry.file_id, parent_id=parent_id, filename=filename)
+
+    def copy_move_single(self, dest_path, *, is_move):
+        dest_segments = split_dav_path(dest_path)
+        if len(dest_segments) > 1:
+            parent_loc = self.resolver.resolve(dest_segments[:-1])
+            if parent_loc.kind in (STAGE_DIR, STAGE_FILE):
+                raise DAVError(HTTP_FORBIDDEN, "cannot copy/move an already-uploaded file into a staging area")
+            parent = self.resolver.api.resolve(dest_segments[:-1])
+        else:
+            parent = None
+        parent_id = parent.file_id if parent is not None else None
+        filename = dest_segments[-1]
+        self.resolver.api.duplicate(self.entry, filename=filename, parent_id=parent_id)
+
 
 class ZipFileResource(_ReadOnlyFile):
     def __init__(self, path, environ, resolver: Resolver, view: zipfs.ZipView, node: zipfs.ZipNode, entry: Entry):
@@ -905,11 +943,49 @@ class GameCollection(DAVCollection):
     def handle_delete(self):
         raise DAVError(HTTP_FORBIDDEN)
 
+    # Without these, MOVE of /game falls through to DAVCollection's default
+    # copy_move_single(), reached only after wsgidav's descendant walk visits
+    # every child — the request still ends up rejected, but as a 207
+    # Multi-Status full of per-child 403s rather than a clean top-level 403
+    # (empirically confirmed: four "/game/" 403 sub-responses, /game itself
+    # untouched). COPY already 403s cleanly today via that same walk-then-
+    # default path, but these overrides short-circuit it for COPY too rather
+    # than leaving it to accidentally work for a different reason.
+    def handle_copy(self, dest_path, *, depth_infinity):
+        raise DAVError(HTTP_FORBIDDEN)
+
+    def handle_move(self, dest_path):
+        raise DAVError(HTTP_FORBIDDEN)
+
 
 class FolderCollection(RootCollection):
     def __init__(self, path, environ, resolver: Resolver, entry: Entry):
         super().__init__(path, environ, resolver, entry.file_id, entry.mtime)
         self.entry = entry
+
+    def handle_delete(self):
+        self.resolver.api.trash(self.entry.file_id)
+        return True
+
+    def handle_move(self, dest_path):
+        dest_segments = split_dav_path(dest_path)
+        parent = self.resolver.api.resolve(dest_segments[:-1]) if len(dest_segments) > 1 else None
+        parent_id = parent.file_id if parent is not None else None
+        self.resolver.api.move(self.entry.file_id, parent_id=parent_id, filename=dest_segments[-1])
+        return True
+
+    # Opts back OUT of _ReadOnlyCollection's blanket handle_copy() 403: a real
+    # copy is possible now, and wsgidav's own per-node descendant walk already
+    # does the recursion for free — this class only needs to answer for
+    # itself (create the destination folder; see copy_move_single below).
+    def handle_copy(self, dest_path, *, depth_infinity):
+        return False
+
+    def copy_move_single(self, dest_path, *, is_move):
+        dest_segments = split_dav_path(dest_path)
+        parent = self.resolver.api.resolve(dest_segments[:-1]) if len(dest_segments) > 1 else None
+        parent_id = parent.file_id if parent is not None else None
+        self.resolver.api.create_folder(dest_segments[-1], parent_id=parent_id)
 
 
 class ZipDirCollection(_ReadOnlyCollection):
@@ -963,7 +1039,10 @@ class _StagingCopyMove:
         return self.stager.path_for(split_dav_path(dest_path)[1:]) is not None
 
     def move_recursive(self, dest_path):
-        self.stager.move(self.local, split_dav_path(dest_path))
+        try:
+            self.stager.move(self.local, split_dav_path(dest_path))
+        except PermissionError as exc:
+            raise DAVError(HTTP_FORBIDDEN, str(exc))
 
     def copy_move_single(self, dest_path, *, is_move):
         try:
@@ -1241,18 +1320,19 @@ def _text_response(start_response, status: str, body: str, content_type="text/pl
 
 
 class WriteGuard:
-    """Reject every mutating verb outside /game/<pack-unit> — except MKCOL, PUT, DELETE and COPY.
+    """Reject every mutating verb outside /game/<pack-unit> — except MKCOL, PUT, DELETE, COPY and MOVE.
 
     MKCOL and PUT map onto a real backend endpoint that needs no packing:
     MKCOL is `POST /folders` (`RootCollection.create_collection`), and PUT is
     the same stage -> upload -> register pipeline /game uses, generalized to
     an arbitrary destination by uploadstage.py instead of a fixed /game
-    folder. DELETE and COPY have no backend endpoint anywhere, but gating them
-    by path would be the wrong axis: the actual line is staged-vs-uploaded, and the
+    folder. DELETE, COPY and MOVE have real backend endpoints too (trash,
+    register-reuse, and rename/reparent respectively) but gating them by path
+    would be the wrong axis: the actual line is staged-vs-uploaded, and the
     resources enforce that themselves (StagingFileResource/UploadFileResource
-    implement them as local undo/copy operations; _ReadOnlyCollection/_ReadOnlyFile
-    refuse them via handle_delete/copy_move_single or the wsgidav default).
-    MOVE, PROPPATCH, LOCK have no such per-resource distinction, so they stay gated.
+    implement them as local undo/copy/move operations; _ReadOnlyCollection/_ReadOnlyFile
+    refuse them via handle_delete/copy_move_single/handle_move or the wsgidav default).
+    PROPPATCH and LOCK have no such per-resource distinction, so they stay gated.
 
     rclone's global --read-only is not usable here because it would also freeze
     /game, so the rule lives on this side of the mount.

@@ -50,6 +50,7 @@ PAGE_SIZE = 10000
 
 
 THUMB_JPEG = bytes.fromhex("ffd8ffe0") + b"fake jpeg preview" * 3 + bytes.fromhex("ffd9")
+_UNSET = object()
 
 
 class FakeWorker:
@@ -269,7 +270,10 @@ class FakeBackend:
         group=None,
         part_index=None,
         file_hash=None,
+        access_hash=_UNSET,
     ):
+        if access_hash is _UNSET:
+            access_hash = "ah" if message_id else None
         return {
             "file_id": uuid.uuid4().hex,
             "filename": name,
@@ -280,14 +284,26 @@ class FakeBackend:
             "has_thumbnail": False,
             "created_at": self._stamp(),
             "direct_url": None,
-            "access_hash": "ah" if message_id else None,
+            "access_hash": access_hash,
             "parent_id": parent_id,
             "isDir": is_dir,
             "is_split_file": is_split,
             "split_group_id": group,
             "part_index": part_index,
             "file_hash": file_hash,
+            "trashed_at": None,
         }
+
+    def _subtree_ids(self, root_id: str) -> set:
+        ids = {root_id}
+        changed = True
+        while changed:
+            changed = False
+            for r in self.rows:
+                if r["parent_id"] in ids and r["file_id"] not in ids:
+                    ids.add(r["file_id"])
+                    changed = True
+        return ids
 
     # -- endpoint dispatch ------------------------------------------------ #
 
@@ -323,6 +339,7 @@ class FakeBackend:
                 group=payload.get("split_group_id"),
                 part_index=payload.get("part_index"),
                 file_hash=payload.get("file_hash"),
+                access_hash=payload.get("access_hash") if "access_hash" in payload else _UNSET,
             )
             row["file_id"] = payload["file_id"]
             row["telegram_user_id"] = payload.get("telegram_user_id") or 0
@@ -334,6 +351,20 @@ class FakeBackend:
             self.rows = [r for r in self.rows if r["file_id"] != row["file_id"]]
             self.rows.append(row)
             return row
+        if path.startswith("/files/") and method == "DELETE" and not path.endswith("/purge"):
+            file_id = path.rsplit("/", 1)[1]
+            ids = self._subtree_ids(file_id)
+            stamp = self._stamp()
+            for r in self.rows:
+                if r["file_id"] in ids:
+                    r["trashed_at"] = stamp
+            return {"message": "Moved to trash", "file_id": file_id, "items_trashed": len(ids)}
+        if path.startswith("/files/") and method == "PATCH":
+            file_id = path.rsplit("/", 1)[1]
+            row = next(r for r in self.rows if r["file_id"] == file_id)
+            row["parent_id"] = payload.get("parent_id")
+            row["filename"] = payload.get("filename")
+            return row
         raise AssertionError(f"unexpected API call {method} {path}")
 
     def _list(self, params, want_dir):
@@ -343,6 +374,7 @@ class FakeBackend:
             for r in self.rows
             if bool(r["isDir"]) is want_dir
             and r["parent_id"] == parent
+            and not r.get("trashed_at")
             # Split parts collapse to the primary part, as the real query does.
             and (not r["is_split_file"] or (r["part_index"] or 0) == 0)
         ]
@@ -625,8 +657,6 @@ def test_missing_path_is_404(rig):
 @pytest.mark.parametrize(
     "method,path",
     [
-        ("DELETE", "/photos/small.txt"),
-        ("DELETE", "/movie.mkv"),
         ("PROPPATCH", "/photos/small.txt"),
         ("LOCK", "/photos/small.txt"),
         ("DELETE", "/game"),
@@ -661,23 +691,48 @@ def test_move_into_a_read_only_path_is_forbidden(rig):
     assert resp.status_code == 403
 
 
-def test_copy_already_uploaded_file_outside_game_is_forbidden(rig):
+def test_move_out_of_game_staging_is_forbidden(rig):
+    rig.request("MKCOL", "/game/Temp")
+    rig.request("PUT", "/game/Temp/a.bin", data=b"junk")
+
     resp = rig.request(
-        "COPY", "/photos/small.txt", headers={"Destination": rig.base + "/photos/copy.txt"}
+        "MOVE", "/game/Temp/a.bin", headers={"Destination": rig.base + "/photos/escaped.bin"}
     )
     assert resp.status_code == 403, resp.status_code
-    assert "already uploaded" in resp.text, resp.text
-    assert "copy.txt" not in rig.names("/photos")
+    assert "escaped.bin" not in rig.names("/photos")
+    assert "a.bin" in rig.names("/game/Temp")
 
 
-def test_copy_already_uploaded_folder_outside_game_is_forbidden(rig):
-    # _ReadOnlyCollection.handle_copy() via FolderCollection, not
-    # ZipDirCollection — the only other collection coverage
-    # (test_copy_already_packed_game_folder_does_not_walk_the_archive)
-    # exercises the zip-archive subclass exclusively.
-    resp = rig.request("COPY", "/photos", headers={"Destination": rig.base + "/photos2"})
-    assert resp.status_code == 403, resp.status_code
-    assert "photos2" not in rig.names("/")
+def test_move_already_uploaded_file_renames_and_reparents(rig):
+    resp = rig.request(
+        "MOVE", "/photos/small.txt", headers={"Destination": rig.base + "/game/renamed.txt"}
+    )
+    assert resp.status_code in (201, 204), resp.status_code
+    assert "small.txt" not in rig.names("/photos")
+    assert "renamed.txt" in rig.names("/game")
+
+
+def test_copy_already_uploaded_file_creates_an_independent_row(rig):
+    resp = rig.request(
+        "COPY", "/photos/small.txt", headers={"Destination": rig.base + "/game/copy.txt"}
+    )
+    assert resp.status_code == 201, resp.status_code
+    assert "small.txt" in rig.names("/photos")  # original untouched
+    assert "copy.txt" in rig.names("/game")
+    assert rig.request("GET", "/game/copy.txt").content == rig.blob_for("photos/small.txt")
+
+
+def test_move_already_uploaded_split_file_preserves_all_parts(rig):
+    # blob_for() must run BEFORE the move: it resolves the path via
+    # entry_for(), which stops working the instant the old path is gone.
+    original_bytes = rig.blob_for("movie.mkv")
+    resp = rig.request(
+        "MOVE", "/movie.mkv", headers={"Destination": rig.base + "/game/movie2.mkv"}
+    )
+    assert resp.status_code in (201, 204), resp.status_code
+    assert "movie.mkv" not in rig.names("/")
+    assert "movie2.mkv" in rig.names("/game")
+    assert rig.request("GET", "/game/movie2.mkv").content == original_bytes
 
 
 def test_copy_already_uploaded_file_into_game_staging_is_forbidden(rig):
@@ -695,9 +750,52 @@ def test_copy_already_uploaded_file_into_game_staging_is_forbidden(rig):
     assert not (rig.cfg.staging_dir / "Temp" / "x.txt").exists()
 
 
+def test_move_already_uploaded_file_into_game_staging_is_forbidden(rig):
+    rig.request("MKCOL", "/game/Temp")
+
+    resp = rig.request(
+        "MOVE", "/photos/small.txt", headers={"Destination": rig.base + "/game/Temp/x.txt"}
+    )
+    assert resp.status_code == 403, resp.status_code
+    assert "small.txt" in rig.names("/photos")
+    assert not (rig.cfg.staging_dir / "Temp" / "x.txt").exists()
+
+
+def test_move_already_uploaded_folder_renames_it_children_intact(rig):
+    resp = rig.request(
+        "MOVE", "/photos", headers={"Destination": rig.base + "/renamed_photos"}
+    )
+    assert resp.status_code in (201, 204), resp.status_code
+    assert "photos" not in rig.names("/")
+    assert "renamed_photos" in rig.names("/")
+    assert sorted(rig.names("/renamed_photos")) == ["shot.png", "small.txt"]
+
+
+def test_copy_already_uploaded_folder_duplicates_the_whole_subtree(rig):
+    resp = rig.request(
+        "COPY", "/photos", headers={"Destination": rig.base + "/game/photos2/"}
+    )
+    assert resp.status_code == 201, resp.status_code
+    assert sorted(rig.names("/photos")) == ["shot.png", "small.txt"]  # original untouched
+    assert sorted(rig.names("/game/photos2")) == ["shot.png", "small.txt"]
+    assert rig.request("GET", "/game/photos2/small.txt").content == rig.blob_for("photos/small.txt")
+
+
+def test_move_game_folder_itself_is_forbidden(rig):
+    resp = rig.request("MOVE", "/game", headers={"Destination": rig.base + "/renamed_game"})
+    assert resp.status_code == 403, resp.status_code
+    assert "game" in rig.names("/")
+
+
+def test_copy_game_folder_itself_is_forbidden(rig):
+    resp = rig.request("COPY", "/game", headers={"Destination": rig.base + "/game_copy"})
+    assert resp.status_code == 403, resp.status_code
+    assert "game_copy" not in rig.names("/")
+
+
 def test_read_only_paths_are_unchanged_after_rejected_deletes(rig):
-    rig.request("DELETE", "/photos/small.txt")
-    assert rig.names("/photos") == ["shot.png", "small.txt"]
+    rig.request("DELETE", "/game")
+    assert rig.names("/") == ["game", "movie.mkv", "photos"]
 
 
 # --------------------------------------------------------------------------- #
@@ -836,6 +934,93 @@ def test_upload_status_reports_pending_then_clears(rig):
 
     status = rig.request("GET", "/rpc/status").json()
     assert status["uploads"]["pending"] == []
+
+
+def test_api_trash_marks_a_row_and_excludes_it_from_listings(rig):
+    entry = rig.entry_for("photos/small.txt")
+    rig.resolver.api.trash(entry.file_id)
+    assert "small.txt" not in rig.names("/photos")
+    row = next(r for r in rig.backend.rows if r["file_id"] == entry.file_id)
+    assert row["trashed_at"] is not None
+    assert row["filename"] == "small.txt"  # still there, just excluded — a soft delete
+
+
+def test_api_trash_of_a_folder_cascades_to_its_children(rig):
+    photos = rig.entry_for("photos")
+    rig.resolver.api.trash(photos.file_id)
+    assert rig.names("/") == ["game", "movie.mkv"]
+    row = next(r for r in rig.backend.rows if r["filename"] == "small.txt")
+    assert row["trashed_at"] is not None
+
+
+def test_api_move_renames_and_reparents(rig):
+    entry = rig.entry_for("photos/small.txt")
+    game = rig.entry_for("game")
+    rig.resolver.api.move(entry.file_id, parent_id=game.file_id, filename="renamed.txt")
+    assert "small.txt" not in rig.names("/photos")
+    assert "renamed.txt" in rig.names("/game")
+
+
+def test_api_duplicate_registers_a_second_row_at_the_same_message(rig):
+    entry = rig.entry_for("photos/small.txt")
+    game = rig.entry_for("game")
+    rig.resolver.api.duplicate(entry, filename="copy.txt", parent_id=game.file_id)
+
+    assert "small.txt" in rig.names("/photos")  # original untouched
+    assert "copy.txt" in rig.names("/game")
+    original_row = next(r for r in rig.backend.rows if r["filename"] == "small.txt")
+    copy_row = next(r for r in rig.backend.rows if r["filename"] == "copy.txt")
+    assert copy_row["file_id"] != original_row["file_id"]
+    assert copy_row["telegram_message_id"] == original_row["telegram_message_id"]
+    assert copy_row["access_hash"] == original_row["access_hash"]
+
+
+def test_api_duplicate_of_a_split_file_copies_every_part(rig):
+    entry = rig.entry_for("movie.mkv")
+    game = rig.entry_for("game")
+    rig.resolver.api.duplicate(entry, filename="movie2.mkv", parent_id=game.file_id)
+
+    assert "movie2.mkv" in rig.names("/game")
+    original_parts = [r for r in rig.backend.rows if r["filename"] == "movie.mkv"]
+    copy_parts = sorted(
+        (r for r in rig.backend.rows if r["filename"] == "movie2.mkv"),
+        key=lambda r: r["part_index"] or 0,
+    )
+    assert len(copy_parts) == len(original_parts)
+    original_by_index = {r["part_index"] or 0: r for r in original_parts}
+    for part in copy_parts:
+        original = original_by_index[part["part_index"] or 0]
+        assert part["telegram_message_id"] == original["telegram_message_id"]
+        assert part["access_hash"] == original["access_hash"]
+        assert part["file_id"] != original["file_id"]
+    assert len({p["split_group_id"] for p in copy_parts}) == 1
+    assert copy_parts[0]["split_group_id"] != original_parts[0]["split_group_id"]
+
+
+def test_api_duplicate_of_a_split_file_filters_duplicate_message_ids(rig):
+    """Defend against the historical dedup bug where one message was registered
+    as multiple parts. duplicate() must filter those out, not propagate them."""
+    entry = rig.entry_for("movie.mkv")
+    game = rig.entry_for("game")
+    original_parts = [r for r in rig.backend.rows if r["filename"] == "movie.mkv"]
+
+    # Inject a duplicate: copy the first part's row with a different file_id
+    # but the same message_id (simulating the historical bug).
+    dup_row = dict(original_parts[0])
+    dup_row["file_id"] = uuid.uuid4().hex
+    dup_row["part_index"] = len(original_parts)  # extra part with same message_id
+    rig.backend.rows.append(dup_row)
+
+    rig.resolver.api.duplicate(entry, filename="movie3.mkv", parent_id=game.file_id)
+
+    assert "movie3.mkv" in rig.names("/game")
+    copy_parts = sorted(
+        (r for r in rig.backend.rows if r["filename"] == "movie3.mkv"),
+        key=lambda r: r["part_index"] or 0,
+    )
+    # Dedup filter should have removed the duplicate message_id, so copy
+    # has the same count as original (not original + duplicate).
+    assert len(copy_parts) == len(original_parts)
 
 
 # --------------------------------------------------------------------------- #
@@ -1184,6 +1369,22 @@ def test_delete_already_packed_game_folder_is_forbidden_not_a_crash(rig):
     resp = rig.request("DELETE", "/game/MyGame")
     assert resp.status_code == 403
     assert rig.names("/game") == ["MyGame"]
+
+
+def test_delete_already_uploaded_file_really_trashes_it(rig):
+    resp = rig.request("DELETE", "/photos/small.txt")
+    assert resp.status_code == 204, resp.status_code
+    assert "small.txt" not in rig.names("/photos")
+    row = next(r for r in rig.backend.rows if r["filename"] == "small.txt")
+    assert row["trashed_at"] is not None
+
+
+def test_delete_already_uploaded_folder_trashes_the_whole_subtree(rig):
+    resp = rig.request("DELETE", "/photos")
+    assert resp.status_code == 204, resp.status_code
+    assert "photos" not in rig.names("/")
+    row = next(r for r in rig.backend.rows if r["filename"] == "small.txt")
+    assert row["trashed_at"] is not None
 
 
 def test_copy_already_packed_game_file_is_forbidden_cleanly(rig):

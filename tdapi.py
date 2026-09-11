@@ -25,6 +25,7 @@ import tempfile
 import re
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -814,3 +815,69 @@ class TeleDriveClient:
         data = self._call("POST", "/files/register", payload=payload)
         self.invalidate(parent_id)
         return data
+
+    def trash(self, file_id: str) -> None:
+        """Soft-delete: the backend stamps trashed_at on the whole subtree and
+        keeps every Telegram message untouched. Listings already exclude
+        trashed rows by default, so there is nothing else to filter here.
+        """
+        self._call("DELETE", f"/files/{file_id}")
+        self.invalidate()
+
+    def move(self, file_id: str, *, parent_id: Optional[str], filename: str) -> None:
+        """Rename/reparent in place — children stay attached, they key off
+        this row's stable file_id, never off its name or path."""
+        self._call("PATCH", f"/files/{file_id}", payload={"parent_id": parent_id, "filename": filename})
+        self.invalidate()
+
+    def duplicate(self, entry: Entry, *, filename: str, parent_id: Optional[str]) -> None:
+        """Metadata-only copy: a new row pointing at the same Telegram message(s).
+
+        Safe because there is no UNIQUE(telegram_message_id) constraint — the
+        existing hash-dedup path in register() already relies on the same
+        fact to avoid re-uploading identical content.
+        """
+        if not (entry.is_split and entry.split_group_id):
+            self.register(
+                filename=filename,
+                filesize=entry.size,
+                message_id=entry.message_id,
+                file_id=uuid.uuid4().hex,
+                access_hash=entry.access_hash,
+                mime_type=entry.mime,
+                parent_id=parent_id,
+                file_hash=entry.file_hash,
+            )
+            return
+
+        # A fresh fetch, not parts_for(): that method's cache only keeps
+        # (message_id, size) and is relied on elsewhere in that exact shape —
+        # a copy needs each part's access_hash too, which parts_for() drops.
+        data = self._call("GET", f"/files/by-split-group/{entry.split_group_id}")
+        rows = sorted(data.get("files") or [], key=lambda r: r.get("part_index") or 0)
+        deduped = []
+        seen = set()
+        for row in rows:
+            message_id = row.get("telegram_message_id")
+            if message_id is None or message_id in seen:
+                continue
+            seen.add(message_id)
+            deduped.append(row)
+        new_group = uuid.uuid4().hex
+        total = len(deduped)
+        for index, row in enumerate(deduped):
+            self.register(
+                filename=filename,
+                filesize=row.get("filesize") or 0,
+                message_id=row["telegram_message_id"],
+                file_id=uuid.uuid4().hex,
+                access_hash=row.get("access_hash"),
+                mime_type=entry.mime,
+                parent_id=parent_id,
+                is_split_file=True,
+                original_name=filename,
+                part_index=index,
+                total_parts=total,
+                split_group_id=new_group,
+                file_hash=entry.file_hash,
+            )
