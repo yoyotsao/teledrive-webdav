@@ -1,10 +1,102 @@
 name: ChatGPT full dependency CI
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - tmp/chatgpt-sqlite-failover-export
+    paths:
+      - .github/workflows/chatgpt-full-ci.yml
+
+permissions:
+  contents: write
 
 jobs:
-  disabled:
+  verify-and-push:
     runs-on: ubuntu-latest
     steps:
-      - run: echo payload upload in progress
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: plan/sqlite-sessions-idle-segment-failover
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Guard target branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "9ec9d8b6b53874334f579158ec5a3665e25adf1b"
+
+      - name: Reconstruct and apply verified patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin tmp/chatgpt-sqlite-failover-export:refs/remotes/origin/tmp/chatgpt-sqlite-failover-export
+          : > /tmp/payload.b64
+          for part in 00 01 02a 02b tail; do
+            git show "origin/tmp/chatgpt-sqlite-failover-export:ci/final-upload.${part}" >> /tmp/payload.b64
+          done
+          base64 -d /tmp/payload.b64 | gzip -d > /tmp/final.patch
+          echo "8420bc759445fdb7f5cb538eb88a24cc3cf41d8a3e6562b55547ed4b03e8b5c6  /tmp/final.patch" | sha256sum -c -
+          git apply --check /tmp/final.patch
+          git apply --index /tmp/final.patch
+          git diff --cached --check
+
+      - name: Install complete dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+
+      - name: Verify Phase A
+        run: >-
+          python -m pytest
+          tests/test_session_discovery.py
+          tests/test_session_clients.py
+          tests/test_session_lock.py
+          tests/test_sessionctl.py
+          tests/test_session_migration.py
+          tests/test_account_pool.py
+          tests/test_auth_challenge.py
+          tests/test_account_routing.py
+          tests/test_routed_metadata.py
+          -q
+
+      - name: Verify Phase B
+        run: >-
+          python -m pytest
+          tests/test_failover_logging.py
+          tests/test_transfer_status.py
+          tests/test_transfer_logging.py
+          tests/test_upload_failover.py
+          tests/test_segment_scheduler.py
+          tests/test_upload_activity.py
+          tests/test_upload_limiter.py
+          tests/test_upload_attempts.py
+          -q
+
+      - name: Run complete offline suite
+        run: python -m pytest -q --ignore=tests/live
+
+      - name: Credential-pattern scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          if rg -n -i 'session\s*[=:]\s*[A-Za-z0-9_-]{40}|authorization:\s*bearer|ey[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.' \
+            config.example.ini README.md CLAUDE.md tests telegram_sessions.py telegram_accounts.py \
+            tgio.py sessionctl.py upload_activity.py segment_scheduler.py upload_engine.py; then
+            echo 'credential-like pattern found'
+            exit 1
+          fi
+
+      - name: Commit and push verified implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat: implement SQLite sessions and idle segment failover'
+          git push origin HEAD:plan/sqlite-sessions-idle-segment-failover
