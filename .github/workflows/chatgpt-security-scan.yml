@@ -1,0 +1,68 @@
+name: ChatGPT credential security scan
+
+on:
+  push:
+    branches:
+      - tmp/chatgpt-sqlite-failover-export
+    paths:
+      - .github/workflows/chatgpt-security-scan.yml
+
+permissions:
+  contents: read
+
+jobs:
+  scan-target:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout verified target
+        uses: actions/checkout@v4
+        with:
+          ref: plan/sqlite-sessions-idle-segment-failover
+          fetch-depth: 1
+
+      - name: Guard pushed implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "5cbedb667c66cc43e3ba5b4ff001148a7b25f970"
+
+      - name: Credential-pattern scan
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          pattern = re.compile(
+              r"session\s*[=:]\s*[A-Za-z0-9_-]{40}|"
+              r"authorization:\s*bearer|"
+              r"ey[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.",
+              re.IGNORECASE,
+          )
+          roots = [
+              Path("config.example.ini"), Path("README.md"), Path("CLAUDE.md"), Path("tests"),
+              Path("telegram_sessions.py"), Path("telegram_accounts.py"), Path("tgio.py"),
+              Path("sessionctl.py"), Path("upload_activity.py"), Path("segment_scheduler.py"),
+              Path("upload_engine.py"),
+          ]
+          matches = []
+          for root in roots:
+              paths = root.rglob("*") if root.is_dir() else [root]
+              for path in paths:
+                  if not path.is_file():
+                      continue
+                  try:
+                      text = path.read_text(encoding="utf-8")
+                  except (UnicodeDecodeError, OSError):
+                      continue
+                  if pattern.search(text):
+                      matches.append(str(path))
+          if matches:
+              print("credential-like pattern found in:")
+              for path in matches:
+                  print(path)
+              sys.exit(1)
+          print("credential-pattern scan clean")
+          PY
