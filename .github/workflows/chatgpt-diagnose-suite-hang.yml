@@ -1,0 +1,41 @@
+name: ChatGPT diagnose suite hang
+
+on:
+  push:
+    branches:
+      - tmp/chatgpt-sqlite-failover-export
+    paths:
+      - .github/workflows/chatgpt-diagnose-suite-hang.yml
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: plan/sqlite-sessions-idle-segment-failover
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply verified implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "9ec9d8b6b53874334f579158ec5a3665e25adf1b"
+          git fetch origin tmp/chatgpt-sqlite-failover-export:refs/remotes/origin/tmp/chatgpt-sqlite-failover-export
+          : > /tmp/payload.b64
+          for part in 00 01 02a 02b 03 04 05 06 07 08 09 10; do
+            git show "origin/tmp/chatgpt-sqlite-failover-export:ci/final-upload.${part}" >> /tmp/payload.b64
+          done
+          base64 -d /tmp/payload.b64 | gzip -d > /tmp/final.patch
+          echo "8420bc759445fdb7f5cb538eb88a24cc3cf41d8a3e6562b55547ed4b03e8b5c6  /tmp/final.patch" | sha256sum -c -
+          git apply /tmp/final.patch
+          git show "origin/tmp/chatgpt-sqlite-failover-export:ci/full-suite-fix.patch.gz.b64" | base64 -d | gzip -d > /tmp/full-suite-fix.patch
+          echo "504ff452d0765de0a0caf66dd0ffa4bd1d0d59578e12edeed1bcafb038dce3f9  /tmp/full-suite-fix.patch" | sha256sum -c -
+          git apply /tmp/full-suite-fix.patch
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pytest
+      - name: Run verbose suite with hard timeout
+        shell: bash
+        run: timeout --signal=TERM 240s python -m pytest -vv --ignore=tests/live
