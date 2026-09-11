@@ -938,7 +938,7 @@ def test_upload_status_reports_pending_then_clears(rig):
 
 def test_api_trash_marks_a_row_and_excludes_it_from_listings(rig):
     entry = rig.entry_for("photos/small.txt")
-    rig.resolver.api.trash(entry.file_id)
+    rig.resolver.api.trash(entry.file_id, entry.parent_id)
     assert "small.txt" not in rig.names("/photos")
     row = next(r for r in rig.backend.rows if r["file_id"] == entry.file_id)
     assert row["trashed_at"] is not None
@@ -947,7 +947,7 @@ def test_api_trash_marks_a_row_and_excludes_it_from_listings(rig):
 
 def test_api_trash_of_a_folder_cascades_to_its_children(rig):
     photos = rig.entry_for("photos")
-    rig.resolver.api.trash(photos.file_id)
+    rig.resolver.api.trash(photos.file_id, photos.parent_id)
     assert rig.names("/") == ["game", "movie.mkv"]
     row = next(r for r in rig.backend.rows if r["filename"] == "small.txt")
     assert row["trashed_at"] is not None

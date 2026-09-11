@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, List, Literal, Optional, Tuple
@@ -28,12 +29,6 @@ BIG_FILE_THRESHOLD = SMALL_FILE_MAX
 MESSAGE_MAX = MAX_PARTS_PER_MESSAGE * BIG_PART_SIZE
 
 PART_RETRIES = 3
-MAX_FLOOD_RETRIES = 10
-
-# An upload is a multi-hour batch job: waiting out a long FLOOD_WAIT beats
-# orphaning hundreds of already-accepted parts. Deliberately not tgio's
-# MAX_FLOOD_WAIT (120s); that one guards interactive reads.
-UPLOAD_MAX_FLOOD_WAIT = 600
 
 _WEB_LIMITER = LimiterConfig.web_defaults()
 DECREASE_FACTOR = _WEB_LIMITER.decrease_factor
@@ -113,14 +108,14 @@ class UploadGate(AdaptiveUploadLimiter):
 
 
 def _flood_wait(exc: BaseException) -> Optional[tuple[float, bool]]:
-    """Classify premium waits before Telethon reduces them to generic errors."""
+    """Return Telegram's requested upload wait, without imposing a local cap."""
     try:
         from telethon.errors import FloodPremiumWaitError, FloodWaitError
 
         premium = isinstance(exc, FloodPremiumWaitError)
         if isinstance(exc, (FloodWaitError, FloodPremiumWaitError)):
             seconds = float(exc.seconds)
-            if seconds <= UPLOAD_MAX_FLOOD_WAIT:
+            if math.isfinite(seconds) and seconds >= 0:
                 return seconds, premium
     except Exception:  # pragma: no cover
         pass
@@ -161,7 +156,6 @@ async def send_part(sender_of: Callable[[], object], request, gate, label: str) 
     the account limiter and classify ``FLOOD_PREMIUM_WAIT`` before Telethon's
     generic request handling can erase the wire name.
     """
-    flood_retries = 0
     while True:
         sender = sender_of()
         if sender is None:
@@ -177,10 +171,7 @@ async def send_part(sender_of: Callable[[], object], request, gate, label: str) 
             if flood is None:
                 raise
             seconds, premium = flood
-            flood_retries += 1
-            if flood_retries > MAX_FLOOD_RETRIES:
-                raise
-            log.warning("%s hit FLOOD_WAIT", label)
+            log.warning("%s hit FLOOD_WAIT; retrying after %.1fs", label, seconds)
             gate.flood(seconds, premium=premium)
             continue
         gate.success(gate.now() - start)

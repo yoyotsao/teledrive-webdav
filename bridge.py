@@ -768,7 +768,7 @@ class RemoteFileResource(_ReadOnlyFile):
         self.resolver.upload_stager.touch(self._upload_segments, self._upload_parent_id)
 
     def delete(self):
-        self.resolver.api.trash(self.entry.file_id)
+        self.resolver.api.trash(self.entry.file_id, self.entry.parent_id)
 
     def support_recursive_move(self, dest_path):
         # Override to enable move_recursive() instead of copy+delete fallback.
@@ -964,7 +964,7 @@ class FolderCollection(RootCollection):
         self.entry = entry
 
     def handle_delete(self):
-        self.resolver.api.trash(self.entry.file_id)
+        self.resolver.api.trash(self.entry.file_id, self.entry.parent_id)
         return True
 
     def handle_move(self, dest_path):

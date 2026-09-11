@@ -35,22 +35,32 @@ def _warmer(tmp_path, mount_drive="H:", exists=True):
 class _FakePopen:
     """Stands in for warmshell.exe: canned output, optionally never finishing."""
 
-    def __init__(self, stdout=b"", stderr=b"", timeout=False):
+    def __init__(self, stdout=b"", stderr=b"", timeout=False, stuck_after_kill=False):
         self._stdout = stdout
         self._stderr = stderr
         self._timeout = timeout
+        self._stuck_after_kill = stuck_after_kill
         self.killed = False
         self.inputs = []
+        self.timeouts = []
 
     def __call__(self, argv, **kwargs):
         self.argv = argv
+        self.kwargs = kwargs
         return self
 
     def communicate(self, input=None, timeout=None):
+        self.timeouts.append(timeout)
         if input is not None:
             self.inputs.append(input)
         if self._timeout and not self.killed:
-            raise subprocess.TimeoutExpired(cmd="warmshell", timeout=timeout)
+            raise subprocess.TimeoutExpired(
+                cmd="warmshell", timeout=timeout, output=self._stdout, stderr=self._stderr
+            )
+        if self._stuck_after_kill and self.killed:
+            raise subprocess.TimeoutExpired(
+                cmd="warmshell", timeout=timeout, output=self._stdout, stderr=self._stderr
+            )
         return self._stdout, self._stderr
 
     def kill(self):
@@ -103,6 +113,44 @@ def test_a_finished_batch_counts_from_the_exe(tmp_path, monkeypatch):
     assert fake.inputs == [b"H:\\a.jpg\nH:\\b.jpg\n"]
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows creation flag")
+def test_warmshell_does_not_inherit_the_bridge_console(tmp_path, monkeypatch):
+    """A timed-out warmer must not leave an unclosable bridge console behind."""
+    warmer = _warmer(tmp_path)
+    fake = _FakePopen(stdout=b"1\n", stderr=b"+ 5 H:\\a.jpg\n")
+    monkeypatch.setattr(warmup.subprocess, "Popen", fake)
+
+    warmer._warm_group(["H:\\a.jpg"])
+
+    assert fake.kwargs["creationflags"] & subprocess.CREATE_NO_WINDOW
+
+
+def test_warmshell_launch_is_serialized_with_restart(tmp_path, monkeypatch):
+    """Restart must be able to close the spawn gate before stopping bridge."""
+    warmer = _warmer(tmp_path)
+    state = {"guarded": False, "exited": False}
+
+    class _Guard:
+        def __enter__(self):
+            state["guarded"] = True
+
+        def __exit__(self, exc_type, exc, traceback):
+            state["guarded"] = False
+            state["exited"] = True
+
+    class _GuardedPopen(_FakePopen):
+        def __call__(self, argv, **kwargs):
+            assert state["guarded"], "warmshell was spawned outside the launch gate"
+            return super().__call__(argv, **kwargs)
+
+    fake = _GuardedPopen(stdout=b"1\n", stderr=b"+ 5 H:\\a.jpg\n")
+    monkeypatch.setattr(warmup, "_warmshell_launch_guard", _Guard)
+    monkeypatch.setattr(warmup.subprocess, "Popen", fake)
+
+    assert warmer._warm_group(["H:\\a.jpg"]) == (1, False)
+    assert state == {"guarded": False, "exited": True}
+
+
 def test_a_killed_batch_still_reports_what_it_warmed(tmp_path, monkeypatch, caplog):
     """The count on stdout never arrives; the flushed lines are all there is."""
     warmer = _warmer(tmp_path)
@@ -117,6 +165,30 @@ def test_a_killed_batch_still_reports_what_it_warmed(tmp_path, monkeypatch, capl
     # And it names what the shell was still holding, which is the one thing the
     # old flat-timeout message could never say.
     assert "H:\\stuck.jpg" in caplog.text
+
+
+def test_cleanup_has_a_deadline_when_killed_warmshell_never_exits(
+    tmp_path, monkeypatch, caplog
+):
+    """The bridge must regain control even when Windows cannot reap warmshell."""
+    warmer = _warmer(tmp_path)
+    fake = _FakePopen(
+        stderr=b"+ 5 H:\\a.jpg\n- 4 H:\\b.jpg\n",
+        timeout=True,
+        stuck_after_kill=True,
+    )
+    monkeypatch.setattr(warmup.subprocess, "Popen", fake)
+
+    with caplog.at_level("WARNING"):
+        warmed, wedged = warmer._warm_group(["H:\\a.jpg", "H:\\b.jpg"])
+
+    assert (warmed, wedged) == (1, True)
+    assert fake.killed
+    assert fake.timeouts == [
+        pytest.approx(60.0),
+        pytest.approx(5.0),
+    ]
+    assert "still running after kill" in caplog.text
 
 
 def test_a_wedged_batch_stops_the_pass(tmp_path, monkeypatch):

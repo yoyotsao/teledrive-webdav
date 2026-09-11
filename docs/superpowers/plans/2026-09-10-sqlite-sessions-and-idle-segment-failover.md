@@ -28,9 +28,12 @@
 - Migrate only when `(replacement_speed / current_speed) * remaining_ratio > 2`; equality does not migrate. Candidate current speed zero maps to infinity only after all candidate gates pass.
 - Migration increments the attempt generation and removes the old account's finalize right before the replacement can start. A segment migrates at most once and always restarts at part zero with a new Telegram `file_id`.
 - Drain waits only for the revoked attempt's RPC counter. It must not wait for unrelated work on the old account. A sent MTProto RPC is never hard-cancelled and has a 120-second wrapper deadline.
+- A successful `begin_request()` is the committed-send point of no return: the returned token authorizes exactly one RPC even if migration commits before the worker invokes the sender. Revoke prevents acquiring the next token; every committed token must be sent or settled with an explicit local submission failure, and is included in its original attempt's drain barrier.
+- For scheduled segments, `SegmentScheduler` alone owns and closes the actual `UploadLease` instance stored in `SegmentTask.active_upload_lease`. Executors borrow its runtime and report preparation/quiescence; they never close it. During handoff, the old active lease and target reservation are separately owned until the old lease drains.
+- Every submitted executor Future is retained and its outcome consumed. Assignment is claimed atomically before submission; an unexpected exception, cancelled Future, or failed submission must wake the coordinator and produce a task or scheduler failure.
 - Logical task events require the current generation. Transport settlement and confirmed physical-success events use immutable RPC tokens and remain accepted idempotently for a draining, stale, or terminal generation without reopening task state.
 - Effective progress counts first success of each current-generation part and may decrease only at migration. Physical bytes count every explicitly successful part RPC, including late revoked-generation success, and never decrease.
-- Premium flood sets limiter mode to `frozen` without lowering its rate. Success cannot ramp while frozen; after the wait, the first RPC committed at the `sender.send()` boundary starts a 60-second flood-free window, then `cautious` ramps by at most 0.1 parts/s every 30 seconds.
+- Premium flood sets limiter mode to `frozen` without lowering its rate. Success cannot ramp while frozen; after the wait, the first actual invocation/scheduling of `sender.send()` starts a 60-second flood-free window. Token acquisition alone does not start that window. `cautious` subsequently ramps by at most 0.1 parts/s every 30 seconds.
 - The cross-thread lock order is `SegmentScheduler → TelegramAccountPool → AccountActivityRegistry → UploadSpeedTracker`. Code holding a later lock never calls an earlier layer. The activity registry never invokes callbacks; it returns immutable transition data that callers publish only after releasing every outer lock. Revocation crosses into a worker event loop only through `loop.call_soon_threadsafe(event.set)`.
 - File bytes continue to flow only between the local bridge and Telegram. The TeleDrive FastAPI backend remains metadata-only.
 - Automated tests are offline. No session revocation, live login, Telegram upload, credential deletion, or live failover probe runs without explicit user authorization.
@@ -144,7 +147,7 @@ def safe_resolve_existing(path: Path, *, kind: str) -> Path:
     resolved = None
     try:
         resolved = Path(path).resolve(strict=True)
-    except OSError:
+    except (OSError, RuntimeError):
         pass
     if resolved is None:
         raise ConfigError(f"{kind} is unavailable") from None
@@ -246,6 +249,19 @@ def test_control_session_identity_must_match_filename(worker_factory, session_fi
     rendered = "".join(traceback.format_exception(raised.value)) + caplog.text
     assert str(session_file) not in rendered
     assert raised.value.__cause__ is None
+
+
+def test_control_start_cancellation_disconnects_and_propagates_cancelled_error(worker_factory):
+    async def exercise():
+        worker = worker_factory.blocked_connect()
+        startup = asyncio.create_task(worker._connect_and_validate_control())
+        await worker_factory.connect_entered.wait()
+        startup.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await startup
+        assert worker_factory.disconnect_calls == 1
+        assert worker._client is None
+    asyncio.run(exercise())
 ```
 
 Also assert the file is rechecked immediately before construction, `receive_updates=False` is passed to every client, `control.session.save_entities` is false, unauthorized sessions fail, identity validation happens before the worker is marked ready or its username is logged, memory serialization is absent from exception text, and recreating an auxiliary derives a fresh session from current control state. Missing/invalid SQLite errors must pass through an account-ID-scoped sanitizer and have no raw cause, path, or basename in formatted traceback or `caplog`.
@@ -290,6 +306,7 @@ async def _connect_and_validate_control(self) -> None:
     client = None
     me = None
     failure = None
+    validated = False
     try:
         client = self._new_control_client()
         await client.connect()
@@ -303,19 +320,24 @@ async def _connect_and_validate_control(self) -> None:
             raise SessionIdentityError(
                 f"Telegram session user ID mismatch: expected {self._expected_user_id}, got {actual}"
             )
+        validated = True
+    except asyncio.CancelledError:
+        raise
     except (SessionAuthorizationError, SessionIdentityError) as exc:
         failure = exc
-    except BaseException as exc:
+    except Exception as exc:
         failure = SessionClientError(
             f"Telegram session for account {self._expected_user_id} failed "
             f"({type(exc).__name__})"
         )
-    if failure is not None:
-        if client is not None:
+    finally:
+        if client is not None and not validated:
             try:
                 await client.disconnect()
-            except BaseException:
+            except Exception:
+                # Preserve cancellation or the original sanitized failure.
                 pass
+    if failure is not None:
         raise failure from None
     self._client = client
     self._me = me
@@ -562,10 +584,16 @@ def _promote_no_replace(temporary: Path, destination: Path) -> None:
         promotion_error = SessionCtlError("could not finalize Telegram session")
     if promotion_error is not None:
         raise promotion_error from None
-    temporary.unlink()
+    cleanup_failed = False
+    try:
+        temporary.unlink()
+    except (OSError, RuntimeError):
+        cleanup_failed = True
+    if cleanup_failed:
+        raise SessionCtlError("Telegram session finalized; staging cleanup failed") from None
 
 
-def login_session(config_path: Path, session_dir: Path, *, client_factory,
+def _login_session_impl(config_path: Path, session_dir: Path, *, client_factory,
                   permission_policy: SessionPermissionPolicy) -> Path:
     api_id, api_hash = load_bootstrap_credentials(config_path)
     directory = resolve_session_dir_for_cli(config_path, session_dir)
@@ -587,9 +615,35 @@ def login_session(config_path: Path, session_dir: Path, *, client_factory,
         permission_policy.verify_staged_file(temporary)
         _promote_no_replace(temporary, destination)
         return destination
+
+
+def login_session(config_path: Path, session_dir: Path, *, client_factory,
+                  permission_policy: SessionPermissionPolicy) -> Path:
+    failure = None
+    try:
+        return _login_session_impl(
+            config_path, session_dir, client_factory=client_factory,
+            permission_policy=permission_policy,
+        )
+    except SessionExistsError as exc:
+        failure = SessionExistsError(str(exc))  # This project's path-free message.
+    except Exception as exc:
+        root = exc
+        seen = {id(root)}
+        while root.__context__ is not None and id(root.__context__) not in seen:
+            root = root.__context__
+            seen.add(id(root))
+        category = type(root).__name__
+        detail = str(root) if isinstance(root, SessionCtlError) else category
+        suffix = "; cleanup failed" if root is not exc else ""
+        failure = SessionCtlError(f"Telegram session operation failed ({detail}){suffix}")
+    # All context exits, unlink, and cleanup have finished before sanitization.
+    raise failure from None
 ```
 
 `sessionctl` is a standalone process, so `asyncio.run()` owns its event loop. `_login_to_staging()` enters cleanup immediately after client construction: a `start()` failure still disconnects, and a secondary disconnect failure never replaces the primary login error. The outer boundary replaces dependency errors after leaving their `except` scope so neither cause nor context is rendered.
+
+The public `login_session()` boundary surrounds the entire implementation, including `_promote_no_replace()`'s `temporary.unlink()` and `TemporaryDirectory.__exit__()`. Apply the same outer boundary to migration. On a context cleanup failure following a primary failure, report only the primary failure category plus a fixed `cleanup failed` flag, never retain raw exception objects in the public error. Add separate injected symlink-loop `RuntimeError`, unlink-failure, and temporary-directory-exit-failure tests, including primary-plus-cleanup failure; check formatted traceback, cause, context, and caplog for paths. A cleanup failure after promotion must leave the completed destination intact and report that finalization may already have occurred; it must not delete or overwrite that session.
 
 `WindowsSessionPermissionPolicy` creates/protects the directory DACL with inheritance disabled and Full Control allow ACEs only for the calling-user SID, `S-1-5-18` (`SYSTEM`), and `S-1-5-32-544` (`BUILTIN\\Administrators`); it audits existing directories before staging and fails closed on every other allow SID. `PosixSessionPermissionPolicy` creates directories as `0700`, files as `0600`, and rejects any existing group/other permission bit. Both adapters are selected by `os.name`, expose no path in failure text, and are injected in tests.
 
@@ -815,8 +869,23 @@ def test_premium_flood_cycle_reports_and_resets_physical_totals(clock):
     tracker.record_physical(UploadRpcToken("task", 1, 1, 0, 1), 512)
     first = tracker.close_premium_flood_cycle(lease, wait_seconds=17)
     second = tracker.close_premium_flood_cycle(lease, wait_seconds=19)
-    assert (first.accepted_physical_parts, first.accepted_physical_bytes) == (1, 512)
-    assert (second.accepted_physical_parts, second.accepted_physical_bytes) == (0, 0)
+    assert (first.task_accepted_parts, first.task_accepted_bytes) == (1, 512)
+    assert (first.account_accepted_parts, first.account_accepted_bytes) == (1, 512)
+    assert (second.task_accepted_parts, second.task_accepted_bytes) == (0, 0)
+    assert (second.account_accepted_parts, second.account_accepted_bytes) == (0, 0)
+
+
+def test_account_cycle_includes_other_attempts_and_resets_independently(clock):
+    tracker = UploadSpeedTracker(clock=clock, window=30, snapshot_ttl=300)
+    a, b = AttemptLease("a", 1, 1), AttemptLease("b", 1, 1)
+    tracker.record_physical(UploadRpcToken("a", 1, 1, 0, 1), 512)
+    tracker.record_physical(UploadRpcToken("b", 1, 1, 0, 1), 1024)
+    first = tracker.close_premium_flood_cycle(a, 17)
+    assert (first.account_accepted_parts, first.account_accepted_bytes) == (2, 1536)
+    assert (first.task_accepted_parts, first.task_accepted_bytes) == (1, 512)
+    second = tracker.close_premium_flood_cycle(b, 19)
+    assert (second.account_accepted_parts, second.account_accepted_bytes) == (0, 0)
+    assert (second.task_accepted_parts, second.task_accepted_bytes) == (1, 1024)
 ```
 
 Also test fixed 30-second denominators, no snapshot without successful effective bytes, five-minute expiration, invalidation on new work, revoked physical success not becoming effective, stale and terminal generations retaining physical dedupe, a new RPC token for each retry, per-attempt flood-cycle accepted part/byte reset, and counters never becoming negative under repeated cleanup.
@@ -861,8 +930,10 @@ class IdleSpeedSnapshot:
 class FloodCycleSnapshot:
     lease: AttemptLease
     wait_seconds: float
-    accepted_physical_parts: int
-    accepted_physical_bytes: int
+    account_accepted_parts: int
+    account_accepted_bytes: int
+    task_accepted_parts: int
+    task_accepted_bytes: int
 
 
 @dataclass
@@ -880,7 +951,7 @@ class ActivityChange:
 
 
 class UploadSpeedTracker:
-    # __init__ uses defaultdict(MutableTotals) for _flood_cycle_totals and
+    # __init__ uses defaultdict(MutableTotals) for _account_cycles/_attempt_cycles and
     # sets for _effective_parts and _physical_rpc_tokens.
     def record_effective(self, lease: AttemptLease, part_index: int, nbytes: int) -> bool:
         key = (lease.task_id, lease.attempt_id, part_index)
@@ -902,20 +973,27 @@ class UploadSpeedTracker:
                 return False
             self._physical_rpc_tokens.add(token)
             self._physical[token.account_id].append((self._clock(), nbytes))
-            cycle = self._flood_cycle_totals[token.lease]
-            cycle.parts += 1
-            cycle.bytes += nbytes
+            for cycle in (self._account_cycles[token.account_id],
+                          self._attempt_cycles[token.lease]):
+                cycle.parts += 1
+                cycle.bytes += nbytes
             return True
 
     def close_premium_flood_cycle(
         self, lease: AttemptLease, wait_seconds: float,
     ) -> FloodCycleSnapshot:
         with self._lock:
-            totals = self._flood_cycle_totals.pop(lease, MutableTotals())
-            return FloodCycleSnapshot(lease, wait_seconds, totals.parts, totals.bytes)
+            account = self._account_cycles.pop(lease.account_id, MutableTotals())
+            attempt = self._attempt_cycles.pop(lease, MutableTotals())
+            return FloodCycleSnapshot(
+                lease, wait_seconds, account.parts, account.bytes,
+                attempt.parts, attempt.bytes,
+            )
 ```
 
 Add an `UploadRpcToken.lease` property returning `AttemptLease(task_id, attempt_id, account_id)`. Every retry receives a monotonically increasing `sequence`, so two confirmed sends of the same part are two physical events while effective progress remains unique per `(task_id, attempt_id, part_index)`.
+
+Each premium event atomically closes/resets the account-wide cycle and the emitting attempt's cycle under the tracker lock. Other attempts' task cycles remain intact. Account cycles include small uploads, albums, thumbnails, retries, and confirmed stale-generation success. Task cycles are scoped by `AttemptLease` to avoid combining replacement generations. Late success is counted in the cycle open when it is confirmed. Expose all four counters in `FloodCycleSnapshot`; they correspond to the spec's account/task AcceptedParts/BytesSincePreviousPremiumFlood fields.
 
 `AccountActivityRegistry` owns `active_byte_upload_jobs`, a set of in-flight `UploadRpcToken` values, `reserved_task_id`, and idle snapshot per account under one `threading.Condition`. Every mutator returns `ActivityChange` and never invokes an external callback. `request_started(token)` and `request_settled(token)` are idempotent; `request_settled` accepts stale/terminal tokens and never consults the task generation. Create/revoke snapshots only on transitions defined in the spec. Pool/scheduler callers copy the returned value through their outer critical section and publish it only after every held lock is released.
 
@@ -1063,6 +1141,40 @@ def test_late_success_after_deadline_is_physical_only(rig):
     rig.sender.succeed(0)
     assert rig.observer.physical_bytes == rig.part_size
     assert rig.observer.logical_bytes == 0
+
+
+def test_revoke_and_slot_acquire_same_tick_releases_slot():
+    async def exercise():
+        revoked = asyncio.Event()
+        slot = asyncio.BoundedSemaphore(1)
+        @asynccontextmanager
+        async def acquire_and_revoke():
+            await slot.acquire()
+            revoked.set()
+            try:
+                yield
+            finally:
+                slot.release()
+        with pytest.raises(AttemptRevoked):
+            async with _cancelable_context(acquire_and_revoke(), revoked):
+                pytest.fail("revoked context body must not run")
+        await asyncio.wait_for(slot.acquire(), timeout=0.1)
+        slot.release()
+    asyncio.run(exercise())
+
+
+def test_committed_token_sends_after_migration_and_drains(rig):
+    old = rig.start_paused_after_begin_request()
+    token = old.committed_token
+    rig.commit_profitable_migration()
+    old.resume_sender()
+    old.succeed_rpc()
+    rig.await_wrapper_settled(token)
+    assert old.sent_tokens == [token]
+    assert rig.physical_bytes == rig.part_size
+    assert rig.logical_bytes == 0
+    assert rig.old_attempt_drained
+    assert rig.try_begin_another_old_request() is None
 ```
 
 Also test revocation during limiter pacing, worker-slot waiting, and retry delay; explicit premium-flood callback; duplicate success; `finally` counter balance; and normal uploads with `observer=None` retaining old behavior.
@@ -1083,7 +1195,7 @@ class UploadObserver(Protocol):
     def request_succeeded(self, token: UploadRpcToken, nbytes: int) -> None:
         pass
 
-    def premium_flood(self, seconds: float) -> None:
+    def premium_flood(self, seconds: float, pacer_snapshot: LimiterSnapshot) -> None:
         pass
 
     def request_settled(self, token: UploadRpcToken) -> None:
@@ -1106,38 +1218,72 @@ class RevokeHandle:
         self._loop.call_soon_threadsafe(self.worker_event.set)
 
 
+async def _await_cleanup(awaitable):
+    cleanup = asyncio.ensure_future(awaitable)
+    interrupted = False
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            interrupted = True
+    return cleanup.result(), interrupted
+
+
 async def _wait_or_revoke(awaitable, revoked: asyncio.Event | None):
     if revoked is None:
         return await awaitable
     work = asyncio.ensure_future(awaitable)
     cancellation = asyncio.create_task(revoked.wait())
-    done, _pending = await asyncio.wait(
-        {work, cancellation}, return_when=asyncio.FIRST_COMPLETED,
-    )
-    if cancellation in done:
+    try:
+        await asyncio.wait({work, cancellation}, return_when=asyncio.FIRST_COMPLETED)
+        if work.done():
+            return work.result()  # Completion wins when both finish together.
         work.cancel()
         await asyncio.gather(work, return_exceptions=True)
+        if not work.cancelled() and work.exception() is None:
+            return work.result()  # Enter may have completed during cancellation.
         raise AttemptRevoked()
-    cancellation.cancel()
-    await asyncio.gather(cancellation, return_exceptions=True)
-    return await work
+    finally:
+        cancellation.cancel()
+        if not work.done():
+            work.cancel()
+        _, interrupted = await _await_cleanup(
+            asyncio.gather(work, cancellation, return_exceptions=True),
+        )
+        if interrupted:
+            raise asyncio.CancelledError()
 
 
 @asynccontextmanager
 async def _cancelable_context(cm, revoked: asyncio.Event | None):
-    value = await _wait_or_revoke(cm.__aenter__(), revoked)
+    enter = asyncio.ensure_future(cm.__aenter__())
     try:
+        value = await _wait_or_revoke(enter, revoked)
+        if revoked is not None and revoked.is_set():
+            raise AttemptRevoked()
         yield value
     finally:
-        await asyncio.shield(cm.__aexit__(None, None, None))
+        # Own the enter task even if _wait_or_revoke exits via cancellation.
+        exit_args = sys.exc_info()
+        if not enter.done():
+            enter.cancel()
+        _, interrupted = await _await_cleanup(
+            asyncio.gather(enter, return_exceptions=True),
+        )
+        if not enter.cancelled() and enter.exception() is None:
+            _, exit_interrupted = await _await_cleanup(cm.__aexit__(*exit_args))
+            interrupted = interrupted or exit_interrupted
+        if interrupted:
+            raise asyncio.CancelledError()
 
 
 def _observe_late_rpc(rpc, observer, token, nbytes: int) -> None:
-    if observer is None or token is None:
+    if rpc is None:
         return
 
     def settled(future) -> None:
-        if not future.cancelled() and future.exception() is None:
+        if (not future.cancelled() and future.exception() is None
+                and observer is not None and token is not None):
             observer.late_request_succeeded(token, nbytes)
 
     rpc.add_done_callback(settled)
@@ -1154,9 +1300,12 @@ async def send_part(sender_of, request, gate, label, *, part_index, nbytes,
             if sender is None:
                 raise RuntimeError(f"{label}: upload client has no MTProto sender")
             token = observer.request_started(part_index, nbytes) if observer else None
-            rpc = asyncio.create_task(sender.send(request))
-            gate.mark_send_started()
+            rpc = None
             try:
+                # Token acquisition committed this RPC; do not recheck revoke.
+                # Telethon send may return a Future, not a coroutine.
+                rpc = asyncio.ensure_future(sender.send(request))
+                gate.mark_send_started()
                 await asyncio.wait_for(asyncio.shield(rpc), timeout=rpc_timeout)
                 if observer:
                     observer.request_succeeded(token, nbytes)
@@ -1168,9 +1317,9 @@ async def send_part(sender_of, request, gate, label, *, part_index, nbytes,
                 if flood is None:
                     raise
                 seconds, premium = flood
-                if premium and observer:
-                    observer.premium_flood(seconds)
                 gate.flood(seconds, premium=premium)
+                if premium and observer:
+                    observer.premium_flood(seconds, gate.snapshot())
                 continue
             finally:
                 if observer:
@@ -1179,7 +1328,11 @@ async def send_part(sender_of, request, gate, label, *, part_index, nbytes,
         return
 ```
 
-In `_upload_parts`, wrap worker-slot admission with `_cancelable_context(worker_slots, revoked)` and every exponential retry delay with `_wait_or_revoke(_sleep(...), revoked)`. A `RevokeHandle` is created on the worker loop and returned to the scheduler before the attempt starts; scheduler threads call only `RevokeHandle.revoke()`, never `asyncio.Event.set()` directly. Once `sender.send` is scheduled, shield it from lease cancellation and wait for result or deadline. The late callback records physical bytes only; it cannot update effective progress, recreate an in-flight token, or revive the expired wrapper.
+In `_upload_parts`, wrap worker-slot admission with `_cancelable_context(worker_slots, revoked)` and every exponential retry delay with `_wait_or_revoke(_sleep(...), revoked)`. A successful enter wins over simultaneous revoke; the context's own `try/finally` checks revoke and always exits an acquired slot before propagating `AttemptRevoked`. Use the dedicated context wrapper for resource acquisition; the generic wait helper alone does not own resources. Add direct task-cancellation coverage during admission as well. Production cleanup must retain and await its cleanup Future through repeated cancellation; no detached context-exit task may outlive worker shutdown.
+
+A `RevokeHandle` is created on the worker loop and returned before the attempt starts. Scheduler threads call only `RevokeHandle.revoke()`. `begin_request()` rejects an already-revoked generation under the scheduler lock. If it succeeds, the worker must invoke the sender even if migration happens immediately afterward; this token belongs to the old attempt's drain barrier. Sender creation is inside the token's `try/finally`, so synchronous submission errors settle the token without recording bytes. `mark_send_started()` runs only after successful sender invocation/scheduling; this separate boundary governs pacer timing.
+
+Replace `_upload_parts`' existing sibling `task.cancel()` failure cleanup for committed requests: signal revoke to stop uncommitted work, then await every committed wrapper through result/error/deadline before reporting executor quiescence. A revoked attempt, unexpected executor exception, or shutdown cannot abandon token settlement. The late callback records physical bytes only; it cannot recreate a settled token or update effective progress.
 
 - [ ] **Step 4: Run part protocol and attempt tests**
 
@@ -1210,7 +1363,7 @@ git commit -m "feat: make upload parts observable and revoke-aware"
 def test_candidate_requires_age_premium_flood_and_strict_score(scheduler, clock):
     lease = scheduler.activate("task", account_id=2)
     scheduler.part_succeeded(lease, part_index=0, nbytes=100)
-    scheduler.notify_premium_flood(lease, seconds=30)
+    scheduler.notify_premium_flood(lease, seconds=30, pacer_snapshot=scheduler.frozen_snapshot)
     clock.advance(30)
     scheduler.set_idle_snapshot(account_id=1, speed=20, age=0)
     scheduler.set_live_speed(lease, 10)
@@ -1222,7 +1375,7 @@ def test_candidate_requires_age_premium_flood_and_strict_score(scheduler, clock)
 
 def test_qualification_never_changes_ownership_and_only_commit_migrates(scheduler, clock):
     old = scheduler.activate("task", account_id=2)
-    scheduler.notify_premium_flood(old, seconds=30)
+    scheduler.notify_premium_flood(old, seconds=30, pacer_snapshot=scheduler.frozen_snapshot)
     clock.advance(30)
     assert scheduler.task("task").state is SegmentState.ACTIVE
     assert scheduler.task("task").attempt_id == old.attempt_id
@@ -1240,7 +1393,7 @@ def test_qualification_never_changes_ownership_and_only_commit_migrates(schedule
 def test_stale_settlement_drains_tokens_without_changing_logical_state(scheduler, clock):
     old = scheduler.activate("task", account_id=2)
     token = scheduler.begin_request(old, part_index=0)
-    scheduler.notify_premium_flood(old, seconds=30)
+    scheduler.notify_premium_flood(old, seconds=30, pacer_snapshot=scheduler.frozen_snapshot)
     clock.advance(30)
     scheduler.set_idle_snapshot(account_id=1, speed=30, age=0)
     scheduler.set_live_speed(old, 1)
@@ -1251,6 +1404,25 @@ def test_stale_settlement_drains_tokens_without_changing_logical_state(scheduler
     assert not scheduler.request_settled(token)
     assert scheduler.drained("task", old.attempt_id)
     assert scheduler.task("task").logical_uploaded_bytes == 0
+
+
+def test_select_next_action_cannot_issue_same_attempt_twice(scheduler):
+    scheduler.register_one_pending_segment()
+    first = scheduler.select_next_action()
+    assert first is not None
+    assert scheduler.select_next_action() is None
+    assert scheduler.task(first.task_id).active_upload_lease is not None
+
+
+def test_prepared_and_terminal_cleanup_close_the_same_lease_once(scheduler):
+    lease = scheduler.activate("task", account_id=1)
+    owned = scheduler.task("task").active_upload_lease
+    scheduler.fake_prepare_all_parts(lease)
+    scheduler.bytes_prepared(lease)
+    scheduler.fail_attempt(lease, "message failed")
+    scheduler.attempt_quiesced(lease)
+    assert owned.fake_release_count == 1
+    assert scheduler.task("task").active_upload_lease is None
 ```
 
 Also test current-speed zero only after every candidate gate passes, maximum-score selection, one migration maximum, attempted-account exclusion, two idle accounts racing one task, finalize/migration mutual exclusion, stale progress/error/completion rejection, late physical success after terminal state, logical reset with physical retention, terminal idempotence, and qualification deadline cleanup. Add deterministic wakeup tests for: candidate age reaching 30 seconds while a target is already idle, premium-recency expiry, progress/speed change, idle snapshot creation/invalidation/expiry, and migration selection taking priority over assigning a normal pending segment.
@@ -1315,8 +1487,26 @@ class SegmentTask:
     last_premium_flood_at: Optional[float] = None
     qualification_deadline: Optional[float] = None
     reserved_account_id: Optional[int] = None
+    active_upload_lease: Optional[UploadLease] = field(default=None, repr=False)
+    active_upload_attempt_id: Optional[int] = None
+    executor_quiescent: set[int] = field(default_factory=set, repr=False)
     revoke_handle: Optional[RevokeHandle] = field(default=None, repr=False)
     result: Optional[UploadedPart] = None
+
+
+def close_active_upload_lease(self, lease: AttemptLease) -> bool:
+    # Caller has established prepared or token-empty + quiescent eligibility.
+    with self._condition:
+        task = self._tasks[lease.task_id]
+        owned = task.active_upload_lease
+        if (owned is None or task.active_upload_attempt_id != lease.attempt_id
+                or owned.runtime.telegram_user_id != lease.account_id):
+            return False
+        task.active_upload_lease = None
+        task.active_upload_attempt_id = None
+        change = owned.close()
+        self._pending_activity_changes.append(change)
+        return True
 ```
 
 Remove the earlier integer `attempt_in_flight_rpcs` field; the token-set field above is authoritative. All mutating methods acquire one `threading.Condition`. `_valid_current(lease, allowed_states)` performs task ID, attempt ID, account ID, non-terminal, and state checks and is used only by logical progress, errors, completion, and `grant_finalize()`.
@@ -1325,11 +1515,19 @@ Remove the earlier integer `attempt_in_flight_rpcs` field; the token-set field a
 
 `notify_premium_flood()` updates flood recency, installs the nearest qualification deadline without changing ownership, closes the current `UploadSpeedTracker` flood cycle, and returns its `FloodCycleSnapshot` to the diagnostics sink. Progress/speed changes call `notify_speed_changed()`. Activity changes call `notify_account_changed()` only after releasing all activity/pool locks. `next_deadline()` returns the nearest absolute monotonic candidate-age, premium-recency, or idle-snapshot-expiry boundary; `wait_for_change(observed_version, deadline)` computes the remaining timeout and uses the condition instead of a polling timer. On every wake, `select_next_action()` recomputes migration candidates before normal pending assignments, so an already-idle account can migrate a segment that qualifies later.
 
-`commit_migration(target_account_id, task_id)` is the only method allowed to enter `MIGRATING` or increment `attempt_id`. Under the scheduler condition and with no `await` or I/O, it rechecks target online/linked/idle state, snapshot age, attempted-account exclusion, current candidate gates, latest score strictly greater than 2, and `migration_count == 0`; invokes the synchronous pool reservation callback; invalidates the target snapshot; sets `MIGRATING`; increments the generation immediately; records the old generation as draining; clears current account/logical bytes/completed parts; sets migration count to one; and adds the target to attempted accounts. It then invokes `RevokeHandle.revoke()`. Qualification/timer methods can never call this transition implicitly.
+Initial assignment initializes `attempt_id=1`. Subsequently `commit_migration(target_account_id, task_id)` is the only method allowed to enter `MIGRATING` or increment `attempt_id`. Under the scheduler condition and with no `await` or I/O, it rechecks target online/linked/idle state, snapshot age, attempted-account exclusion, current candidate gates, latest score strictly greater than 2, and `migration_count == 0`; invokes the synchronous pool reservation callback (which invalidates its snapshot in the same activity transition); sets `MIGRATING`; increments the generation immediately; records the old generation as draining; clears current account/logical bytes/completed parts; sets migration count to one; and adds the target to attempted accounts. It then invokes `RevokeHandle.revoke()`. Qualification/timer methods can never call this transition implicitly.
 
-After the old token set becomes empty, `activate_reserved_replacement()` revalidates the same `MIGRATING` generation and reservation, atomically converts reservation to one active job through the pool callback, installs the new account and `RevokeHandle`, sets `attempt_started_at=now`, and returns the replacement lease. `grant_finalize()` changes ACTIVE to FINALIZING under the same scheduler condition, making it mutually exclusive with `commit_migration()`.
+`SegmentTask.active_upload_lease` stores the single pool-issued object; `active_upload_attempt_id` identifies its owner even after migration increments the task generation. Initial assignment and replacement activation store that exact instance. Executors receive only the borrowed runtime plus `AttemptLease`; they never call `UploadLease.close()`, `__exit__()`, `end_job()`, or `file_slots.release()`.
 
-Terminal cleanup is idempotent: cancel qualification deadlines, detach task-level callbacks, and release exactly the resource the task currently owns (an active job or a reservation, never both). It does not clear transport token sets or force account RPC counters to zero; those drain only through `request_settled(token)`. Repeated completion/error callbacks and late revoked-attempt events cannot decrement counters twice or change a terminal result.
+`bytes_prepared(lease)` accepts only the current ACTIVE generation, verifies all segment bytes are prepared and its token set is empty, then calls `close_active_upload_lease(lease)` under the scheduler condition. Preparation includes any pre-finalize thumbnail byte work. This releases file admission before message admission. Stale preparation cannot close the replacement lease. `grant_finalize()` then competes with migration under that same condition; denied finalize never sends a message.
+
+`close_active_upload_lease(lease)` matches both `active_upload_attempt_id` and account ID, detaches the stored object before calling its one `close()`, and returns false if already detached. Pool close returns transition data; scheduler publishes notifications only after releasing all outer locks. `UploadLease` is declared by Task 11 in `telegram_accounts.py`; use `TYPE_CHECKING` and postponed annotations in Task 10 to avoid a runtime import cycle.
+
+Migration keeps the old active lease in the task while separately holding the target reservation; reservation has no `UploadLease` yet. After the old token set is empty and that executor reports `attempt_quiesced(old_lease)` (no further byte work), scheduler closes the old object exactly once. `activate_reserved_replacement()` then revalidates the same MIGRATING generation/reservation, acquires one target slot, stores the new pool-issued object with the replacement generation, installs its `RevokeHandle`, sets ACTIVE and the new start time, and returns the replacement lease. This barrier never waits on unrelated jobs on the source account.
+
+Terminal transition invalidates logical leases and releases any target reservation immediately. It marks any remaining active lease for scheduler-owned close as soon as the corresponding executor is quiescent and its tokens have settled. Thus terminal state does not erase live transport bookkeeping or release a slot while its borrower is still using it. Reentrant cleanup, preparation, quiescence, and Future-completion callbacks all converge on `close_active_upload_lease()`; they never manufacture a second resource wrapper.
+
+`select_next_action()` claims `(task_id, attempt_id)` in a scheduler-owned set under its condition, installs account/UploadLease ownership, and sets ACTIVE before returning an immutable action. Returning the same attempt again is forbidden, including while it is waiting to enter the thread pool. Migration itself is committed by `commit_migration()`; no replacement action is returned until the drain/quiescence barrier and activation finish. Expose `submission_failed(action, error_category)`, `enqueue_executor_completion(future, action, error_category)`, `take_executor_completions()`, and `executor_finished(action, error_category)`. A submission failure releases an unstarted claim's resources and fails the task. An unexpected Future error aborts the file scheduler, revokes other active work, wakes waiters, and completes cleanup. A successful Future that left its current task ACTIVE without a valid outcome is also a scheduler failure. No Future error is silently discarded as a stale logical event.
 
 - [ ] **Step 4: Run scheduler tests**
 
@@ -1354,7 +1552,7 @@ git commit -m "feat: add lease-safe segment scheduler"
 
 **Interfaces:**
 - Consumes: `AccountActivityRegistry` from Task 7 and scheduler reservation callbacks from Task 10.
-- Produces: `UploadLease.activity`, `try_reserve_idle(account_id, task_id)`, `activate_reservation(account_id, task_id)`, and `release_reservation(account_id, task_id)`.
+- Produces: `UploadLease.runtime`, `UploadLease.close() -> ActivityChange`, `try_reserve_idle(account_id, task_id) -> bool`, `activate_reservation(account_id, task_id) -> UploadLease`, and `release_reservation(account_id, task_id) -> ActivityChange`.
 
 - [ ] **Step 1: Write failing reservation/account-activity tests**
 
@@ -1366,10 +1564,14 @@ def test_busy_account_with_free_file_slots_cannot_be_failover_target(pool):
 
 
 def test_reservation_blocks_normal_work_and_activation_counts_once(pool):
+    before = pool.fake_slots[1].acquire_count
     assert pool.try_reserve_idle(1, "segment:2")
+    assert pool.fake_slots[1].acquire_count == before
+    assert pool.activity.snapshot(1).idle_snapshot is None
     with pool.acquire_upload(timeout=0) as other:
         assert other.telegram_user_id == 2
     lease = pool.activate_reservation(1, "segment:2")
+    assert pool.fake_slots[1].acquire_count == before + 1
     assert pool.activity.snapshot(1).active_byte_upload_jobs == 1
     lease.close()
     assert pool.activity.snapshot(1).active_byte_upload_jobs == 0
@@ -1387,27 +1589,29 @@ Expected: FAIL because the pool only exposes anonymous semaphore leases.
 
 ```python
 class UploadLease:
-    def __init__(self, pool, runtime, work_id, *, reserved=False):
+    def __init__(self, pool, runtime, work_id):
         self.pool = pool
         self.runtime = runtime
         self.work_id = work_id
-        self.reserved = reserved
         self._closed = False
 
     def __enter__(self):
         return self.runtime
 
     def close(self):
-        if self._closed:
-            return
-        self._closed = True
-        self.pool._release_upload(self.runtime, self.work_id)
+        with self.pool._lock:
+            if self._closed:
+                return ActivityChange(self.runtime.telegram_user_id, False, False, False)
+            self._closed = True
+            return self.pool._release_upload_locked(self.runtime, self.work_id)
 
     def __exit__(self, *_exc):
         self.close()
 ```
 
-Normal `acquire_upload()` acquires a file slot and begins activity atomically under the pool lock, then emits any scheduler notification after unlocking. `_release_upload()` takes the pool lock, ends activity, releases the slot, copies the resulting notification, unlocks, and only then wakes the scheduler. `try_reserve_idle()` is called only while the scheduler lock is already held; it takes pool then activity locks, rechecks online, linked, exact idleness, valid snapshot, and exclusion, and sets `reserved_task_id` without calling back into the scheduler. Reservation makes normal selection skip the entire account even though its semaphore has remaining capacity. `activate_reservation()` follows the same lock order, clears reservation, and begins exactly one job while retaining one acquired slot. Activity and pool code never acquire the scheduler lock.
+Normal `acquire_upload()` acquires a file slot and begins activity atomically under the pool lock. `_release_upload_locked()` requires that same pool lock, ends the specific job and releases exactly one slot, then returns `ActivityChange` without invoking callbacks. `UploadLease.close()` serializes its idempotence check under that lock. The scheduler stores and closes the returned object; small/album callers outside the scheduler may continue owning their own context-managed leases. Notification delivery belongs to the outermost caller after every lock has been released.
+
+Reservation does not acquire a semaphore or create an active job. `try_reserve_idle()` takes pool then activity locks (under scheduler lock in production), rechecks eligibility, and in one activity transition sets `reserved_task_id` and invalidates the snapshot. All normal dispatch, including exact-account album fallback, must reject a reserved account; direct semaphore bypasses are removed. `activate_reservation()` verifies the reservation and eligibility, non-blockingly acquires exactly one file slot, then atomically clears reservation and begins one job. It returns a new `UploadLease` for the scheduler to store. Failure to acquire leaves no partially-created job and leads to explicit task failure/reservation cleanup. Releasing an unused reservation never releases a semaphore. Pool and activity operations never call back into scheduler while locked.
 
 - [ ] **Step 4: Run account/activity tests**
 
@@ -1463,6 +1667,16 @@ def test_old_attempt_cannot_send_message_after_migration(rig):
     assert rig.old_account.messages == []
     assert len(rig.replacement.messages) == 1
     assert result.file_id == rig.replacement.document_id
+
+
+def test_executor_exception_cannot_leave_task_active_forever(rig):
+    rig.executor_raise_before_handler = AssertionError("synthetic executor defect")
+    job = rig.start_big_upload(accounts=(1,), segment_size=rig.three_parts)
+    with pytest.raises(SchedulerExecutionError):
+        job.result(timeout=2)
+    assert rig.scheduler.all_terminal()
+    assert rig.retained_future_count == 0
+    assert rig.active_upload_job_count == 0
 ```
 
 Also cover a busy replacement, an idle account with no/expired snapshot, score equal to two, one-account behavior, ordinary flood/timeout/general slowness, migration versus finalize race, old late physical success, drain ignoring old-account unrelated work, replacement failure without a third migration, segment-zero thumbnail ownership, sorted final results, and small/album/thumbnail paths blocking idle while never becoming candidates.
@@ -1502,11 +1716,33 @@ def _upload_big_with_scheduler(self, request, decision, preview):
 
 
 def _run_scheduler_loop(self, scheduler, executor):
+    submitted = {}
+
+    def on_done(future, action):
+        category = None
+        try:
+            future.result()  # Consume every exception, including cancellation.
+        except BaseException as exc:
+            category = type(exc).__name__
+        scheduler.enqueue_executor_completion(future, action, category)
+
     observed_version = scheduler.version
-    while not scheduler.all_terminal():
-        action = scheduler.select_next_action()
+    while True:
+        for future, action, category in scheduler.take_executor_completions():
+            submitted.pop(future)
+            scheduler.executor_finished(action, category)
+        if scheduler.all_terminal() and not submitted:
+            break
+        action = (scheduler.select_next_action()
+                  if len(submitted) < self._segment_concurrency else None)
         if action is not None:
-            executor.submit(self._execute_scheduler_action, scheduler, action)
+            try:
+                future = executor.submit(self._execute_scheduler_action, scheduler, action)
+            except Exception as exc:
+                scheduler.submission_failed(action, type(exc).__name__)
+                continue
+            submitted[future] = action
+            future.add_done_callback(lambda done, claim=action: on_done(done, claim))
             continue
         deadline = scheduler.next_deadline()
         observed_version = scheduler.wait_for_change(observed_version, deadline)
@@ -1525,8 +1761,8 @@ class SchedulerUploadObserver:
         self.scheduler.physical_success(token, nbytes)
         self.scheduler.part_succeeded(self.lease, token.part_index, nbytes)
 
-    def premium_flood(self, seconds: float) -> None:
-        self.scheduler.notify_premium_flood(self.lease, seconds)
+    def premium_flood(self, seconds: float, pacer_snapshot: LimiterSnapshot) -> None:
+        self.scheduler.notify_premium_flood(self.lease, seconds, pacer_snapshot)
 
     def request_settled(self, token: UploadRpcToken) -> None:
         self.scheduler.request_settled(token)
@@ -1537,9 +1773,11 @@ class SchedulerUploadObserver:
 
 `decision.segments` remains the existing `list[tuple[offset, size]]`; enumerate it exactly once into `SegmentDescriptor(index, offset, size)`. `next_deadline()` converts the nearest monotonic deadline into the condition timeout internally. Worker callbacks for premium flood, effective progress, request settlement, account idle transitions, and errors increment the scheduler version and notify the condition. Therefore production uses no manual polling hook and wakes when an already-idle target becomes useful at the candidate's 30-second deadline.
 
-For each scheduler attempt, open a new `SegmentReader(descriptor.offset, descriptor.size)` so migration starts at part zero within that logical segment, pass the scheduler observer and `RevokeHandle.worker_event` to `worker.prepare_segment`, and call `grant_finalize(lease)` before `send_uploaded_segment`. Release the byte-upload/file-slot lease after prepare and before the message bucket, preserving current admission semantics. If finalize is denied, discard the handle and never send a message. Only the current attempt for `descriptor.index == 0` uploads/attaches the thumbnail.
+For each scheduler attempt, open a new `SegmentReader` using the source path, descriptor offset/size and `force_big=True`, then pass the observer and worker revoke event to `worker.prepare_segment`. The executor borrows the scheduler-owned runtime. On completed preparation it calls `scheduler.bytes_prepared(lease)`, which closes the stored upload lease before message admission; the executor then requests `grant_finalize(lease)` before `send_uploaded_segment`. Denied finalize discards the handle. Only the current segment-zero attempt prepares/attaches the thumbnail, with any thumbnail byte work included before `bytes_prepared()`.
 
-The attempt executor treats `AttemptRevoked` as a handoff outcome, not a task failure: it closes only the old upload lease after its wrappers settle and notifies the scheduler that drain may advance. Every other exception is offered through generation-validated `fail_attempt(lease, error_category)`; a stale error is ignored. `SchedulerUploadObserver.request_succeeded()` always records token-based physical success first, then attempts current-generation logical progress, so a migration race cannot lose confirmed traffic or revive the old attempt.
+The executor catches `AttemptRevoked` as the expected handoff result and drains all committed wrappers in its `finally` before `scheduler.attempt_quiesced(lease)`. It never closes an UploadLease. Expected operational failures go through `fail_attempt()`; programming errors propagate to the retained Future, whose outcome is always consumed by `on_done`. `executor_finished()` independently verifies/quiesces the action when its Future ends, including failures before the executor entered its own `try/finally`. A stale unexpected error aborts the file scheduler rather than disappearing under a generation check. `SchedulerUploadObserver.request_succeeded()` records physical success before attempting current-generation logical progress.
+
+`enqueue_executor_completion()` appends immutable completion data and increments version/notifies under the scheduler condition. It performs no state transitions, diagnostics, or calls back into a worker, so the callback also works when attached to an already-completed Future. Only the coordinator mutates `submitted` and consumes outcomes. On abort it keeps draining retained Futures; `completed_results_by_index()` raises the recorded failure after all borrowers have stopped. Tests inject submit failure, cancelled-before-start Future, exception before executor cleanup setup, and a normally-returning executor that forgot its task outcome.
 
 Update small, album, album fallback, and thumbnail preparation calls to pass generic account activity observers so they update snapshots and block idle decisions without entering the scheduler candidate set.
 
@@ -1601,10 +1839,11 @@ def test_premium_flood_log_uses_closed_physical_cycle(status_rig, caplog):
     status_rig.confirm_rpc(lease, part_index=0, sequence=1, nbytes=512)
     status_rig.confirm_rpc(lease, part_index=0, sequence=2, nbytes=512)
     cycle = status_rig.premium_flood(lease, wait_seconds=30)
-    assert cycle.accepted_physical_parts == 2
-    assert cycle.accepted_physical_bytes == 1024
-    assert "accepted_physical_parts=2" in caplog.text
-    assert "accepted_physical_bytes=1024" in caplog.text
+    assert cycle.task_accepted_parts == cycle.account_accepted_parts == 2
+    assert cycle.task_accepted_bytes == cycle.account_accepted_bytes == 1024
+    assert "task_accepted_parts=2" in caplog.text
+    assert "account_accepted_bytes=1024" in caplog.text
+    assert "pacer_mode=frozen" in caplog.text
 ```
 
 Also assert flood-cycle logs include account/task/segment/attempt IDs, wait/penalty, mode/rate, live speed, logical bytes, remaining ratio, and accepted physical parts/bytes; migration logs include old/new generations, from/to IDs, snapshot age/speeds, score, abandoned bytes, and migration count. Assert access hashes, auth keys, session material, and JWTs are redacted.
@@ -1629,7 +1868,7 @@ class TransferMetrics:
 
 Do not remove the existing timing fields. Extend status details with scheduler state only while a transfer is active; terminal queue persistence keeps the final account IDs and redacted failure detail, not ephemeral lease objects or timers. Add the exact candidate constants and operational interpretation to `CLAUDE.md`; add user-facing session-directory setup, migration, status fields, and failover behavior to `README.md`.
 
-Wire `UploadObserver.premium_flood(seconds)` only to `SegmentScheduler.notify_premium_flood(bound_lease, seconds)`. That method closes `UploadSpeedTracker.close_premium_flood_cycle()` and forwards the returned `FloodCycleSnapshot` to the diagnostics sink. This Task 7 API is the only source for `accepted_physical_parts` and `accepted_physical_bytes`; do not reconstruct the cycle from logical progress. Confirmed stale-generation RPCs recorded before the cycle closes are included, while timeouts and unknown results are not.
+Call `gate.flood(seconds, premium=True)` before `UploadObserver.premium_flood(seconds, gate.snapshot())`. The observer forwards the immutable post-flood snapshot to `SegmentScheduler.notify_premium_flood(bound_lease, seconds, pacer_snapshot)`. That method closes the tracker cycle and queues diagnostics using this supplied snapshot (never a cross-thread read of the live limiter); the log therefore shows frozen mode, updated penalty, and the preserved premium rate. Publish diagnostics outside locks. `FloodCycleSnapshot` supplies `account_accepted_parts`, `account_accepted_bytes`, `task_accepted_parts`, and `task_accepted_bytes`; logical progress cannot substitute for any of these physical counters.
 
 - [ ] **Step 4: Run focused verification**
 

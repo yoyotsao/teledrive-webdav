@@ -29,6 +29,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
@@ -63,6 +64,14 @@ SHELL_THREADS = 4
 # hundred files and never put a single entry into thumbcache_*.db — the layer
 # that is worth 274 previews a second.
 SHELL_SECONDS_PER_FILE = 10.0
+# ``kill()`` is only a request on Windows.  A process with threads blocked in
+# the filesystem can remain alive, so never turn cleanup into a second,
+# unlimited wait inside the bridge.
+SHELL_KILL_GRACE_SECONDS = 5.0
+# Shared with scripts/stop_bridge.ps1.  Restart owns this gate from its process
+# snapshot until the bridge is gone, so a background warm-up cannot spawn a new
+# child in the small gap after the snapshot.
+WARMSHELL_LAUNCH_MUTEX = r"Local\TeleDriveWarmshellLaunch"
 # Extensions worth asking for a thumbnail. The same set the head cache uses:
 # these are the files the shell renders and then goes and reads.
 SHELL_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
@@ -81,6 +90,46 @@ DEFAULT_INTERVAL_MINUTES = 360.0
 # Seconds between progress lines while a pass runs. One line per batch would be
 # a thousand lines for a hundred thousand files.
 PROGRESS_EVERY = 60.0
+
+
+@contextmanager
+def _warmshell_launch_guard():
+    """Serialize process creation with the Windows restart preflight."""
+    if sys.platform != "win32":
+        yield
+        return
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = (
+        wintypes.LPVOID,
+        wintypes.BOOL,
+        wintypes.LPCWSTR,
+    )
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.ReleaseMutex.argtypes = (wintypes.HANDLE,)
+    kernel32.ReleaseMutex.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.CreateMutexW(None, False, WARMSHELL_LAUNCH_MUTEX)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    acquired = False
+    try:
+        result = kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)
+        if result not in (0x00000000, 0x00000080):
+            raise ctypes.WinError(ctypes.get_last_error())
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            kernel32.ReleaseMutex(handle)
+        kernel32.CloseHandle(handle)
 
 
 
@@ -266,20 +315,45 @@ class Warmer:
         """
         budget = max(60.0, SHELL_SECONDS_PER_FILE * len(group))
         started = time.monotonic()
-        proc = subprocess.Popen(
-            [str(self.shell_exe), str(SHELL_THREADS), "256"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        try:
+            with _warmshell_launch_guard():
+                proc = subprocess.Popen(
+                    [str(self.shell_exe), str(SHELL_THREADS), "256"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    # The warmer has no UI and all three streams are pipes.
+                    # Keeping it off the bridge's console also means an
+                    # unreapable Windows process cannot keep that console
+                    # window alive after the bridge exits.
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+        except (OSError, subprocess.SubprocessError) as exc:
+            log.warning("shell warm failed to run: %s", exc)
+            return 0, True
         payload = ("\n".join(group) + "\n").encode("utf-8")
         wedged = False
         try:
             out, err = proc.communicate(input=payload, timeout=budget)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            out, err = proc.communicate()
+        except subprocess.TimeoutExpired as timed_out:
             wedged = True
+            try:
+                proc.kill()
+                out, err = proc.communicate(timeout=SHELL_KILL_GRACE_SECONDS)
+            except subprocess.TimeoutExpired as still_running:
+                # Prefer the latest partial buffers.  TimeoutExpired carries
+                # what communicate() collected without requiring the child to
+                # close its pipes, which it may never do in this state.
+                out = still_running.output or timed_out.output or b""
+                err = still_running.stderr or timed_out.stderr or b""
+                log.warning(
+                    "shell warm: still running after kill; leaving cleanup to "
+                    "restart preflight"
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                out = timed_out.output or b""
+                err = timed_out.stderr or b""
+                log.warning("shell warm: could not reap after timeout: %s", exc)
         except (OSError, subprocess.SubprocessError) as exc:
             log.warning("shell warm failed to run: %s", exc)
             return 0, True

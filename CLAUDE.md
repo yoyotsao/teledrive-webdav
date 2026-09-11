@@ -76,10 +76,10 @@ bridge 只用現有 public API，沒有為它新增任何會讀寫二進位資�
 
 ### 一般路徑的寫入（`uploadstage.py`）
 
-`/game` 以外，`H:` 上任何資料夾都能建立子資料夾、PUT 新檔、覆寫既有檔案、刪除還沒上傳的檔案。
+`/game` 以外，`H:` 上任何資料夾都能建立子資料夾、PUT 新檔、覆寫既有檔案、刪除暫存或已上傳的檔案。
 `WriteGuard`（`bridge.py`）對 `MKCOL`、`PUT`、`DELETE` 全域放行，理由是這三個動詞
-各自不需要 `/game` 的打包步驟——`DELETE` 甚至不是靠一個 backend 端點放行，而是完全
-不需要看路徑：
+各自不需要 `/game` 的打包步驟；`DELETE` 由實際 resource 決定要取消本機暫存，或呼叫
+backend 的垃圾桶端點，跟路徑本身無關：
 
 - **`MKCOL`** 直接打 `POST /folders`（`RootCollection.create_collection`），
   沒有落地、沒有 debounce，是即時的真實寫入。
@@ -94,9 +94,10 @@ bridge 只用現有 public API，沒有為它新增任何會讀寫二進位資�
   還是 backend 已經註冊過的真實資料」，跟在不在 `/game` 底下無關——`/game` 跟
   一般路徑的差別只在上傳前有沒有先打包成 zip，不是刪除能力本身的分界。
   `UploadFileResource.delete()`（一般路徑）跟 `StagingFileResource`/`StagingCollection.delete()`
-  （`/game`）都只是把本機暫存檔案／目錄刪掉，取消這次還沒發生的上傳；一旦真的
-  上傳註冊過，兩邊都靠 `_ReadOnlyFile.delete()` / `_ReadOnlyCollection.handle_delete()`
-  統一回 403——backend 沒有刪除端點，這點不因路徑而異。
+  （`/game`）把本機暫存檔案／目錄刪掉，取消這次還沒發生的上傳；已上傳的真實檔案由
+  `RemoteFileResource.delete()`、真實資料夾由 `FolderCollection.handle_delete()` 呼叫
+  `DELETE /files/{id}` 軟刪除。整個資料夾子樹會一起進垃圾桶，Telegram 訊息不動，可從
+  TeleDrive 網頁還原。ZIP 內部的虛擬節點沒有獨立 backend row，仍回 403。
 - **`COPY`** 跟 `DELETE` 一樣看「還在暫存 vs. 已上傳」，不看路徑：還在暫存的來源
   （`UploadFileResource`/`StagingFileResource`/`StagingCollection`）真的用
   `shutil.copy2`／建空目錄複製一份，來源不受影響；已上傳的來源一律 403
@@ -839,7 +840,7 @@ GET /files    0.52s ┘
 | `tests/test_shell_warm.py` | shell warm 的記帳：逐檔 stderr 回報的解析（含非 ASCII 路徑）、被 kill 的批次仍報得出暖成幾個與還卡在哪一個、卡住就停掉這一輪而不是把後面幾十批排在後面、期限按檔數算、沒掛載就不去問 shell |
 | `tests/test_upload_pace.py` | `tgupload.UploadGate`：distinct-event guard、window/rate 的 AIMD、rate cap 從量測值算出且爬回不再綁得住時拆掉、注入假時鐘 |
 | `tests/test_upload_parts.py` | `plan_parts`、`_PartReader` 的隨機讀取、`send_part` 的 flood/斷線重試（繞過 `client._call`）、`upload_file_parts` 的 segment-relative index、bytes↔offset、永久失敗時取消手足 task |
-| `tests/test_bridge_e2e.py` | 真的用 HTTP 跑整個 bridge（PROPFIND / GET / Range / 403 / MKCOL+PUT → 打包 → 上傳 → 再瀏覽 / `/rpc/*` / fetch-local / warmup sweep 的續跑與禮讓 / split part 的精確大小非灌水 / 一般路徑的 MKCOL、PUT 新檔、覆寫、去重、`/rpc/status` 的 `uploads` 欄位 / DELETE 在 `/game` 與一般路徑對「還在暫存」一致放行、對「已上傳」一致 403 且不因遞迴列出整棵樹而 500 / COPY 對已上傳內容一致 403（檔案與資料夾兩種 resource 都不因遞迴列出整棵樹而 500）、對還在暫存的內容（`/game` 與一般路徑）做出真正的本機複製、跨 `/game` 邊界複製一律 403 / 父目錄已在 staging 時的 PUT 與 MKCOL 一次 backend 都不打），只有 MTProto 與 backend 是假的 |
+| `tests/test_bridge_e2e.py` | 真的用 HTTP 跑整個 bridge（PROPFIND / GET / Range / 403 / MKCOL+PUT → 打包 → 上傳 → 再瀏覽 / `/rpc/*` / fetch-local / warmup sweep 的續跑與禮讓 / split part 的精確大小非灌水 / 一般路徑的 MKCOL、PUT 新檔、覆寫、去重、`/rpc/status` 的 `uploads` 欄位 / DELETE 對暫存內容取消上傳、對已上傳的真實檔案與資料夾呼叫 backend 軟刪除且連同子樹進垃圾桶、ZIP 內部虛擬節點維持 403 / COPY 對已上傳內容一致 403（檔案與資料夾兩種 resource 都不因遞迴列出整棵樹而 500）、對還在暫存的內容（`/game` 與一般路徑）做出真正的本機複製、跨 `/game` 邊界複製一律 403 / 父目錄已在 staging 時的 PUT 與 MKCOL 一次 backend 都不打），只有 MTProto 與 backend 是假的 |
 
 掛載後仍需手動走一遍（測試無法代替）：
 
