@@ -1,0 +1,57 @@
+             stream.payloads[0] = None
+             gc.collect()
+             released = first_ref() is None
+@@ -302,4 +308,6 @@ def test_worker_uses_explicit_small_primitive_instead_of_telethon_shortcut(monke
+     result = run(worker._upload_segment(io.BytesIO(b"x"), 1, "x.bin", None))
+ 
+     assert result == {"message_id": 81, "file_id": "91", "access_hash": "101", "size": 1}
+-    assert calls == [("small", client, limiter, 1, "x.bin", {"progress": None})]
++    assert calls == [("small", client, limiter, 1, "x.bin", {
++        "progress": None, "observer": None, "revoked": None, "rpc_timeout": 120.0,
++    })]
+diff --git a/tgupload.py b/tgupload.py
+index 0b6b54e..dade240 100644
+--- a/tgupload.py
++++ b/tgupload.py
+@@ -284,9 +284,28 @@ async def send_part(
+ ) -> None:
+     """Paced, flood-aware single part send with a revoke-safe commit boundary."""
+     while True:
+-        async with _cancelable_context(gate.slot(), revoked):
++        # New account limiters split admission into a capacity slot plus pacing so
++        # revocation can abort between those phases.  Older injected/test limiters
++        # expose one acquire() context that already owns both responsibilities.
++        # Keep both contracts valid while preserving the same commit boundary:
++        # once request_started() succeeds, the RPC is sent even if revoke races in.
++        slot = getattr(gate, "slot", None)
++        pace = getattr(gate, "pace", None)
++        if callable(slot) and callable(pace):
++            admission = slot()
++            legacy_admission = False
++        else:
++            acquire = getattr(gate, "acquire", None)
++            if not callable(acquire):
++                raise AttributeError("upload limiter has no admission context")
++            admission = acquire()
++            legacy_admission = True
+             start = gate.now()
+-            await _wait_or_revoke(gate.pace(), revoked)
++
++        async with _cancelable_context(admission, revoked):
++            if not legacy_admission:
++                start = gate.now()
++                await _wait_or_revoke(pace(), revoked)
+             if revoked is not None and revoked.is_set():
+                 raise AttemptRevoked()
+             sender = sender_of()
+@@ -318,7 +337,9 @@ async def send_part(
+                 log.warning("%s hit FLOOD_WAIT; retrying after %.1fs", label, seconds)
+                 gate.flood(seconds, premium=premium)
+                 if premium and observer is not None:
+-                    observer.premium_flood(seconds, gate.snapshot())
++                    snapshot = getattr(gate, "snapshot", None)
++                    if callable(snapshot):
++                        observer.premium_flood(seconds, snapshot())
+                 continue
+             finally:
+                 if observer is not None and token is not None:
