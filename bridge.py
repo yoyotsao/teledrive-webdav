@@ -40,6 +40,7 @@ import zipfs
 from config import Config, ext_path as _ext, load_config
 from tdapi import ApiError, Entry, JsonStore, ShardedJsonStore, TeleDriveClient
 from telegram_accounts import TelegramAccountPool
+from telegram_sessions import SessionDirectoryLock
 from tgio import REQUEST_SIZE, STREAM_BLOCK_SIZE, SeekableRemoteFile
 from transfer_models import RemotePart
 
@@ -1666,8 +1667,13 @@ def main(argv=None) -> int:
     from warmup import BackgroundWarmup
 
     api = TeleDriveClient(cfg)
-    pool = TelegramAccountPool.from_config(cfg)
-    pool.start(api)
+    session_lock = SessionDirectoryLock(cfg.session_dir).acquire()
+    try:
+        pool = TelegramAccountPool.from_config(cfg)
+        pool.start(api)
+    except BaseException:
+        session_lock.release()
+        raise
     worker = pool.primary.worker
 
     # One engine for the whole process: fingerprint claims only collapse
@@ -1731,6 +1737,7 @@ def main(argv=None) -> int:
         stager.stop()
         upload_stager.stop()
         pool.stop()
+        session_lock.release()
     return 0
 
 

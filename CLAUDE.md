@@ -175,23 +175,64 @@ file/part，bridge 一律讀不到**，跨帳號的 split file 只是最明顯�
 
 ### 帳號
 
-`config.ini` 的 `accounts_file` 指向一份 JSON（格式見 `accounts.example.json`，
-真檔要放在 repo 外，`.gitignore` 也擋著 `accounts.json`）。留空就是舊行為：
-`session` 那一條就是 primary，也是唯一的上傳目標。
+`config.ini` 只指定 `primary_user_id` 與 `session_dir`。`session_dir` 必須在 application root 外，
+其中**直接子檔案** `<positive telegram user id>.session` 就是完整帳號 registry；primary 由
+`primary_user_id` 指定，其餘帳號按數字 ID 排序。沒有 `accounts_file`、label 或 plaintext
+StringSession runtime fallback。
 
-- **順序有意義。** 第一個是 primary：只有它對 backend 做 bot challenge 認證，
-  也只有它負責回答 `telegram_user_id = 0` 的舊 row（多帳號之前註冊的全部是 0）。
-- **`telegram_user_id` 對不上 session 真正的帳號就停用那一個帳號並說明原因**，
-  其他帳號照常起來。錯誤訊息會把 session string 換成 `[redacted]`。
-- **`for_read(id)` 不做 fallback。** 0 走 primary，其他值必須是「有設定且連上」
-  的那一個帳號，找不到就 `AccountUnavailableError`。悄悄改用 primary 讀會拿到
-  別的檔案或空手而回，那比一個明確的錯誤糟得多。
-- **新上傳只會發到「有設定 + 連上 + backend 說已 linked」的帳號**
-  （`eligible_upload_ids`）。沒 link 的帳號仍可讀它歷史上存的東西。
+- `.session` 是未加密 bearer credential。路徑、檔名（除 user ID）、auth key、StringSession、
+  login code、2FA、JWT 與 Authorization header 都不能進 log/status/exception traceback。
+- 每個 SQLite 檔只有一個 Telethon control owner；download/upload auxiliary client 都從 control
+  當下狀態複製成獨立 in-memory `StringSession`，永遠不再開 SQLite path。shutdown 必須 auxiliary
+  先斷，SQLite owner 最後斷。
+- control startup 一定 `get_me()`，實際 ID 必須等於檔名 ID；不符只停用該帳號。`for_read(0)`
+  仍代表 primary 以相容舊 row，非 0 ID 不 fallback。
+- bridge 整個生命週期持有 `<session_dir>/.teledrive-session.lock`；`sessionctl login/migrate`
+  也拿同一把 lock，因此不能在 bridge 開著時改 credential registry。
+- 新 session 用 `sessionctl.py login` 建立；舊 plaintext 只有在確認未外洩時才用 `migrate`。
+  已外洩的舊 credential 必須先從 Telegram 撤銷，再重新登入，不能遷移。
+- 新上傳只會發到「有設定 + 連上 + backend 說已 linked」的帳號；未 linked 帳號仍可讀歷史資料。
+  新增／移除 session 檔後要重啟 bridge 才重建 pool。
 
 每個帳號各自持有：3 個 file slot（同時處理幾個檔）、12 個 chunk slot、
 一份 `AdaptiveUploadLimiter`、一個訊息 token bucket（3/s，burst 6）。
 **互不影響是重點**——一個帳號撞 FLOOD_WAIT 不該把另一個帳號也節流掉。
+
+#### 大型 segment idle failover
+
+所有 fresh `force_big=True` transfer（包含只有一個 big segment）改由中央 `SegmentScheduler`
+管理 ownership generation、reservation、drain 與 finalize CAS；small、album、thumbnail 只參與
+`AccountActivityRegistry` 的 idle/effective/physical bookkeeping，本身永遠不是 migration candidate。
+
+固定常數與 gate：
+
+- candidate attempt age `>= 30s`；最近一次 `FLOOD_PREMIUM_WAIT` 必須在 `<= 30s`；
+  `migration_count == 0` 且 segment 未完成。普通 FLOOD_WAIT、timeout、一般慢速都不建立 candidate。
+- replacement 必須 `online + linked + truly idle`：`active_byte_upload_jobs == 0`、
+  `in_flight_upload_rpcs == 0`、`reserved_task_id is None`，且有 TTL **300s** 內的 idle effective-speed snapshot。
+- `remaining_ratio = (size - logical_uploaded_bytes) / size`；
+  `score = (replacement_snapshot_speed / current_live_speed) * remaining_ratio`，嚴格 `> 2` 才 migration。
+  current speed 只有在所有 candidate gates 已通過後才允許 0 → Infinity。每 segment 最多 migration 一次，
+  `attempted_account_ids` 永不重用。
+- migration commit 同步完成 reserve target、`attempt_id += 1`、清零 current logical progress、撤銷舊 finalize 權；
+  replacement 只能在舊 attempt 的 token set 清空且 executor quiescent 後 activation，然後用新 `file_id` 從 part 0 開始。
+- `begin_request()` 成功就是 committed-send point：即使下一瞬間 migration，該 token 對應 RPC 仍一定送出／settle；
+  revoke 只阻止下一個 token。sent MTProto RPC 不 hard-cancel，wrapper deadline **120s**。Drain 只等 revoked attempt，
+  不看來源帳號其他工作的 global in-flight。
+- scheduler **唯一**持有實際 `UploadLease`；executor 只借 runtime，永遠不 close lease。全域 lock order 固定
+  `SegmentScheduler → TelegramAccountPool → AccountActivityRegistry → UploadSpeedTracker`。
+
+有效進度與實際流量分離：current generation 的 unique part success 才增加 logical/effective bytes；retry、
+late revoked success 只增加 physical bytes。Migration 是唯一允許 logical progress 回退的事件；
+`physical_transferred_bytes` 永不回退，完成後 `migration_overhead_bytes = physical - logical`。
+
+Premium pacer 是 session-only `normal → frozen → cautious`。premium flood 進 frozen 時保留 rate、停止 ramp；
+wait 後第一個真正排程／呼叫 `sender.send()` 才開始 **60s** clean window。滿 60s 無 flood 後進 cautious，
+其後最多每 **30s +0.1 parts/s**；任何 flood 再回 frozen。`pace()`／token acquisition 本身不能啟動 clean window。
+
+`/rpc/status` 只曝露 credential-free activity/scheduler 數值；premium flood log 記 account/task/segment/attempt、
+wait/penalty、pacer mode/rate、live speed、remaining ratio，以及 closed physical cycle 的 account/task accepted parts/bytes；
+migration log 記 old/new generation、from/to account、snapshot speed/age、current speed、score、abandoned bytes。
 
 ### 引擎
 
@@ -828,6 +869,12 @@ GET /files    0.52s ┘
 | `tests/test_account_pool.py` | 帳號檔驗證（重複 id、空 label/session）、user id 對不上就只停用那一個、`for_read(0)` 走 primary 而非零值 fallback、未 linked 的帳號不接新上傳、round-robin 跳過忙碌帳號、例外訊息不含 session |
 | `tests/test_account_routing.py` | 讀取前先驗 `file_id`（不對就不發 GetFile）、兩個帳號上相同 message id 不會互串、跨帳號 split 的 Range 拼接正確、快取 key 帶帳號 |
 | `tests/test_upload_limiter.py` | 移植自 `adaptiveRateLimiter.ts` 的狀態轉移向量：首次 flood、學到的 ceiling、slow zone、probe 確認/失敗冷卻、三次 flood 升級、十分鐘重置、premium 等待不降速、壞掉的狀態檔回退、每帳號各自一份 |
+| `tests/test_upload_activity.py` | 全帳號 byte-work idle 定義、effective/physical speed 分流、30 秒固定分母、5 分鐘 idle snapshot、RPC token/重試去重與 premium flood cycle |
+| `tests/test_upload_attempts.py` | revoke-aware part RPC：committed token 必送、admission/retry 可取消、sent RPC 不 hard-cancel、120 秒 wrapper/late physical success |
+| `tests/test_segment_scheduler.py` | generation/ownership state machine、strict score > 2、migration/finalize CAS、reservation/drain、deadline wakeup、executor Future 必消費 |
+| `tests/test_account_failover.py` | truly-idle reservation、normal work 不繞 reservation、owned UploadLease、activity/status credential-free |
+| `tests/test_upload_failover.py` | force-big fake executor 整合：premium source revoke、replacement part 0 重傳、舊 attempt 禁止 message、executor defect 不留下 ACTIVE |
+| `tests/test_failover_logging.py` | logical/physical/migration metrics、closed flood-cycle diagnostics、migration decision log 與 credential redaction |
 | `tests/test_upload_protocol.py` | `decide_protocol` 的三個界線（10 MiB / 500 MiB / 500 MiB + 1）、small 走 128 KiB × 4 workers 且 md5 正確、split 的尾巴仍用 `SaveBigFilePart` |
 | `tests/test_media_thumbnail.py` | `ready` / `not_media` / `undecodable` 的分類、ffmpeg 的探索與逾時、webp 是 media 但不進 album |
 | `tests/test_upload_dedup.py` | 精確覆蓋：殘缺的 split group 不可重用、別名與重複 message id 收斂、完整重複保留各 part 的儲存帳號、同批的兩個別名只上傳一次 |
@@ -853,8 +900,8 @@ GET /files    0.52s ┘
 6. 瀏覽器開網頁確認 `/game` 上傳的 zip 顯示、下載正常
 7. `/game` 以外的資料夾建立子資料夾、丟一個檔案進去，debounce 到期後網頁能看到、下載內容正確；
    同名再丟一次，確認覆寫後讀到的是新內容
-8. **多帳號**：設好 `accounts_file` 之後，確認 `/rpc/status` 的 `accounts` 每一個都
-   `online` + `linked`；丟一個 > 500 MiB 的檔案，看網頁上兩個 part 的
+8. **多帳號**：在 `session_dir` 放好多個 `<user_id>.session` 並重啟後，確認 `/rpc/status` 的 `accounts` 每一個都
+   `online` + `linked`，而且 status 不含 session 路徑或 label；丟一個 > 500 MiB 的檔案，看網頁上兩個 part 的
    `telegram_user_id` 真的不同，再從 `H:` 讀回來比對 SHA256（這是「跨帳號 split 讀得回來」
    唯一的實證）。另外挑一個存在**次要**帳號的既有檔案，確認縮圖與內容都出得來。
 9. **album**：一次丟 11 張 ≤ 10 MiB 的 JPEG 到 `/game` 以外的資料夾，網頁上 11 張都在、
@@ -875,7 +922,7 @@ GET /files    0.52s ┘
 6. **上傳中斷的檔案**：`split_group_id` 有值但只註冊了 part 0，那是真的少資料，只能刪掉重傳。
    `truncated.csv` 記著目前已知的 38 個。
 7. **一機一份 bridge**：只有跑 bridge 的那台 PC 能掛磁碟。所有設定的帳號都由這一份
-   bridge 連線，session string 全部留在這台機器上。
+   bridge 連線；未加密的 SQLite `.session` bearer credentials 必須只留在受保護的外部 `session_dir`。
 8. **進入未快取資料夾的第一個請求約 0.58 秒**（路徑解析：每一層一個 backend 往返，見「效能」第 7 節），之後每張 15ms。重啟後若那個資料夾之前列過，是 0.016 秒。
 9. Windows 11 右鍵選單只能出現在「顯示更多選項」（第一層要 MSIX + `IExplorerCommand`）。
 10. **COPY/MOVE 到已打包的 `/game/<name>` 底下不會失敗，會悄悄開一個新的 shadow staging unit**：

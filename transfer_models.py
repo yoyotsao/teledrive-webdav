@@ -21,8 +21,27 @@ class QueueStage(str, Enum):
 @dataclass(frozen=True)
 class AccountSpec:
     telegram_user_id: int
-    label: str
-    session: str = field(repr=False)
+    session_path: Path = field(repr=False)
+
+
+@dataclass(frozen=True)
+class AttemptLease:
+    task_id: str
+    attempt_id: int
+    account_id: int
+
+
+@dataclass(frozen=True)
+class UploadRpcToken:
+    task_id: str
+    attempt_id: int
+    account_id: int
+    part_index: int
+    sequence: int
+
+    @property
+    def lease(self) -> "AttemptLease":
+        return AttemptLease(self.task_id, self.attempt_id, self.account_id)
 
 
 @dataclass(frozen=True)

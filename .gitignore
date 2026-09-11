@@ -8,6 +8,9 @@ upload-rate-*.json
 cache/
 staging/
 *.session
+*.session-journal
+*.session-wal
+*.session-shm
 *.log
 .pytest_cache/
 .superpowers/

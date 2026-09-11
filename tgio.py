@@ -25,10 +25,12 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 import tgupload
 from media_thumbnail import PREVIEW_BOX, PREVIEW_MAX_BYTES, capture_thumbnail
+from telegram_sessions import safe_resolve_existing
 from transfer_models import PreparedAlbumItem, RemotePart, UploadedPart
 
 log = logging.getLogger("tgio")
@@ -264,6 +266,36 @@ def plan_segments(total_size: int, segment_size: int = SEGMENT_SIZE) -> List[Tup
 # --------------------------------------------------------------------------- #
 
 
+class SessionClientError(RuntimeError):
+    """Sanitized failure while opening or cloning a Telegram session."""
+
+
+class SessionAuthorizationError(SessionClientError):
+    """The configured SQLite session is not authorized."""
+
+
+class SessionIdentityError(SessionClientError):
+    """The SQLite filename identity does not match Telegram."""
+
+
+def _default_client_factory(session, api_id: int, api_hash: str, **kwargs):
+    from telethon import TelegramClient
+
+    return TelegramClient(session, api_id, api_hash, **kwargs)
+
+
+def _default_memory_session_factory(serialized: str):
+    from telethon.sessions import StringSession
+
+    return StringSession(serialized)
+
+
+def _default_session_serializer(session) -> str:
+    from telethon.sessions import StringSession
+
+    return StringSession.save(session)
+
+
 class TelegramWorker:
     """A Telethon client living on its own asyncio loop in a background thread.
 
@@ -275,17 +307,25 @@ class TelegramWorker:
         self,
         api_id: int,
         api_hash: str,
-        session: str,
+        expected_user_id: int,
+        session_path: Path,
         connections: int = DOWNLOAD_CONNECTIONS,
         *,
         upload_parts: int = 12,
         upload_limiter=None,
+        client_factory=None,
+        memory_session_factory=None,
+        session_serializer=None,
     ):
         self._api_id = api_id
         self._api_hash = api_hash
-        self._session = session
+        self._expected_user_id = int(expected_user_id)
+        self._session_path = Path(session_path)
         self._connections = max(1, int(connections))
         self._upload_parts = max(1, int(upload_parts))
+        self._client_factory = client_factory or _default_client_factory
+        self._memory_session_factory = memory_session_factory or _default_memory_session_factory
+        self._session_serializer = session_serializer or _default_session_serializer
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._ready = threading.Event()
@@ -310,7 +350,7 @@ class TelegramWorker:
         self._thread.start()
         self._ready.wait()
         try:
-            self.run(self._connect())
+            self.run(self._connect_and_validate_control())
         except Exception:
             # A bad or expired session must not leave a live loop behind, and
             # the worker must remain retryable after configuration is fixed.
@@ -327,22 +367,106 @@ class TelegramWorker:
         finally:
             self._loop.close()
 
-    async def _connect(self) -> None:
-        # Constructed on the loop thread so Telethon binds to the right loop.
-        from telethon import TelegramClient
-        from telethon.sessions import StringSession
+    def _new_control_client(self):
+        failure = None
+        try:
+            path = safe_resolve_existing(
+                self._session_path,
+                kind=f"Telegram session for account {self._expected_user_id}",
+            )
+            if not path.is_file():
+                raise SessionClientError(
+                    f"Telegram session for account {self._expected_user_id} is unavailable"
+                )
+            client = self._client_factory(
+                str(path),
+                self._api_id,
+                self._api_hash,
+                receive_updates=False,
+            )
+            client.session.save_entities = False
+            return client
+        except SessionClientError as exc:
+            failure = type(exc)(str(exc))
+        except Exception as exc:
+            failure = SessionClientError(
+                f"Telegram session for account {self._expected_user_id} failed "
+                f"({type(exc).__name__})"
+            )
+        raise failure from None
 
-        self._client = TelegramClient(StringSession(self._session), self._api_id, self._api_hash)
-        await self._client.connect()
-        if not await self._client.is_user_authorized():
-            raise RuntimeError("Telegram session is not authorized — regenerate it with generate_session.py")
-        self._me = await self._client.get_me()
+    async def _connect_and_validate_control(self) -> None:
+        client = None
+        me = None
+        failure = None
+        validated = False
+        try:
+            client = self._new_control_client()
+            await client.connect()
+            if not await client.is_user_authorized():
+                raise SessionAuthorizationError(
+                    f"Telegram session for account {self._expected_user_id} is not authorized"
+                )
+            me = await client.get_me()
+            actual = int(me.id)
+            if actual != self._expected_user_id:
+                raise SessionIdentityError(
+                    "Telegram session user ID mismatch: "
+                    f"expected {self._expected_user_id}, got {actual}"
+                )
+            validated = True
+        except asyncio.CancelledError:
+            raise
+        except SessionClientError as exc:
+            failure = type(exc)(str(exc))
+        except Exception as exc:
+            failure = SessionClientError(
+                f"Telegram session for account {self._expected_user_id} failed "
+                f"({type(exc).__name__})"
+            )
+        finally:
+            if client is not None and not validated:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+        if failure is not None:
+            raise failure from None
+        self._client = client
+        self._me = me
         self._pool_lock = asyncio.Lock()
+
+    def _new_auxiliary_client(self, *, upload: bool):
+        failure = None
+        serialized = None
+        try:
+            if self._client is None:
+                raise SessionClientError(
+                    f"Telegram session for account {self._expected_user_id} is not connected"
+                )
+            serialized = self._session_serializer(self._client.session)
+            memory = self._memory_session_factory(serialized)
+            serialized = None
+            options = {"receive_updates": False}
+            if upload:
+                options["flood_sleep_threshold"] = 0
+            return self._client_factory(memory, self._api_id, self._api_hash, **options)
+        except SessionClientError as exc:
+            failure = type(exc)(str(exc))
+        except Exception as exc:
+            failure = SessionClientError(
+                f"Telegram in-memory session for account {self._expected_user_id} failed "
+                f"({type(exc).__name__})"
+            )
+        finally:
+            serialized = None
+        raise failure from None
 
     async def _download_pool(self) -> list:
         """Extra clients used only for reading bytes, built on first read.
 
-        Same session string, so no extra login: each one just opens its own
+        Each auxiliary gets a fresh in-memory clone of the validated control
+        session, so only the control client owns SQLite. Each one opens its own
         MTProto connection, which is the only thing that lifts the per-connection
         throughput ceiling (see DOWNLOAD_CONNECTIONS). The control client is the
         first member so a pool of one behaves exactly like the old code path.
@@ -352,16 +476,22 @@ class TelegramWorker:
         async with self._pool_lock:
             if self._pool is not None:
                 return self._pool
-            from telethon import TelegramClient
-            from telethon.sessions import StringSession
-
             pool = [self._client]
             for _ in range(self._connections - 1):
-                extra = TelegramClient(StringSession(self._session), self._api_id, self._api_hash)
+                extra = self._new_auxiliary_client(upload=False)
                 try:
                     await extra.connect()
                 except Exception as exc:  # a short pool still works, just slower
-                    log.warning("download connection failed, continuing with %s: %s", len(pool), exc)
+                    try:
+                        await extra.disconnect()
+                    except Exception:
+                        pass
+                    log.warning(
+                        "download connection failed for account %s, continuing with %s (%s)",
+                        self._expected_user_id,
+                        len(pool),
+                        type(exc).__name__,
+                    )
                     break
                 pool.append(extra)
             log.info("download pool: %s connections", len(pool))
@@ -381,17 +511,21 @@ class TelegramWorker:
         async with self._pool_lock:
             if self._upload is not None:
                 return self._upload
-            from telethon import TelegramClient
-            from telethon.sessions import StringSession
-
             # Surface every upload/message flood to the account limiters.
             # Telethon's default short-wait retry would bypass their feedback
             # and admission when send_file creates a message.
-            client = TelegramClient(
-                StringSession(self._session), self._api_id, self._api_hash,
-                flood_sleep_threshold=0,
-            )
-            await client.connect()
+            client = self._new_auxiliary_client(upload=True)
+            try:
+                await client.connect()
+            except Exception as exc:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                raise SessionClientError(
+                    f"Telegram upload connection for account {self._expected_user_id} failed "
+                    f"({type(exc).__name__})"
+                ) from None
             log.info("upload connection ready")
             self._upload = client
             return self._upload
@@ -432,9 +566,13 @@ class TelegramWorker:
         self._thumb_gate = None
 
     async def _disconnect_all(self) -> None:
-        clients = list(self._pool or [self._client])
+        clients = []
+        if self._pool is not None:
+            clients.extend(client for client in self._pool if client is not self._client)
         if self._upload is not None:
             clients.append(self._upload)
+        if self._client is not None:
+            clients.append(self._client)
         for client in clients:
             try:
                 await client.disconnect()
@@ -835,11 +973,30 @@ class TelegramWorker:
         handle = await self._prepare_segment(stream, size, file_name, progress, force_big)
         return await self._send_uploaded_segment(handle, size, file_name, preview)
 
-    def prepare_segment(self, stream, size: int, file_name: str, progress=None, *, force_big=None):
-        """Upload bytes without sending a message or retaining a file lease."""
-        return self.run(self._prepare_segment(stream, size, file_name, progress, force_big), timeout=None)
+    def create_revoke_handle(self):
+        """Create a revoke handle on this worker's asyncio loop."""
+        async def make_handle():
+            return tgupload.RevokeHandle.create_on_worker_loop()
 
-    async def _prepare_segment(self, stream, size, file_name, progress=None, force_big=None):
+        return self.run(make_handle(), timeout=None)
+
+    def prepare_segment(
+        self, stream, size: int, file_name: str, progress=None, *, force_big=None,
+        observer=None, revoke_handle=None, rpc_timeout: float = 120.0,
+    ):
+        """Upload bytes without sending a message or retaining a file lease."""
+        return self.run(
+            self._prepare_segment(
+                stream, size, file_name, progress, force_big, observer,
+                revoke_handle, rpc_timeout,
+            ),
+            timeout=None,
+        )
+
+    async def _prepare_segment(
+        self, stream, size, file_name, progress=None, force_big=None,
+        observer=None, revoke_handle=None, rpc_timeout: float = 120.0,
+    ):
         decision = tgupload.decide_protocol(size, album_eligible=False)
         if force_big is None:
             force_big = bool(getattr(stream, "force_big", False))
@@ -848,19 +1005,24 @@ class TelegramWorker:
             if force_big or decision.force_big:
                 handle = await tgupload.upload_big_file_parts(
                     client, self._upload_gate(), reader, size, file_name,
-                    force_big=True, progress=progress,
+                    force_big=True, progress=progress, observer=observer,
+                    revoked=(None if revoke_handle is None else revoke_handle.worker_event),
+                    rpc_timeout=rpc_timeout,
                 )
             else:
                 handle = await tgupload.upload_small_file_parts(
                     client, self._upload_gate(), reader, size, file_name, progress=progress,
+                    observer=observer,
+                    revoked=(None if revoke_handle is None else revoke_handle.worker_event),
+                    rpc_timeout=rpc_timeout,
                 )
         return handle
 
-    def prepare_thumbnail(self, preview):
+    def prepare_thumbnail(self, preview, *, observer=None):
         """Upload a JPEG through this account's chunk limiter before message send."""
-        return self.run(self._prepare_thumbnail(preview), timeout=None)
+        return self.run(self._prepare_thumbnail(preview, observer=observer), timeout=None)
 
-    async def _prepare_thumbnail(self, preview):
+    async def _prepare_thumbnail(self, preview, *, observer=None):
         import io
         from pathlib import Path
 
@@ -870,16 +1032,21 @@ class TelegramWorker:
         async with tgupload._PartReader(io.BytesIO(data)) as reader:
             handle = await tgupload.upload_small_file_parts(
                 client, self._upload_gate(), reader, len(data), "thumbnail.jpg",
+                observer=observer,
             )
         return handle, width, height
 
-    def prepare_album_item(self, source, size, file_name, mime_type, preview=None, *, message_limiter=None):
+    def prepare_album_item(
+        self, source, size, file_name, mime_type, preview=None, *,
+        message_limiter=None, observer=None, thumbnail_observer=None,
+    ):
         """Prepare a document on this account while the caller owns a file lease."""
         return self.run(self._prepare_album_item(
             source, size, file_name, mime_type, preview, message_limiter=message_limiter,
+            observer=observer, thumbnail_observer=thumbnail_observer,
         ), timeout=None)
 
-    async def _prepare_album_file(self, stream, size, file_name):
+    async def _prepare_album_file(self, stream, size, file_name, *, observer=None):
         """Albums use 512 KiB SaveFilePart, including optional thumbnail bytes."""
         import hashlib
         from telethon.tl.functions.upload import SaveFilePartRequest
@@ -894,11 +1061,14 @@ class TelegramWorker:
                 parts=[(offset, min(REQUEST_SIZE, size - offset))
                        for offset in range(0, size, REQUEST_SIZE)],
                 request_factory=lambda file_id, index, _total, data: SaveFilePartRequest(file_id, index, data),
-                workers=4, progress=None, collect_payloads=True,
+                workers=4, progress=None, collect_payloads=True, observer=observer,
             )
         return InputFile(file_id, total, file_name, hashlib.md5(b"".join(payloads)).hexdigest())
 
-    async def _prepare_album_item(self, source, size, file_name, mime_type, preview=None, *, message_limiter=None):
+    async def _prepare_album_item(
+        self, source, size, file_name, mime_type, preview=None, *,
+        message_limiter=None, observer=None, thumbnail_observer=None,
+    ):
         from pathlib import Path
         from config import ext_path
         from telethon.tl.functions.messages import UploadMediaRequest
@@ -908,13 +1078,15 @@ class TelegramWorker:
         )
 
         with open(ext_path(source), "rb") as stream:
-            handle = await self._prepare_album_file(stream, size, file_name)
+            handle = await self._prepare_album_file(stream, size, file_name, observer=observer)
         attributes = [DocumentAttributeFilename(file_name)]
         thumb = None
         if preview is not None:
             thumbnail, width, height = preview
             data = thumbnail if isinstance(thumbnail, bytes) else Path(thumbnail).read_bytes()
-            thumb = await self._prepare_album_file(io.BytesIO(data), len(data), "thumbnail.jpg")
+            thumb = await self._prepare_album_file(
+                io.BytesIO(data), len(data), "thumbnail.jpg", observer=thumbnail_observer
+            )
             attributes.append(DocumentAttributeImageSize(width, height))
         request = UploadMediaRequest(InputPeerSelf(), InputMediaUploadedDocument(
             file=handle, mime_type=mime_type, attributes=attributes, thumb=thumb,
@@ -987,15 +1159,19 @@ class TelegramWorker:
             ))
         return parts
 
-    def prepare_album_fallback(self, stream, size, file_name):
+    def prepare_album_fallback(self, stream, size, file_name, *, observer=None):
         """Reread fallback bytes using exactly one ordinary small-upload worker."""
-        return self.run(self._prepare_album_fallback(stream, size, file_name), timeout=None)
+        return self.run(
+            self._prepare_album_fallback(stream, size, file_name, observer=observer),
+            timeout=None,
+        )
 
-    async def _prepare_album_fallback(self, stream, size, file_name):
+    async def _prepare_album_fallback(self, stream, size, file_name, *, observer=None):
         client = await self._upload_client()
         async with tgupload._PartReader(stream) as reader:
             return await tgupload.upload_small_file_parts(
                 client, self._upload_gate(), reader, size, file_name, workers=1,
+                observer=observer,
             )
 
     def send_uploaded_segment(self, handle, size, file_name, preview=None, *, mime_type=None, message_limiter=None):

@@ -490,10 +490,14 @@ class Rig:
 def rig(tmp_path):
     from cheroot import wsgi
 
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    (session_dir / "1.session").write_bytes(b"sqlite")
     cfg = Config(
         api_id=1,
         api_hash="hash",
-        session="session",
+        primary_user_id=1,
+        session_dir=session_dir,
         base_url="http://backend.invalid",
         game_folder="game",
         dir_cache_seconds=0.0,  # every listing is fresh: the fake backend is the truth

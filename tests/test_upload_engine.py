@@ -5,6 +5,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -66,7 +67,7 @@ class Client:
 
 class Worker(TelegramWorker):
     def __init__(self, user_id):
-        super().__init__(1, "hash", "offline")
+        super().__init__(1, "hash", user_id, Path("unused.session"))
         self._me = SimpleNamespace(id=user_id)
         self.client = Client()
         self.set_upload_limiter(UnpacedLimiter())
@@ -90,13 +91,22 @@ class UnpacedLimiter:
         pass
 
 
+def _complete_scheduler_observer(kwargs, size):
+    observer = kwargs.get("observer")
+    if observer is None:
+        return
+    token = observer.request_started(0, size)
+    observer.request_succeeded(token, size)
+    observer.request_settled(token)
+
+
 @pytest.fixture
 def rig(tmp_path, monkeypatch):
-    workers = {str(i): Worker(i) for i in (1, 2)}
+    workers = {i: Worker(i) for i in (1, 2)}
     pool = TelegramAccountPool(
-        [AccountSpec(i, str(i), str(i)) for i in (1, 2)],
+        [AccountSpec(i, Path(f"/sessions/{i}.session")) for i in (1, 2)],
         api_id=1, api_hash="hash", upload_files=1,
-        worker_factory=lambda _a, _b, session, *_args, **_kwargs: workers[session],
+        worker_factory=lambda _a, _b, user_id, _path, *_args, **_kwargs: workers[user_id],
     )
     for i in (1, 2):
         pool.runtime(i).online = pool.runtime(i).linked = True
@@ -104,8 +114,9 @@ def rig(tmp_path, monkeypatch):
     monkeypatch.setattr(gamestage, "HASH_SAMPLE", 32)
     calls = []
 
-    async def big(client, limiter, reader, size, name, *, force_big, progress=None):
+    async def big(client, limiter, reader, size, name, *, force_big, progress=None, **kwargs):
         calls.append((client, size, name, force_big))
+        _complete_scheduler_observer(kwargs, size)
         return SimpleNamespace(name=name)
 
     monkeypatch.setattr(tgupload, "upload_big_file_parts", big)
@@ -123,9 +134,9 @@ def rig(tmp_path, monkeypatch):
 
 
 def test_small_upload_uses_four_workers_and_does_not_register(rig):
-    rig.workers["1"].client.target = 4
+    rig.workers[1].client.target = 4
     result = rig.engine().transfer(rig.request(10 * tgupload.SMALL_PART_SIZE))
-    client = rig.workers["1"].client
+    client = rig.workers[1].client
     assert client.peak == 4
     assert len(client.requests) == 10
     assert {type(r).__name__ for r in client.requests} == {"SaveFilePartRequest"}
@@ -169,6 +180,7 @@ def test_segments_overlap_and_results_return_in_plan_order(rig, monkeypatch):
             assert first_started.wait(2)
             second_finished.set()
         finished.append(size)
+        _complete_scheduler_observer(kwargs, size)
         return object()
 
     monkeypatch.setattr(tgupload, "upload_big_file_parts", big)
@@ -181,8 +193,8 @@ def test_only_segment_zero_has_thumbnail_and_upload_uses_chunk_limiter(rig, monk
     monkeypatch.setattr("tgio.capture_thumbnail", lambda *_: ThumbnailResult("ready", b"jpeg", 640, 360))
     result = rig.engine().transfer(rig.request(500 * MiB + 1, "video/mp4"))
     assert [p.has_thumbnail for p in result.parts] == [True, False]
-    first = rig.workers["1"].client
-    second = rig.workers["2"].client
+    first = rig.workers[1].client
+    second = rig.workers[2].client
     assert len(first.requests) == 1  # thumbnail uses explicit small-part upload
     assert first.requests[0].bytes == b"jpeg"
     assert first.messages[0][2]["thumb"] is not None
@@ -304,6 +316,7 @@ def test_upload_failure_releases_slot_and_a_retry_can_upload(rig, monkeypatch):
         attempts.append(1)
         if len(attempts) == 1:
             raise RuntimeError("upload failed")
+        _complete_scheduler_observer(kwargs, args[3])
         return object()
 
     monkeypatch.setattr(tgupload, "upload_big_file_parts", big)
@@ -331,6 +344,7 @@ def test_concurrent_writes_to_one_name_share_a_single_upload(rig, monkeypatch):
 
     async def big(*args, **kwargs):
         uploaded.append(1)
+        _complete_scheduler_observer(kwargs, args[3])
         return object()
 
     rig.api.check_hash = check_hash
@@ -360,6 +374,7 @@ def test_identical_bytes_under_two_names_are_uploaded_twice(rig, monkeypatch):
 
     async def big(*args, **kwargs):
         uploaded.append(1)
+        _complete_scheduler_observer(kwargs, args[3])
         return object()
 
     monkeypatch.setattr(tgupload, "upload_big_file_parts", big)
@@ -407,7 +422,7 @@ def test_telegram_reported_short_size_is_rejected_without_registering(rig):
     async def send(*args, **kwargs):
         return SimpleNamespace(id=10, document=SimpleNamespace(id=20, access_hash=30, size=1))
 
-    rig.workers["1"].client.send_file = send
+    rig.workers[1].client.send_file = send
     with pytest.raises(upload_engine.CoverageError):
         rig.engine().transfer(rig.request(2))
     assert rig.api.payloads == []
@@ -459,7 +474,13 @@ def test_upload_client_short_flood_reaches_message_bucket_before_sender_retry(mo
     ))
     monkeypatch.setattr("telethon.client.users.asyncio.sleep", unexpected_automatic_sleep)
 
-    worker = TelegramWorker(1, "hash", "")
+    from telethon.sessions import MemorySession
+
+    worker = TelegramWorker(1, "hash", 1, Path("unused.session"))
+    # Auxiliary upload clients now clone the validated control session.  This
+    # transport-level test does not exercise SQLite startup, so provide the
+    # minimal connected control-session state required by that lifecycle.
+    worker._client = SimpleNamespace(session=MemorySession())
     handle = InputFile(99, 1, "file.bin", "checksum")
 
     async def scenario():
@@ -471,5 +492,6 @@ def test_upload_client_short_flood_reaches_message_bucket_before_sender_retry(mo
     result = asyncio.run(scenario())
     assert result["message_id"] == 10
     assert events == ["acquire", "send", ("flood", 2), "acquire", "send"]
-    assert [type(request).__name__ for request in requests] == ["SendMediaRequest", "SendMediaRequest"]
-    assert all(request.media.file is handle for request in requests)
+    inner_requests = [getattr(request, "query", request) for request in requests]
+    assert [type(request).__name__ for request in inner_requests] == ["SendMediaRequest", "SendMediaRequest"]
+    assert all(request.media.file is handle for request in inner_requests)

@@ -311,7 +311,13 @@ class UploadStager:
                 }
                 for p in self._pending.values()
             ]
-        return {"debounce_minutes": self.cfg.debounce_minutes, "pending": pending}
+        scheduler_status = getattr(self.engine, "scheduler_status", None)
+        schedulers = scheduler_status() if callable(scheduler_status) else []
+        return {
+            "debounce_minutes": self.cfg.debounce_minutes,
+            "pending": pending,
+            "schedulers": schedulers,
+        }
 
     def _loop(self) -> None:
         debounce = self.cfg.debounce_minutes * 60

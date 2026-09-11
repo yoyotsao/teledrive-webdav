@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import inspect
 import logging
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -12,52 +12,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator, Optional, Sequence
 
-from config import ConfigError
-from tgio import TelegramWorker
+from config import ConfigError, HERE
+from telegram_sessions import discover_account_specs
+from tgio import SessionClientError, SessionIdentityError, TelegramWorker
 from transfer_models import AccountSpec
+from upload_activity import AccountActivityRegistry, ActivityChange, UploadSpeedTracker
 
 log = logging.getLogger("tgaccounts")
 
 
 class AccountUnavailableError(RuntimeError):
     """A requested account is not configured, online, or upload eligible."""
-
-
-def load_account_specs(path: Path) -> list[AccountSpec]:
-    """Read and validate the ordered account file without exposing secrets."""
-    path = Path(path)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8-sig"))
-    except OSError as exc:
-        raise ConfigError(f"cannot read accounts file {path}: {exc}") from None
-    except (UnicodeError, json.JSONDecodeError) as exc:
-        raise ConfigError(f"invalid accounts file {path}: {exc}") from None
-
-    rows = payload.get("accounts") if isinstance(payload, dict) else None
-    if not isinstance(rows, list) or not rows:
-        raise ConfigError(f"accounts file {path} must contain a non-empty 'accounts' array")
-
-    specs: list[AccountSpec] = []
-    seen: set[int] = set()
-    for index, row in enumerate(rows):
-        if not isinstance(row, dict):
-            raise ConfigError(f"account {index + 1} in {path} must be an object")
-        user_id = row.get("telegram_user_id")
-        label = row.get("label")
-        session = row.get("session")
-        if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
-            raise ConfigError(
-                f"account {index + 1} in {path} has invalid telegram_user_id"
-            )
-        if user_id in seen:
-            raise ConfigError(f"duplicate telegram_user_id {user_id} in accounts file {path}")
-        if not isinstance(label, str) or not label.strip():
-            raise ConfigError(f"account {user_id} in {path} has an empty label")
-        if not isinstance(session, str) or not session:
-            raise ConfigError(f"account {user_id} ({label.strip()}) in {path} has an empty session")
-        seen.add(user_id)
-        specs.append(AccountSpec(user_id, label.strip(), session))
-    return specs
 
 
 @dataclass
@@ -68,8 +33,6 @@ class AccountRuntime:
     online: bool = False
     linked: bool = False
     error: Optional[str] = None
-    # Task 5 supplies both concrete implementations. Keeping these injectable
-    # makes ownership explicit without creating a second temporary controller.
     chunk_limiter: Optional[object] = None
     message_limiter: Optional[object] = None
     _started: bool = field(default=False, init=False, repr=False)
@@ -79,9 +42,29 @@ class AccountRuntime:
         actual = self.worker.user_id
         return int(actual) if actual is not None else self.spec.telegram_user_id
 
-    @property
-    def label(self) -> str:
-        return self.spec.label
+
+class UploadLease:
+    """Own exactly one account file slot and its byte-upload activity job."""
+
+    def __init__(self, pool: "TelegramAccountPool", runtime: AccountRuntime, work_id: str):
+        self.pool = pool
+        self.runtime = runtime
+        self.work_id = work_id
+        self._closed = False
+
+    def __enter__(self):
+        return self.runtime
+
+    def close(self) -> ActivityChange:
+        with self.pool._lock:
+            if self._closed:
+                return ActivityChange(self.runtime.telegram_user_id, False, False, False)
+            self._closed = True
+            return self.pool._release_upload_locked(self.runtime, self.work_id)
+
+    def __exit__(self, *_exc):
+        self.close()
+
 
 
 class TelegramAccountPool:
@@ -99,10 +82,12 @@ class TelegramAccountPool:
         worker_factory: Callable[..., TelegramWorker] = TelegramWorker,
         chunk_limiter_factory: Optional[Callable[..., object]] = None,
         message_limiter_factory: Optional[Callable[[], object]] = None,
+        speed_tracker: Optional[UploadSpeedTracker] = None,
+        activity_registry: Optional[AccountActivityRegistry] = None,
     ) -> None:
         if not specs:
             raise ConfigError("at least one Telegram account is required")
-        ids = [spec.telegram_user_id for spec in specs if spec.telegram_user_id != 0]
+        ids = [spec.telegram_user_id for spec in specs]
         duplicate = next((user_id for user_id in ids if ids.count(user_id) > 1), None)
         if duplicate is not None:
             raise ConfigError(f"duplicate telegram_user_id {duplicate}")
@@ -114,7 +99,8 @@ class TelegramAccountPool:
             worker = worker_factory(
                 api_id,
                 api_hash,
-                spec.session,
+                spec.telegram_user_id,
+                spec.session_path,
                 download_connections,
                 upload_parts=upload_parts,
             )
@@ -131,17 +117,21 @@ class TelegramAccountPool:
                 )
             )
         self._by_id = {
-            runtime.spec.telegram_user_id: runtime
-            for runtime in self._runtimes
-            if runtime.spec.telegram_user_id != 0
+            runtime.spec.telegram_user_id: runtime for runtime in self._runtimes
         }
         self._rr = 0
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self.speed_tracker = speed_tracker or UploadSpeedTracker()
+        self.activity = activity_registry or AccountActivityRegistry(
+            speed_tracker=self.speed_tracker
+        )
+        for runtime in self._runtimes:
+            self.activity.add_account(runtime.spec.telegram_user_id)
+        self._work_sequence = 0
         self._started = False
 
     @staticmethod
     def _make_runtime_value(factory, spec: AccountSpec):
-        """Support legacy zero-argument factories and spec-aware production ones."""
         if factory is None:
             return None
         try:
@@ -149,6 +139,12 @@ class TelegramAccountPool:
         except (TypeError, ValueError):
             return factory()
         return factory(spec)
+
+    @staticmethod
+    def _application_root() -> Path:
+        if getattr(sys, "frozen", False):
+            return Path(sys.executable).resolve().parent
+        return HERE.resolve()
 
     @classmethod
     def from_config(
@@ -159,10 +155,8 @@ class TelegramAccountPool:
         chunk_limiter_factory: Optional[Callable[..., object]] = None,
         message_limiter_factory: Optional[Callable[[], object]] = None,
     ) -> "TelegramAccountPool":
-        specs = (
-            load_account_specs(cfg.accounts_file)
-            if cfg.accounts_file is not None
-            else [AccountSpec(0, "primary", cfg.session)]
+        specs = discover_account_specs(
+            cfg.session_dir, cfg.primary_user_id, cls._application_root()
         )
         if chunk_limiter_factory is None:
             from upload_limiter import AdaptiveUploadLimiter
@@ -203,7 +197,9 @@ class TelegramAccountPool:
             return self.primary
         runtime = self._by_id.get(int(telegram_user_id))
         if runtime is None:
-            raise AccountUnavailableError(f"Telegram account {telegram_user_id} is not configured")
+            raise AccountUnavailableError(
+                f"Telegram account {telegram_user_id} is not configured"
+            )
         return runtime
 
     def start(self, api) -> None:
@@ -224,7 +220,9 @@ class TelegramAccountPool:
         except Exception as exc:
             self.stop()
             detail = self._safe_detail(primary, exc)
-            raise AccountUnavailableError(f"primary account authentication failed: {detail}") from None
+            raise AccountUnavailableError(
+                f"primary account authentication failed: {detail}"
+            ) from None
 
         for index, runtime in enumerate(self._runtimes):
             runtime.linked = runtime.online and (
@@ -238,15 +236,20 @@ class TelegramAccountPool:
             runtime._started = True
             actual = runtime.worker.user_id
             if actual is None:
-                raise RuntimeError("connected session did not return a Telegram user ID")
+                raise SessionClientError(
+                    f"Telegram session for account {runtime.spec.telegram_user_id} returned no user ID"
+                )
             actual = int(actual)
             expected = runtime.spec.telegram_user_id
-            if expected != 0 and actual != expected:
-                raise RuntimeError(f"session user ID mismatch: expected {expected}, got {actual}")
+            if actual != expected:
+                raise SessionIdentityError(
+                    f"Telegram session user ID mismatch: expected {expected}, got {actual}"
+                )
             other = self._by_id.get(actual)
             if other is not None and other is not runtime:
-                raise RuntimeError(f"session user ID {actual} conflicts with another account")
-            self._by_id[actual] = runtime
+                raise SessionIdentityError(
+                    f"Telegram session user ID {actual} conflicts with another account"
+                )
             runtime.online = True
             runtime.error = None
         except Exception as exc:
@@ -265,8 +268,11 @@ class TelegramAccountPool:
             if runtime._started:
                 try:
                     runtime.worker.stop()
-                except Exception as exc:  # best effort: every other account still stops
-                    log.warning("Telegram account shutdown failed: %s", self._safe_detail(runtime, exc))
+                except Exception as exc:
+                    log.warning(
+                        "Telegram account shutdown failed: %s",
+                        self._safe_detail(runtime, exc),
+                    )
                 runtime._started = False
             runtime.online = False
             runtime.linked = False
@@ -278,51 +284,145 @@ class TelegramAccountPool:
             raise AccountUnavailableError(self._unavailable_message(runtime))
         return runtime
 
-    @contextmanager
-    def acquire_upload(self, timeout: Optional[float] = None) -> Iterator[AccountRuntime]:
-        runtime = self._choose_free_runtime(timeout)
-        try:
-            yield runtime
-        finally:
-            runtime.file_slots.release()
+    def _next_work_id_locked(self) -> str:
+        self._work_sequence += 1
+        return f"upload:{self._work_sequence}"
 
-    def _choose_free_runtime(self, timeout: Optional[float]) -> AccountRuntime:
+    def _release_upload_locked(self, runtime: AccountRuntime, work_id: str) -> ActivityChange:
+        change = self.activity.end_job(runtime.telegram_user_id, work_id)
+        runtime.file_slots.release()
+        return change
+
+    def _try_acquire_exact_locked(self, runtime: AccountRuntime, work_id: str) -> Optional[UploadLease]:
+        if not runtime.online or not runtime.linked:
+            return None
+        activity = self.activity.snapshot(runtime.telegram_user_id)
+        if activity.reserved_task_id is not None:
+            return None
+        if not runtime.file_slots.acquire(blocking=False):
+            return None
+        change = self.activity.begin_job(runtime.telegram_user_id, work_id)
+        if not change.changed:
+            runtime.file_slots.release()
+            return None
+        return UploadLease(self, runtime, work_id)
+
+    def acquire_exact_upload_lease(self, account_id: int, work_id: str) -> Optional[UploadLease]:
+        with self._lock:
+            try:
+                runtime = self.runtime(account_id)
+            except AccountUnavailableError:
+                return None
+            return self._try_acquire_exact_locked(runtime, work_id)
+
+    def acquire_upload_lease(
+        self, work_id: Optional[str] = None, timeout: Optional[float] = None
+    ) -> UploadLease:
         if timeout is not None and timeout < 0:
             raise ValueError("timeout must be non-negative or None")
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             with self._lock:
+                if work_id is None:
+                    work_id = self._next_work_id_locked()
                 count = len(self._runtimes)
                 order = [(self._rr + offset) % count for offset in range(count)]
                 for index in order:
                     runtime = self._runtimes[index]
-                    if runtime.online and runtime.linked and runtime.file_slots.acquire(blocking=False):
+                    lease = self._try_acquire_exact_locked(runtime, work_id)
+                    if lease is not None:
                         self._rr = (index + 1) % count
-                        return runtime
+                        return lease
                 any_eligible = any(r.online and r.linked for r in self._runtimes)
             if not any_eligible:
-                raise AccountUnavailableError("no online linked Telegram account is available for upload")
+                raise AccountUnavailableError(
+                    "no online linked Telegram account is available for upload"
+                )
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise AccountUnavailableError("timed out waiting for a Telegram upload file slot")
+                    raise AccountUnavailableError(
+                        "timed out waiting for a Telegram upload file slot"
+                    )
                 time.sleep(min(0.01, remaining))
             else:
                 time.sleep(0.01)
 
+    @contextmanager
+    def acquire_upload(
+        self, timeout: Optional[float] = None, *, work_id: Optional[str] = None
+    ) -> Iterator[AccountRuntime]:
+        lease = self.acquire_upload_lease(work_id=work_id, timeout=timeout)
+        try:
+            yield lease.runtime
+        finally:
+            lease.close()
+
+    def try_reserve_idle(self, account_id: int, task_id: str) -> bool:
+        with self._lock:
+            try:
+                runtime = self.runtime(account_id)
+            except AccountUnavailableError:
+                return False
+            if not runtime.online or not runtime.linked:
+                return False
+            snapshot = self.activity.snapshot(account_id)
+            if not snapshot.idle or snapshot.idle_snapshot is None:
+                return False
+            return self.activity.reserve_if_idle(account_id, task_id)
+
+    def activate_reservation(self, account_id: int, task_id: str) -> UploadLease:
+        with self._lock:
+            runtime = self.runtime(account_id)
+            if not runtime.online or not runtime.linked:
+                raise AccountUnavailableError(
+                    f"Telegram account {account_id} is not upload eligible"
+                )
+            snapshot = self.activity.snapshot(account_id)
+            if snapshot.reserved_task_id != task_id:
+                raise AccountUnavailableError(
+                    f"Telegram account {account_id} is not reserved for this upload"
+                )
+            if not runtime.file_slots.acquire(blocking=False):
+                raise AccountUnavailableError(
+                    f"Telegram account {account_id} has no upload file slot"
+                )
+            change = self.activity.activate_reservation(account_id, task_id, task_id)
+            if not change.changed:
+                runtime.file_slots.release()
+                raise AccountUnavailableError(
+                    f"Telegram account {account_id} reservation changed"
+                )
+            return UploadLease(self, runtime, task_id)
+
+    def release_reservation(self, account_id: int, task_id: str) -> ActivityChange:
+        with self._lock:
+            return self.activity.release_reservation(account_id, task_id)
+
     def status(self) -> dict:
+        accounts = []
+        for runtime in self._runtimes:
+            account_id = runtime.spec.telegram_user_id
+            activity = self.activity.snapshot(account_id)
+            idle_speed = (
+                None if activity.idle_snapshot is None
+                else activity.idle_snapshot.bytes_per_second
+            )
+            accounts.append({
+                "telegram_user_id": account_id,
+                "primary": runtime is self.primary,
+                "online": runtime.online,
+                "linked": runtime.linked,
+                "error": runtime.error,
+                "limiter": self._limiter_status(runtime.chunk_limiter),
+                "idle": activity.idle,
+                "active_byte_upload_jobs": activity.active_byte_upload_jobs,
+                "in_flight_upload_rpcs": activity.in_flight_upload_rpcs,
+                "reserved_task_id": activity.reserved_task_id,
+                "idle_speed_bytes_per_second": idle_speed,
+            })
         return {
-            "accounts": [
-                {
-                    "telegram_user_id": runtime.telegram_user_id,
-                    "label": runtime.label,
-                    "online": runtime.online,
-                    "linked": runtime.linked,
-                    "error": runtime.error,
-                    "limiter": self._limiter_status(runtime.chunk_limiter),
-                }
-                for runtime in self._runtimes
-            ],
+            "accounts": accounts,
             "eligible_upload_ids": list(self.eligible_upload_ids),
         }
 
@@ -333,12 +433,12 @@ class TelegramAccountPool:
 
     @staticmethod
     def _safe_detail(runtime: AccountRuntime, exc: BaseException) -> str:
-        detail = str(exc).replace(runtime.spec.session, "[redacted]")
-        prefix = f"account {runtime.spec.telegram_user_id} ({runtime.spec.label})"
-        return f"{prefix}: {detail or type(exc).__name__}"
+        if isinstance(exc, (SessionClientError, SessionIdentityError)):
+            detail = str(exc)
+        else:
+            detail = type(exc).__name__
+        return f"account {runtime.spec.telegram_user_id}: {detail}"
 
     @staticmethod
     def _unavailable_message(runtime: AccountRuntime) -> str:
-        return runtime.error or (
-            f"account {runtime.spec.telegram_user_id} ({runtime.spec.label}) is offline"
-        )
+        return runtime.error or f"account {runtime.spec.telegram_user_id} is offline"
