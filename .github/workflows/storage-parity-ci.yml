@@ -17,5 +17,15 @@ jobs:
           python-version: '3.11'
       - name: Install dependencies
         run: python -m pip install -r requirements.txt pytest
+      - name: Task 8 deterministic writes
+        run: python -m pytest tests/test_storage_parity_writes.py tests/test_upload_parts.py tests/test_upload_album.py tests/test_channel_routing.py -q
+      - name: Task 9 durable staging
+        run: python -m pytest tests/test_upload_stage.py tests/test_missing_stage.py tests/test_stage_generation.py tests/test_cross_instance_groups.py -q
+      - name: Task 10 durable albums
+        run: python -m pytest tests/test_album_state.py tests/test_upload_album.py tests/test_upload_register.py -q
+      - name: Task 11 recovery
+        run: python -m pytest tests/test_upload_journal.py tests/test_recovery_state.py tests/test_upload_cancel.py -q
+      - name: Task 12 target-aware dedup
+        run: python -m pytest tests/test_upload_dedup_identity.py tests/test_upload_dedup_lookup.py tests/test_copy_semantics.py -q
       - name: Run offline suite
         run: python -m pytest tests -q
