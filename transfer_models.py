@@ -126,6 +126,61 @@ class DurableSendResult:
 
 
 @dataclass(frozen=True)
+class DurableTelegramWrite:
+    """Exact Telegram result persisted into the backend operation journal.
+
+    ``random_id`` and ``target_peer_key`` are frozen send identity.  The two
+    derived dictionaries intentionally use the backend wire names so recovery
+    can persist a response/update mapping without translating it a second time.
+    """
+
+    uploader_id: int
+    random_id: int
+    target_peer_key: str
+    destination_message_id: int
+    media_kind: str
+    media_id: str
+    media_size: int
+    access_hash: Optional[str] = None
+    photo_variant: Optional[str] = None
+
+    @property
+    def mapping(self) -> dict:
+        return {
+            "uploader_id": int(self.uploader_id),
+            "random_id": int(self.random_id),
+            "target_peer_key": str(self.target_peer_key),
+            "destination_message_id": int(self.destination_message_id),
+        }
+
+    @property
+    def media_identity(self) -> dict:
+        out = {
+            "destination_media_kind": str(self.media_kind),
+            "destination_media_id": str(self.media_id),
+            "destination_size": int(self.media_size),
+        }
+        if self.access_hash is not None:
+            out["destination_access_hash"] = str(self.access_hash)
+        if self.photo_variant is not None:
+            out["destination_photo_variant"] = str(self.photo_variant)
+        return out
+
+    def location(self, *, location_version: int = 1) -> FileLocation:
+        chat_id = None if str(self.target_peer_key).startswith("me:") else str(self.target_peer_key)
+        return FileLocation(
+            telegram_chat_id=chat_id,
+            telegram_user_id=int(self.uploader_id),
+            telegram_message_id=int(self.destination_message_id),
+            media_kind=str(self.media_kind),
+            media_id=str(self.media_id),
+            media_size=int(self.media_size),
+            photo_variant=self.photo_variant,
+            location_version=int(location_version),
+        )
+
+
+@dataclass(frozen=True)
 class DurableOperationCursor:
     identity: DurableOperationIdentity
     target: FrozenStorageTarget
