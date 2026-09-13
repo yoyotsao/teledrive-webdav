@@ -8,7 +8,12 @@ for _name, _value in vars(_legacy).items():
     if _name not in {"__name__", "__loader__", "__package__", "__spec__"}:
         globals()[_name] = _value
 
-from transfer_models import FileLocation, LegacySavedMessagesLocation, physical_location_key  # noqa: E402
+from transfer_models import (  # noqa: E402
+    FileLocation,
+    LegacySavedMessagesLocation,
+    ResolvedRemotePart,
+    physical_location_key,
+)
 
 
 class ChannelRoutingError(RuntimeError):
@@ -103,8 +108,6 @@ async def _resolve_channel_access_async(self, channel_id: str):
             or getattr(permissions, "is_admin", False)
         )
     if not can_write and not bool(getattr(entity, "broadcast", False)):
-        # Ordinary groups/megagroups are writable by members unless Telegram
-        # rejects the send; broadcast storage channels require admin rights.
         can_write = True
     return ChannelAccess(
         channel_id=raw,
@@ -157,12 +160,7 @@ def _get_location_media(self, location: FileLocation, peer, refresh: bool = Fals
 
 def _read_location(self, location, peer, offset: int, length: int) -> bytes:
     if isinstance(location, LegacySavedMessagesLocation):
-        return self.read(
-            location.telegram_message_id,
-            location.file_id,
-            offset,
-            length,
-        )
+        return self.read(location.telegram_message_id, location.file_id, offset, length)
     if length <= 0:
         return b""
     media = self.get_location_media(location, peer)
@@ -175,8 +173,54 @@ def _read_location(self, location, peer, offset: int, length: int) -> bytes:
         return self.run(self._read(media, offset, length))
 
 
+def _thumbnail_location(self, location, peer):
+    if isinstance(location, LegacySavedMessagesLocation):
+        part = RemotePart(
+            location.telegram_message_id,
+            location.media_size,
+            location.telegram_user_id,
+            location.file_id,
+        )
+        return self.thumbnails([part]).get((part.message_id, str(part.file_id)))
+    media = self.get_location_media(location, peer)
+    return self.run(self._thumbnail_bytes(media), timeout=60)
+
+
+def _media_info_location(self, location, peer):
+    if isinstance(location, LegacySavedMessagesLocation):
+        media = self.get_document(location.telegram_message_id, location.file_id)
+    else:
+        media = self.get_location_media(location, peer)
+    return _legacy._media_attributes(media)
+
+
+def read_part(pool, part, offset: int, length: int) -> bytes:
+    """Read a legacy or canonical part, failing over only account-local errors."""
+    if not isinstance(part, ResolvedRemotePart):
+        return _legacy.read_part(pool, part, offset, length)
+    last_error = None
+    for runtime, peer in pool.read_routes(part.location):
+        try:
+            return runtime.worker.read_location(part.location, peer, offset, length)
+        except RemoteIdentityError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            continue
+    raise ChannelRoutingError(
+        f"no usable Telegram route for {physical_location_key(part.location)!r}: {last_error}"
+    )
+
+
 TelegramWorker.start = _parity_start
 TelegramWorker.stop = _parity_stop
 TelegramWorker.resolve_channel_access = _resolve_channel_access
 TelegramWorker.get_location_media = _get_location_media
 TelegramWorker.read_location = _read_location
+TelegramWorker.thumbnail_location = _thumbnail_location
+TelegramWorker.media_info_location = _media_info_location
+
+# SeekableRemoteFile is defined in the legacy module and resolves read_part in
+# that module's globals, so update that single seam rather than copying its
+# streaming/block-cache implementation.
+_legacy.read_part = read_part
