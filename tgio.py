@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import mimetypes
 import _tgio_legacy as _legacy
 
 for _name, _value in vars(_legacy).items():
@@ -18,6 +19,23 @@ from transfer_models import (  # noqa: E402
 
 class ChannelRoutingError(RuntimeError):
     pass
+
+
+def make_preview(path, mime_type: str = "", ffmpeg=None):
+    """Keep the historical preview API monkeypatchable from ``tgio``.
+
+    The legacy implementation lives in another module now, so referring to its
+    module-global ``capture_thumbnail`` would bypass existing tests and callers
+    that intentionally replace ``tgio.capture_thumbnail``. Resolve the seam in
+    this compatibility module instead.
+    """
+    mime = mime_type or mimetypes.guess_type(str(path))[0] or ""
+    result = capture_thumbnail(path, mime, ffmpeg)
+    if result.kind != "ready":
+        if result.error:
+            log.info("no preview for %s: %s", getattr(path, "name", path), result.error)
+        return None
+    return result.jpeg, result.width, result.height
 
 
 def _media_kind(media) -> str:
@@ -220,7 +238,7 @@ TelegramWorker.read_location = _read_location
 TelegramWorker.thumbnail_location = _thumbnail_location
 TelegramWorker.media_info_location = _media_info_location
 
-# SeekableRemoteFile is defined in the legacy module and resolves read_part in
-# that module's globals, so update that single seam rather than copying its
-# streaming/block-cache implementation.
+# Classes/functions copied from the original module resolve names in the legacy
+# module globals. Keep the deliberately replaceable seams synchronized.
 _legacy.read_part = read_part
+_legacy.make_preview = make_preview
