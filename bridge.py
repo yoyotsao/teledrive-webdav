@@ -12,7 +12,8 @@ for _name, _value in vars(_legacy).items():
     if _name not in {"__name__", "__loader__", "__package__", "__spec__"}:
         globals()[_name] = _value
 
-from tgio import RemoteIdentityError, read_part  # noqa: E402
+from tgio import RemoteIdentityError  # noqa: E402
+from strict_routing import is_route_access_error, read_part  # noqa: E402
 from transfer_models import physical_location_key  # noqa: E402
 
 
@@ -70,6 +71,8 @@ def _read_via_routes(self, part, operation):
         except RemoteIdentityError:
             raise
         except Exception as exc:
+            if not is_route_access_error(exc):
+                raise
             last_error = exc
     if last_error is not None:
         raise last_error
@@ -104,7 +107,6 @@ def _thumbs_for(self, entries):
                 except OSError as exc:
                     log.warning("could not cache thumbnail %s: %s", path.name, exc)
         if data:
-            # Preserve the public/result shape expected by the shell RPC.
             found[(entry.telegram_user_id, entry.file_id)] = data
     return found
 
@@ -208,7 +210,6 @@ Resolver.props_for = _props_for
 Resolver.heads_for = _heads_for
 Resolver.needs_warming = _needs_warming
 
-# Expose for focused cache tests without teaching callers about hash encoding.
 physical_set_cache_key = _physical_set_key
 
 
