@@ -7,6 +7,7 @@ introduced behind explicit fresh-resolution APIs.
 
 from __future__ import annotations
 
+import uuid
 import _tdapi_legacy as _legacy
 
 # Re-export the complete legacy surface, including private helpers used by the
@@ -159,5 +160,80 @@ def _current_parts(self, entry):
     return out
 
 
+def _alias_payload(entry, row, *, filename, parent_id, part_index=None, total_parts=None, split_group_id=None):
+    """Build a metadata-only alias from a freshly fetched physical row."""
+    location = parse_file_location(row)
+    payload = {
+        "filename": filename,
+        "filesize": int(getattr(location, "media_size", row.get("filesize") or 0)),
+        "mime_type": entry.mime,
+        "message_id": int(location.telegram_message_id),
+        "telegram_message_id": int(location.telegram_message_id),
+        "file_id": uuid.uuid4().hex,
+        "access_hash": row.get("access_hash"),
+        "parent_id": parent_id,
+        "file_hash": entry.file_hash,
+        "has_thumbnail": bool(row.get("has_thumbnail", entry.has_thumbnail)),
+        "is_split_file": total_parts is not None,
+        "original_name": filename,
+        "part_index": part_index,
+        "total_parts": total_parts,
+        "split_group_id": split_group_id,
+    }
+    if isinstance(location, LegacySavedMessagesLocation):
+        payload["telegram_user_id"] = location.telegram_user_id
+    else:
+        payload.update(
+            telegram_user_id=location.telegram_user_id,
+            telegram_chat_id=location.telegram_chat_id,
+            telegram_media_kind=location.media_kind,
+            telegram_media_id=location.media_id,
+            telegram_media_size=location.media_size,
+            telegram_photo_variant=location.photo_variant,
+            # location_version deliberately omitted: the backend allocates the
+            # new logical row's own version for the copied canonical location.
+        )
+    return payload
+
+
+def _duplicate(self, entry, *, filename: str, parent_id):
+    """COPY from current canonical rows, never from listing/storage-target state."""
+    if not (entry.is_split and entry.split_group_id):
+        row = self.current_file_row(entry.file_id)
+        self._call(
+            "POST",
+            "/files/register",
+            payload=_alias_payload(entry, row, filename=filename, parent_id=parent_id),
+        )
+        self.invalidate(parent_id)
+        return
+
+    body = self._call("GET", f"/files/by-split-group/{entry.split_group_id}") or {}
+    rows = sorted(body.get("files") or [], key=lambda item: int(item.get("part_index") or 0))
+    # Parsing every row before the first POST makes incomplete canonical channel
+    # metadata fail closed without creating a partial alias group.
+    for row in rows:
+        parse_file_location(row)
+    new_group = uuid.uuid4().hex
+    total = len(rows)
+    for ordinal, row in enumerate(rows):
+        index = int(row.get("part_index") if row.get("part_index") is not None else ordinal)
+        self._call(
+            "POST",
+            "/files/register",
+            payload=_alias_payload(
+                entry,
+                row,
+                filename=filename,
+                parent_id=parent_id,
+                part_index=index,
+                total_parts=total,
+                split_group_id=new_group,
+            ),
+        )
+    self.invalidate(parent_id)
+
+
 TeleDriveClient.current_file_row = _current_file_row
 TeleDriveClient.current_parts = _current_parts
+TeleDriveClient.duplicate = _duplicate
