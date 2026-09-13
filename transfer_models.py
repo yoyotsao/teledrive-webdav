@@ -59,6 +59,16 @@ class ResolvedRemotePart:
     def size(self) -> int:
         return self.location.media_size
 
+    @property
+    def message_id(self) -> int:
+        """Compatibility view used by the unchanged seek/range table."""
+        return self.location.telegram_message_id
+
+    @property
+    def telegram_user_id(self) -> int:
+        """Legacy display identity only; channel routing never trusts this."""
+        return int(self.location.telegram_user_id or 0)
+
 
 def physical_location_key(location: PhysicalLocation) -> tuple[object, ...]:
     """Return a stable cache identity for bytes at *location*."""
@@ -156,6 +166,7 @@ class RemotePart:
     size: int
     telegram_user_id: int
     file_id: str
+
 
 @dataclass(frozen=True)
 class UploadedPart:
