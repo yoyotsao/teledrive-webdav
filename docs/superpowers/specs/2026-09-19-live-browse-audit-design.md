@@ -1,6 +1,6 @@
 # 真實 `H:` 巡檢與上傳往返探測 — 設計
 
-**日期：** 2026-09-19（rev 3.5）
+**日期：** 2026-09-19（rev 3.6）
 
 **實作 base：** `feat/current-backend-storage-parity` @ `39ad472`（vs `master` ahead 40 / behind 0）。
 Audit 實作走 `feat/live-browse-audit`，**不與 parity 的修復 commit 混在同一條開發線**。
@@ -72,6 +72,16 @@ rev 2 寫了 `_tdapi_legacy.py:819` 這種定位，review 指出 master 上沒�
 | 26 | `resolve()` 收段落串列、回 `Loc` 不是 `Entry`；`_cache_key()` 與 `_thumb_path()` 各打一次 backend | §5 改在薄層一次算完，legacy 只做 HTTP |
 | 27 | `key in Resolver._zips` 不等於 warm —— 列 `/game` 就會建 view | §5 改判 `view._root is not None` |
 | 28 | `JsonStore` 是 `_data` + 單一 `_path`，跟 `ShardedJsonStore._memory` 不同 | §5 兩個 store 分開實作，不共用 helper |
+
+### 0.7 rev 3.6 追加
+
+| # | 問題 | 本版 |
+|---|---|---|
+| 37 | §11.1 的證據（「DLL 載入後毫秒數 ≥ 暫停」）**在現有程式碼下必然失敗**：`Log()` 的計時器是 function-local static 且放在 `path.empty()` 提早 return 之後，記錄關閉時根本沒初始化 | §11.1 加註修法：計時基準搬到 namespace scope，在 DLL 載入時初始化 |
+
+**這一項值得單獨記著**，因為它是這系列裡第一個**把正確實作判成失敗**的檢查——
+前面每一個問題都是「錯的東西會通過」，這個是「對的東西會被擋下」。兩種都要防：
+一個讓你信任壞掉的系統，另一個讓你去修一個沒壞的東西。
 
 ### 0.6 rev 3.5 追加
 
@@ -937,10 +947,19 @@ isolate.exe --manifest m.txt --pause-after 1 --pause-seconds 6
 1. `dll.log` 有 `GetThumbnail` 行（重讀生效了）
 2. **`dll.log` 第一行的「DLL 載入後毫秒數」≥ 暫停秒數**
 
-第 2 條是關鍵。`Log()` 每行都帶 `GetTickCount64() - start`，也就是
-**DLL 載入至今多久**。如果 DLL 是在暫停之後才新載入的，那個數字會接近 0，
-這次量測就什麼都沒證明；≥ 6000 才代表它在暫停**之前**就已經載入、
-也就是它真的在同一個 lifetime 裡重讀了 registry。
+第 2 條是關鍵。如果 DLL 是在暫停之後才新載入的，那個數字會接近 0，
+這次量測就什麼都沒證明；超過暫停秒數才代表它在暫停**之前**就已經載入、
+也就是真的在同一個 lifetime 裡重讀了 registry。
+
+**但這條證據目前不成立，要先修 `Log()`。** 它的計時器是
+`static const ULONGLONG start = GetTickCount64();`，而且放在
+`if (path.empty()) return;` **之後**——function-local static 是第一次
+**執行到**才初始化，所以記錄關閉時它根本沒被初始化，第一行真正寫出來時才開始計時，
+於是**即使 DLL 全程載著，第一行也是 `+0ms`**。照現在的程式碼，這條檢查會把
+**正確的** TTL 實作判成失敗。
+
+修法是把計時基準搬到 namespace scope（`static const ULONGLONG gDllLoadedAt = ...`），
+在 DLL 載入時就初始化——那也正是這行字面上宣稱的意思。實作計畫 Task 10 Step 2a。
 
 **這就是 `DisableProcessIsolation=1` 在這裡幫上忙的地方**：handler 載入在
 `isolate.exe` 自己的 process 裡，所以一次執行就是一個 host lifetime——

@@ -1,4 +1,4 @@
-# Audit Diagnostics Implementation Plan (rev 5)
+# Audit Diagnostics Implementation Plan (rev 6)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -1010,11 +1010,15 @@ def test_thumbs_for_hands_its_origin_to_the_worker(monkeypatch, tmp_path):
     seen = {}
 
     class _Worker:
-        def thumbnails(self, parts, *, origin="unknown"):
+        # thumbnail_location, not thumbnails: the thin _thumbs_for goes through
+        # _read_via_routes, whose operation is
+        #   lambda worker, location, peer: worker.thumbnail_location(location, peer)
+        # A fake offering thumbnails() is never called, and `seen` stays empty.
+        def thumbnail_location(self, location, peer, *, origin="unknown"):
             seen["origin"] = origin
-            return {(p.message_id, str(p.file_id)): b"jpegbytes" for p in parts}
+            return b"jpegbytes"
 
-    entry = _eligible_entry()          # has_thumbnail=True, not split
+    entry = _eligible_entry()          # has_thumbnail=True, not a directory
     resolver = _resolver_with_worker(bridge, tmp_path, _Worker(), monkeypatch)
 
     bridge.Resolver.thumbs_for(resolver, [entry], origin="thumb_prefetch")
@@ -1082,7 +1086,12 @@ class _Runtime:
 
 
 class _Pool:
-    """Routes every read to one worker, whichever account is asked for."""
+    """Routes every read to one worker, whichever account is asked for.
+
+    read_routes is the one the thin layer uses: bridge._read_via_routes walks
+    `self.pool.read_routes(part.location)` and calls
+    `operation(runtime.worker, part.location, peer)`.
+    """
 
     def __init__(self, worker):
         self._runtime = _Runtime(worker)
@@ -1107,11 +1116,12 @@ def _resolver_with_worker(bridge, tmp_path, worker, monkeypatch):
     resolver._prop_cache = JsonStore(tmp_path / "media_props.json")
     (tmp_path / "thumbs").mkdir(exist_ok=True)
     monkeypatch.setattr(resolver, "note_demand", lambda *a, **k: None, raising=False)
+    # A ResolvedRemotePart, NOT a RemotePart: the thin _thumbs_for reaches for
+    # part.location (via _read_via_routes and _physical_set_key), and a legacy
+    # RemotePart has no such attribute -- the test would die on AttributeError
+    # before reaching the assertion it exists for.
     monkeypatch.setattr(
-        resolver, "_fresh_parts",
-        lambda entry: (_tgio_legacy.RemotePart(entry.message_id, entry.size,
-                                               entry.telegram_user_id, entry.file_id),),
-        raising=False,
+        resolver, "_fresh_parts", lambda entry: (_canonical_part(),), raising=False,
     )
     return resolver
 
@@ -1121,12 +1131,21 @@ def _pool_routing_to(worker):
 
 
 def _canonical_part():
-    """A ResolvedRemotePart, so tgio.read_part takes the canonical branch
-    instead of falling through to the legacy one."""
+    """A ResolvedRemotePart, so the canonical branch is taken rather than the
+    legacy fallback.
+
+    The dataclass is (file_id, part_index, location) -- `size` and
+    `message_id` are properties derived from the location, not constructor
+    arguments. Passing index=/size= raises TypeError before any assertion runs.
+    """
     from transfer_models import FileLocation, ResolvedRemotePart
 
-    location = FileLocation(None, 42, 8, "document", "9001", 1024, None, 1)
-    return ResolvedRemotePart(location=location, index=0, size=1024)
+    location = FileLocation(
+        telegram_chat_id=None, telegram_user_id=42, telegram_message_id=8,
+        media_kind="document", media_id="9001", media_size=1024,
+        photo_variant=None, location_version=1,
+    )
+    return ResolvedRemotePart(file_id="f1", part_index=0, location=location)
 
 
 > 這四個 fake 若跟真實簽章對不上，修 fake，不要改產品程式碼。上面每個測試都
@@ -2422,7 +2441,11 @@ static void EmitJsonl(const char* op, const std::wstring& path,
 
 ```cpp
 if (pauseAfter > 0 && processed == pauseAfter && pauseSeconds > 0) {
-    fflush(stderr);            // the operator watches stderr to know it began
+    // Announce it and flush: the harness waits for this marker instead of
+    // guessing a sleep, so a slow first cold read cannot make the run change
+    // the registry before the pause has actually started.
+    fprintf(stderr, "{\"op\":\"pause\",\"seconds\":%d}\n", pauseSeconds);
+    fflush(stderr);
     Sleep(pauseSeconds * 1000);
 }
 ```
@@ -2574,6 +2597,38 @@ if __name__ == "__main__":
     sys.exit(main())
 ```
 
+- [ ] **Step 2a: Make "+Nms" mean what it says — since the DLL loaded**
+
+`Log()` currently initialises its clock *after* the early return:
+
+```cpp
+    if (path.empty())
+        return;
+    ...
+    static const ULONGLONG start = GetTickCount64();     // function-local
+```
+
+A function-local static initialises the first time control **reaches** it.
+With logging off for the first file, it is never reached; it initialises on
+the first line actually written — i.e. after the pause. **The first line then
+reads `+0ms` even though the DLL has been resident the whole time**, and
+Step 4's `>= 12000` check would fail a correct TTL implementation.
+
+The line already claims "milliseconds since the DLL loaded", so make that
+true rather than weakening the check. Move it to namespace scope:
+
+```cpp
+// Initialised during DLL load, before any handler call, so "+Nms" is time
+// since load rather than time since the first line that happened to be
+// written. The LogPath lifecycle harness (Task 10 Step 4) uses this to prove
+// a re-read happened inside one host lifetime; a function-local static would
+// start counting at the first written line and make that proof impossible.
+static const ULONGLONG gDllLoadedAt = GetTickCount64();
+```
+
+and in `Log()` use `GetTickCount64() - gDllLoadedAt`, deleting the
+function-local `start`.
+
 - [ ] **Step 2: Replace the one-shot flag with a locked TTL**
 
 ```cpp
@@ -2664,16 +2719,26 @@ Remove-Item C:\Temp\dll.log -ErrorAction SilentlyContinue
 # 兩個沒看過的 H: 圖片，一行一個
 Set-Content -Encoding utf8 m.txt @("H:\<資料夾A>\one.jpg", "H:\<資料夾B>\two.jpg")
 
-# 一次執行：檔案 1 載入 handler（讀到空值）→ 暫停 12 秒 → 檔案 2
-Start-Job { shellthumb\isolate.exe --jsonl --manifest m.txt `
-              --pause-after 1 --pause-seconds 12 thumb . 2>$null } | Out-Null
+Remove-Item C:\Temp\iso.err -ErrorAction SilentlyContinue
 
-Start-Sleep 4      # 確定已經進入暫停
+# 一次執行：檔案 1 載入 handler（讀到空值）→ 暫停 → 檔案 2
+$job = Start-Job { shellthumb\isolate.exe --jsonl --manifest m.txt `
+                     --pause-after 1 --pause-seconds 12 thumb . 2>C:\Temp\iso.err }
+
+# 等「真的進入暫停」的 marker，不要用固定秒數：第一個 H: 檔案冷讀可能要好幾秒，
+# 固定 sleep 會偶發地在暫停開始之前就改登錄值，看起來就像實作壞掉。
+while (-not (Select-String -Path C:\Temp\iso.err -Pattern '"op":"pause"' -Quiet -EA SilentlyContinue)) {
+    Start-Sleep -Milliseconds 200
+}
+
 reg add "HKCU\Software\TeleDriveWebDAV" /v LogPath /t REG_SZ /d C:\Temp\dll.log /f
-Start-Sleep 12     # 等第二個檔跑完
+Wait-Job $job | Out-Null        # 等它自己跑完，不要猜要等幾秒
 
 Get-Content C:\Temp\dll.log
 ```
+
+> 同步點是 `isolate.exe` 進入暫停時往 stderr 印的 `{"op":"pause","seconds":12}`
+> （Task 9）。沒有它就只能猜秒數，而猜錯的方向剛好是「看起來像實作壞掉」。
 
 **判定有兩個條件，缺一不可：**
 
@@ -2696,12 +2761,14 @@ process，所以一次執行就是一個 host lifetime——**結構上保證，
 reg add "HKCU\Software\TeleDriveWebDAV" /v LogPath /t REG_SZ /d C:\Temp\off.log /f
 Remove-Item C:\Temp\off.log -ErrorAction SilentlyContinue
 
-Start-Job { shellthumb\isolate.exe --jsonl --manifest m.txt `
-              --pause-after 1 --pause-seconds 12 thumb . 2>$null } | Out-Null
-Start-Sleep 4
+$job = Start-Job { shellthumb\isolate.exe --jsonl --manifest m.txt `
+                     --pause-after 1 --pause-seconds 12 thumb . 2>C:\Temp\iso2.err }
+while (-not (Select-String -Path C:\Temp\iso2.err -Pattern '"op":"pause"' -Quiet -EA SilentlyContinue)) {
+    Start-Sleep -Milliseconds 200
+}
 $before = (Get-Item C:\Temp\off.log).Length     # 第一個檔已經寫進去了
 reg delete "HKCU\Software\TeleDriveWebDAV" /v LogPath /f
-Start-Sleep 12
+Wait-Job $job | Out-Null
 
 $before -gt 0 -and (Get-Item C:\Temp\off.log).Length -eq $before
 ```
@@ -2714,6 +2781,7 @@ Expected: `True`。**`$before > 0` 那一半不能省**——否則「檔案沒�
 ```bash
 # Source only -- *.dll is gitignored and untracked (see Task 9).
 git add scripts/kill_thumb_hosts.py shellthumb/TeleDriveThumb.cpp
+# (gDllLoadedAt is part of this change -- see Step 2a)
 git commit -m "fix: let the DLL pick up LogPath changes without a new surrogate"
 ```
 
