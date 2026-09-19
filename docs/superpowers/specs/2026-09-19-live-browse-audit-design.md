@@ -1,6 +1,6 @@
 # 真實 `H:` 巡檢與上傳往返探測 — 設計
 
-**日期：** 2026-09-19（rev 3.4）
+**日期：** 2026-09-19（rev 3.5）
 
 **實作 base：** `feat/current-backend-storage-parity` @ `39ad472`（vs `master` ahead 40 / behind 0）。
 Audit 實作走 `feat/live-browse-audit`，**不與 parity 的修復 commit 混在同一條開發線**。
@@ -72,6 +72,19 @@ rev 2 寫了 `_tdapi_legacy.py:819` 這種定位，review 指出 master 上沒�
 | 26 | `resolve()` 收段落串列、回 `Loc` 不是 `Entry`；`_cache_key()` 與 `_thumb_path()` 各打一次 backend | §5 改在薄層一次算完，legacy 只做 HTTP |
 | 27 | `key in Resolver._zips` 不等於 warm —— 列 `/game` 就會建 view | §5 改判 `view._root is not None` |
 | 28 | `JsonStore` 是 `_data` + 單一 `_path`，跟 `ShardedJsonStore._memory` 不同 | §5 兩個 store 分開實作，不共用 helper |
+
+### 0.6 rev 3.5 追加
+
+closure 核對指出 rev 3.4 有兩項只改了 plan、沒改 spec，於是 spec 仍留著會假通過的版本：
+
+| # | 問題 | 本版 |
+|---|---|---|
+| 35 | §11 的 LogPath preflight 還是「設值 → 等 → probe」，而那正是 B8 指出**舊 one-shot 實作也會通過**的版本 | 新增 §11.1，用一次 `isolate.exe` 執行內的暫停，並以 log 行的「DLL 載入後毫秒數」**實證**同一 lifetime |
+| 36 | §8.4 與 §15 仍假設一定有 `dllhost.exe` 可殺，而 plan 已經知道 `DisableProcessIsolation=1`；plan 又寫「被鎖住就重啟 `explorer.exe`」，與 §15 直接牴觸 | 兩節都改成「不假設有 surrogate」；冷載入改用**新起一個呼叫端 process**，Explorer 一律不動 |
+
+**第 36 項是 scope 衝突而不是技術問題**：修法有兩條路（放寬 §15 允許重啟 Explorer，
+或維持 §15 而讓 build 在被鎖住時明確失敗），選了後者——§15 的範圍是既定的，
+一個觀測工具不該為了自己好做而擴大它。
 
 ### 0.5 rev 3.4 追加
 
@@ -683,9 +696,19 @@ rev 2 只有後者，於是若 bug 又變成「列 `/game` 對每個 zip 呼叫 
 **冷 COM surrogate（`--cold-surrogate`，預設關）** — 專打 `Settings` race
 （只在冷載入的頭幾百微秒發作），順帶保證新 surrogate 讀得到新設的 `LogPath`。
 
-**只殺載入了本 DLL 的 `dllhost.exe`（rev 2 的 `taskkill /f /im dllhost.exe`
-會殺全機所有 COM surrogate）。** 用模組清單找出載入 `TeleDriveThumb.dll` 的
-PID，只殺那些；一個都找不到就說「沒有需要殺的 surrogate」而不是照殺。
+**只殺載入了本 DLL 的 COM surrogate（rev 2 的 `taskkill /f /im dllhost.exe`
+會殺全機所有 surrogate）。** 用模組清單找出載入 `TeleDriveThumb.dll` 的 PID，
+只殺那些。
+
+**而且不要假設有一個。** `install_thumb.py` 設了 `DisableProcessIsolation=1`，
+那個值的作用就是 opt out of isolation——handler 因此通常**直接載入在呼叫端的
+process 裡**（Explorer，或 `isolate.exe` 自己），根本不在 `dllhost.exe`。
+killer 回報「沒有需要殺的 surrogate」是**正常且常見的結果**，不是失敗。
+
+連帶結論：**`--cold-surrogate` 這個情境不能建立在「殺得掉某個 host」上。**
+真正可靠的冷載入來源是**起一個新的呼叫端 process**——`isolate.exe` 每次執行
+都是一個全新的 host lifetime，這比去殺別人的 process 乾淨得多，也不違反
+§15 的「不重啟 `explorer.exe`」。
 
 **持續負載（`--sustain-minutes`，預設 10）** — 兩條 lane：
 
@@ -882,11 +905,46 @@ ratio 保留在報告，用來判斷**快取有沒有產生效果**（接近 1 �
 | `H:` 掛著 | `cfg.mount_drive` 存在 | 沒掛載時 `SHCreateItemFromParsingName` 微秒級失敗，log 上跟「handler 答錯了」一模一樣 |
 | rclone rc 通 | `POST 127.0.0.1:5572/rc/noop` | 少了 `--rc-no-auth` 會回 `403 authentication must be set up` |
 | **`isolate --jsonl` 輸出合法 UTF-8 JSONL** | 對一個已知的非 ASCII 檔名跑一次，解析回來比對 | 這就是 C++ 那半的 harness（§3.0）。先跑 `shellthumb\buildbench.bat` |
-| **DLL 的 LogPath 會重讀** | 設 `LogPath` → 等 2 秒 → probe 一個已知檔案 → 看有沒有出現記錄 | 同上。先 `shellthumb\build.bat`（需先殺載入本 DLL 的 dllhost） |
+| **DLL 的 LogPath 會在同一個 host 內重讀** | 見下方 §11.1。**不可以只做「設值 → 等 → probe」**：handler 若在設值之後才第一次載入，舊的 one-shot 實作一樣會通過 | 先 `shellthumb\build.bat` |
 | `/rpc/counters` 與 `/rpc/cache-state` 存在 | `GET` | bridge 是舊版，先 `restart.bat` |
 | `/files/{id}/purge` 是否存在 | 僅在 `--purge` 時探測 | 不存在就退回 trash 並說明（§9.3） |
 | DLL 已註冊 | HKCU 的 ProgID 與 `SystemFileAssociations` | 先跑 `install_thumb.py` |
 | `bridge.log` 讀得到 | `cfg.cache_dir / "bridge.log"` | 沒有 log 就沒有 positive evidence |
+
+### 11.1 LogPath 重讀的 harness
+
+要證明的是**同一個 DLL host lifetime 內**「先讀到空值、TTL 後讀到新值」。
+兩次獨立的 `isolate.exe` 執行證不出這件事——第二次可能是全新載入，
+而全新載入在舊的 one-shot 實作下也會記錄。
+
+做法是讓兩段發生在**一次** `isolate.exe` 執行裡（`--pause-after` /
+`--pause-seconds`，見實作計畫 Task 9）：
+
+```
+LogPath 不存在
+        ↓
+isolate.exe --manifest m.txt --pause-after 1 --pause-seconds 6
+        │
+        ├─ 檔案 1：handler 在這裡載入，讀到空的 LogPath
+        │
+        ├─ (暫停 6 秒) ← 操作者在這段期間 reg add LogPath
+        │
+        └─ 檔案 2..n：TTL 已過，應重讀並開始記錄
+```
+
+**判定有兩個條件，缺一不可：**
+
+1. `dll.log` 有 `GetThumbnail` 行（重讀生效了）
+2. **`dll.log` 第一行的「DLL 載入後毫秒數」≥ 暫停秒數**
+
+第 2 條是關鍵。`Log()` 每行都帶 `GetTickCount64() - start`，也就是
+**DLL 載入至今多久**。如果 DLL 是在暫停之後才新載入的，那個數字會接近 0，
+這次量測就什麼都沒證明；≥ 6000 才代表它在暫停**之前**就已經載入、
+也就是它真的在同一個 lifetime 裡重讀了 registry。
+
+**這就是 `DisableProcessIsolation=1` 在這裡幫上忙的地方**：handler 載入在
+`isolate.exe` 自己的 process 裡，所以一次執行就是一個 host lifetime——
+結構上保證，再由上面那個毫秒數實證。
 
 ---
 
@@ -1012,7 +1070,10 @@ diagnostics 側（§3.4）：
 - **不清 Windows 的 `thumbcache_*.db`**、**不重啟 `explorer.exe`**、
   **不殺 rclone、不卸載 `H:`**：影響 `H:` 以外的全機使用，而且開一個新資料夾
   就得到同樣乾淨的冷狀態。
-- **不殺全部的 `dllhost.exe`**：只殺載入了本 DLL 的 PID（§8.4）。
+- **不殺全部的 `dllhost.exe`**：只殺載入了本 DLL 的 COM surrogate PID，
+  而且**不假設有一個**——`DisableProcessIsolation=1` 讓 handler 多半載入在
+  呼叫端 process 裡（§8.4）。需要冷載入就**起一個新的呼叫端 process**，
+  不要去動 Explorer。
 - **不加「觸發 warmup」的端點**：違反唯讀不變量，價值不足以換（§8.4）。
 - **不預設 purge**：opt-in，且端點存在與否要探測（§9.3）。
 - **不刪 Telegram 訊息**：做不到。

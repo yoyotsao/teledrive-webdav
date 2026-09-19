@@ -1,4 +1,4 @@
-# Audit Diagnostics Implementation Plan (rev 4)
+# Audit Diagnostics Implementation Plan (rev 5)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -11,7 +11,7 @@
 
 **Tech Stack:** Python 3 / pytest、cheroot WSGI、Telethon、C++（MSVC，`shellthumb/*.bat`）
 
-**Spec:** `docs/superpowers/specs/2026-09-19-live-browse-audit-design.md`（rev 3.4）
+**Spec:** `docs/superpowers/specs/2026-09-19-live-browse-audit-design.md`（rev 3.5）
 
 ## Global Constraints
 
@@ -619,6 +619,67 @@ class _Chunks:
         pass
 
 
+async def _noop_async(*a, **kw):
+    return None
+
+
+class _NullSemaphore:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _Thumb:
+    """A PhotoSize-shaped object _best_thumb() can rank and pick."""
+
+    def __init__(self, type_, size):
+        self.type = type_
+        self.size = size
+
+
+def _doc_with_thumb(size):
+    """A Document carrying the fields _best_thumb() and _thumbnail_bytes() read.
+
+    A bare fake makes _best_thumb() return None, _thumbnail_bytes() returns
+    before issuing anything, and the counter assertions then hold trivially --
+    the test passes having measured nothing. The `assert out` in the test is
+    what catches it if these field names drift; keep that assertion.
+    """
+    return type("Doc", (), {
+        "id": 555,
+        "access_hash": 777,
+        "file_reference": b"ref",
+        "dc_id": 1,
+        "size": size,
+        "mime_type": "image/jpeg",
+        "attributes": [],
+        "thumbs": [_Thumb("m", 8_000), _Thumb("s", 900)],
+    })()
+
+
+def _thumbnail_worker(chunks, monkeypatch):
+    """A TelegramWorker whose pooled connection yields `chunks`.
+
+    _thumbnail_bytes issues on a pooled connection rather than the control
+    one, so a worker with no pool raises before the counter is ever touched.
+    """
+    worker = _tgio_legacy.TelegramWorker.__new__(_tgio_legacy.TelegramWorker)
+
+    class _Client:
+        def iter_download(self, *a, **kw):
+            return chunks
+
+    client = _Client()
+    worker._pool = [client]
+    worker._rr = 0
+    monkeypatch.setattr(worker, "_next_client", lambda *a, **k: client, raising=False)
+    monkeypatch.setattr(worker, "_pin_exported_sender", _noop_async, raising=False)
+    monkeypatch.setattr(worker, "_thumb_semaphore", _NullSemaphore(), raising=False)
+    return worker
+
+
 def test_chunk_counts_one_attempt_and_the_chunk_it_returns(monkeypatch):
     # ONE chunk, because that is the product contract: _chunk is "one
     # REQUEST_SIZE read" and returns on the first yield. A fixture yielding
@@ -653,7 +714,7 @@ def test_thumbnail_bytes_counts_the_whole_preview_it_drains(monkeypatch):
     # this repo already uses for both document and photo media.
     before = COUNTERS.snapshot()
     worker = _thumbnail_worker(_Chunks(b"j" * 8000, b"k" * 2000), monkeypatch)
-    doc = _doc_with_thumb(size=10_000)
+    doc = _doc_with_thumb(10_000)
 
     out = asyncio.run(worker._thumbnail_bytes(doc, origin="thumb_prefetch"))
 
@@ -999,24 +1060,77 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def _eligible_entry():
-    """An Entry thumbs_for will actually act on: not a directory, not split,
-    has_thumbnail true. An empty list or an ineligible entry makes the
-    provenance assertion vacuous."""
-    raise NotImplementedError("build from tdapi.Entry; see tests/test_bridge_e2e.py")
+    """An Entry thumbs_for will actually act on.
+
+    has_thumbnail must be true (thumbs_for skips everything else) and it must
+    not be a directory. An ineligible entry -- or an empty list -- makes the
+    provenance assertion vacuous, which is the exact failure this test exists
+    to rule out.
+    """
+    from _tdapi_legacy import Entry
+
+    return Entry(
+        file_id="f1", name="a.jpg", is_dir=False, size=1234,
+        mime="image/jpeg", message_id=8, has_thumbnail=True,
+        telegram_user_id=42,
+    )
+
+
+class _Runtime:
+    def __init__(self, worker):
+        self.worker = worker
+
+
+class _Pool:
+    """Routes every read to one worker, whichever account is asked for."""
+
+    def __init__(self, worker):
+        self._runtime = _Runtime(worker)
+
+    def for_read(self, account_id):
+        return self._runtime
+
+    def read_routes(self, location):
+        yield self._runtime, None
 
 
 def _resolver_with_worker(bridge, tmp_path, worker, monkeypatch):
-    """A Resolver whose pool routes to `worker` and whose thumb cache is a real
-    empty directory, so thumbs_for misses the cache and reaches the worker."""
-    raise NotImplementedError("mirror the rig in tests/test_transfer_status.py")
+    """A Resolver that actually reaches `worker`: empty on-disk caches so
+    thumbs_for misses, and _fresh_parts stubbed so no backend is needed."""
+    from _tdapi_legacy import JsonStore, ShardedJsonStore
+
+    resolver = object.__new__(bridge.Resolver)
+    resolver.cfg = type("C", (), {"cache_dir": tmp_path})()
+    resolver.pool = _Pool(worker)
+    resolver._zips = {}
+    resolver._zip_cache = ShardedJsonStore(tmp_path / "zips")
+    resolver._prop_cache = JsonStore(tmp_path / "media_props.json")
+    (tmp_path / "thumbs").mkdir(exist_ok=True)
+    monkeypatch.setattr(resolver, "note_demand", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(
+        resolver, "_fresh_parts",
+        lambda entry: (_tgio_legacy.RemotePart(entry.message_id, entry.size,
+                                               entry.telegram_user_id, entry.file_id),),
+        raising=False,
+    )
+    return resolver
 
 
 def _pool_routing_to(worker):
-    raise NotImplementedError("mirror tests/test_account_routing.py's pool fake")
+    return _Pool(worker)
 
 
 def _canonical_part():
-    raise NotImplementedError("a ResolvedRemotePart; see tests/test_account_routing.py")
+    """A ResolvedRemotePart, so tgio.read_part takes the canonical branch
+    instead of falling through to the legacy one."""
+    from transfer_models import FileLocation, ResolvedRemotePart
+
+    location = FileLocation(None, 42, 8, "document", "9001", 1024, None, 1)
+    return ResolvedRemotePart(location=location, index=0, size=1024)
+
+
+> 這四個 fake 若跟真實簽章對不上，修 fake，不要改產品程式碼。上面每個測試都
+> 帶一個「worker 真的被呼叫到」的斷言，所以形狀不對會直接紅，不會靜靜通過。
 
 
 def test_no_provenance_call_site_was_left_untagged():
@@ -1643,7 +1757,12 @@ def test_build_app_actually_hands_the_warmup_to_the_rpc_app(monkeypatch):
 
     monkeypatch.setattr(legacy, "RpcApp", _Spy)
     sentinel = object()
-    legacy.build_app(_cfg(), _resolver(), _fetcher(), _stager(), warmup=sentinel)
+    # build_app only wires objects together -- nothing here is called during
+    # construction -- so bare stand-ins keep the seam visible without a rig.
+    cfg = type("C", (), {"base_url": "https://example/api/v1", "mount_drive": "H:",
+                         "game_folder": "game", "port": 8081})()
+    resolver = type("R", (), {"cfg": cfg})()
+    legacy.build_app(cfg, resolver, object(), None, None, warmup=sentinel)
     assert captured["warmup"] is sentinel
 
 
@@ -2296,6 +2415,18 @@ static void EmitJsonl(const char* op, const std::wstring& path,
 每行一個完整路徑。在既有 per-file 迴圈裡用同一個 `Now(freq)` 計時，
 每檔結束呼叫一次 `EmitJsonl`。
 
+**`--pause-after <n> --pause-seconds <s>`** — 處理完第 n 個檔之後睡 s 秒再繼續，
+預設 `0`（不暫停）。只有一個用途，而那個用途沒有它就做不到：Task 10 要證明 DLL
+在**同一個 host lifetime** 內重讀 `LogPath`，而兩次獨立執行是兩個 lifetime、
+證不出那件事。操作者在暫停期間改登錄值，前後兩段就確定發生在同一個載入的 DLL 上。
+
+```cpp
+if (pauseAfter > 0 && processed == pauseAfter && pauseSeconds > 0) {
+    fflush(stderr);            // the operator watches stderr to know it began
+    Sleep(pauseSeconds * 1000);
+}
+```
+
 - [ ] **Step 2: Teach buildbench.bat to build isolate as well**
 
 `buildbench.bat` 現在**只編 `bench.cpp`**，完全沒碰 `isolate.cpp`——
@@ -2500,54 +2631,83 @@ shellthumb\build.bat
 ```
 
 **`install_thumb.py` 設了 `DisableProcessIsolation=1`，所以 handler 通常
-載入在 `explorer.exe` 裡，不是 `dllhost.exe`。** killer 找不到東西是正常的，
-不是錯誤。DLL 若被鎖住，要重啟的是 `explorer.exe`。killer 留著當
-「真的有隔離 surrogate 時」的安全工具，**不是這個 lifecycle 驗證的核心**。
+載入在呼叫端的 process 裡（Explorer 或 `isolate.exe`），不是 `dllhost.exe`。**
+killer 回報「沒有需要殺的 surrogate」是正常結果，不是錯誤。
+
+**DLL 被 Explorer 鎖住時，這一步就明確失敗並停下來報告。** spec §15 明訂
+不重啟 `explorer.exe`，而一個觀測工具不該為了自己好做而擴大既定的破壞範圍。
+要不要重啟是使用者的決定，不是這份計畫的步驟：
+
+```
+[blocked] TeleDriveThumb.dll is locked and no COM surrogate holds it, so the
+          handler is loaded in a long-lived process (Explorer). Restarting
+          Explorer is out of scope for this plan (spec §15) -- do it yourself
+          if you want to, then re-run.
+```
+
 無論如何**不要用 `taskkill /f /im dllhost.exe`**。
 
 - [ ] **Step 4: Verify the SAME host re-reads LogPath**
 
-rev 3 的寫法（設值 → 等 → probe）**證不出任何事**：如果 handler 是在設值
-**之後**才第一次載入，連舊的 one-shot 實作也會通過。必須讓同一個 host
-process 先在「沒有 LogPath」的狀態下被呼叫過一次。
+rev 3 與 rev 4 的寫法**都證不出任何事**。rev 3 是「設值 → 等 → probe」；
+rev 4 改成 A/C 兩次 `isolate.exe`，但那是**兩個 host lifetime**，
+第二次的全新載入在舊的 one-shot 實作下一樣會記錄。
 
-用 `isolate.exe`（它是一個長命的行程，一次載入 handler 之後持續呼叫）：
+要證明的是**一個 lifetime 內先讀到空值、TTL 之後讀到新值**，所以兩段必須在
+**同一次執行**裡，中間留一個空檔讓操作者改登錄值——這就是 Task 9 的
+`--pause-after` / `--pause-seconds` 存在的唯一理由。
 
 ```powershell
 reg delete "HKCU\Software\TeleDriveWebDAV" /v LogPath /f
-del C:\Temp\dll.log 2>$null
+Remove-Item C:\Temp\dll.log -ErrorAction SilentlyContinue
 
-# A. 同一個行程，先在「沒有 LogPath」時跑一批（handler 在此載入並讀到空值）
-shellthumb\isolate.exe --jsonl thumb <沒看過的 H: 資料夾 A> 5 2>$null
+# 兩個沒看過的 H: 圖片，一行一個
+Set-Content -Encoding utf8 m.txt @("H:\<資料夾A>\one.jpg", "H:\<資料夾B>\two.jpg")
 
-# B. 設值，等過 TTL
+# 一次執行：檔案 1 載入 handler（讀到空值）→ 暫停 12 秒 → 檔案 2
+Start-Job { shellthumb\isolate.exe --jsonl --manifest m.txt `
+              --pause-after 1 --pause-seconds 12 thumb . 2>$null } | Out-Null
+
+Start-Sleep 4      # 確定已經進入暫停
 reg add "HKCU\Software\TeleDriveWebDAV" /v LogPath /t REG_SZ /d C:\Temp\dll.log /f
-Start-Sleep 3
+Start-Sleep 12     # 等第二個檔跑完
 
-# C. 同一個 host 再跑一批
-shellthumb\isolate.exe --jsonl thumb <沒看過的 H: 資料夾 B> 5 2>$null
-type C:\Temp\dll.log
+Get-Content C:\Temp\dll.log
 ```
 
-Expected: C 之後 `dll.log` 有 `GetThumbnail` 行。
-**A 是這個驗證的關鍵**——沒有 A，舊實作也會過。
+**判定有兩個條件，缺一不可：**
 
-> 若 A 與 C 之間 shell 換了一個 host process，這個 harness 就退化成 rev 3
-> 那個證不出事的版本。用 `LogPath` 記錄裡的 process 啟動時間戳，
-> 或在同一個 `isolate.exe` 執行中涵蓋 A 與 C（`--manifest` 兩批），
-> 來確認確實是同一個 host。
+1. `dll.log` 有 `GetThumbnail` 行 —— 重讀生效了
+2. **第一行的「DLL 載入後毫秒數」`>= 12000`**
+
+第 2 條才是真正的證據。`Log()` 每一行都帶 `GetTickCount64() - start`，
+也就是**DLL 載入至今多久**。那個數字若接近 0，代表 DLL 是暫停**之後**才載入的，
+這次量測什麼都沒證明；`>= 12000` 才代表它在暫停**之前**就在了——
+也就是它真的在同一個 lifetime 內重讀了 registry。
+
+`DisableProcessIsolation=1` 在這裡幫上忙：handler 載入在 `isolate.exe` 自己的
+process，所以一次執行就是一個 host lifetime——**結構上保證，再由那個毫秒數實證。**
 
 - [ ] **Step 5: Verify it turns back off in the same host**
 
+同一個形狀反過來：一次執行裡先記錄、暫停中刪掉登錄值、再跑第二個檔。
+
 ```powershell
-$before = (Get-Item C:\Temp\dll.log).Length
+reg add "HKCU\Software\TeleDriveWebDAV" /v LogPath /t REG_SZ /d C:\Temp\off.log /f
+Remove-Item C:\Temp\off.log -ErrorAction SilentlyContinue
+
+Start-Job { shellthumb\isolate.exe --jsonl --manifest m.txt `
+              --pause-after 1 --pause-seconds 12 thumb . 2>$null } | Out-Null
+Start-Sleep 4
+$before = (Get-Item C:\Temp\off.log).Length     # 第一個檔已經寫進去了
 reg delete "HKCU\Software\TeleDriveWebDAV" /v LogPath /f
-Start-Sleep 3
-shellthumb\isolate.exe --jsonl thumb <沒看過的 H: 資料夾 C> 5 2>$null
-(Get-Item C:\Temp\dll.log).Length -eq $before
+Start-Sleep 12
+
+$before -gt 0 -and (Get-Item C:\Temp\off.log).Length -eq $before
 ```
 
-Expected: `True`（關掉也要在同一個 process 內生效）
+Expected: `True`。**`$before > 0` 那一半不能省**——否則「檔案沒有變大」
+可能只是因為從頭到尾就沒記錄過，那同樣什麼都沒證明。
 
 - [ ] **Step 6: Commit**
 
