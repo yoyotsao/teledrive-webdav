@@ -1,38 +1,60 @@
 # 真實 `H:` 巡檢與上傳往返探測 — 設計
 
-**日期：** 2026-09-19（rev 2，2026-09-19 依 review 修訂）
+**日期：** 2026-09-19（rev 3）
 
-**狀態：** Proposed（rev 1 為 Needs revision，本版處理該次 review 的 10 項）
+**狀態：** Proposed
 
 **目標倉庫：** `yoyotsao/teledrive-webdav`
 
 ---
 
-## 0. rev 2 改了什麼
+## 0. 版本與引用規則
 
-rev 1 有六個會造成**假通過**的缺陷，以及三項照目前 repo 根本寫不出來。共通的成因是
-rev 1 假設「不動產品程式碼」，於是只能從外部觀察，而外部觀察在這個系統上不足以
-分辨「沒量到」與「很快」。
+### 0.1 為什麼這份 spec 只引用 symbol
 
-| # | rev 1 的問題 | 本版 |
+rev 2 寫了 `_tdapi_legacy.py:819` 這種定位，review 指出 master 上沒有那些檔。
+兩邊都對，指的是不同的 tree：
+
+| tree | `tdapi.py` | `_*_legacy.py` | `trash()` 在哪 |
+|---|---|---|---|
+| `master` | 883 行，完整實作 | 無 | `tdapi.py` |
+| `feat/current-backend-storage-parity` | 310 行薄層 | 四個，`d0f63b2` 引入 | `_tdapi_legacy.py` |
+
+**把引用改回 master 定位不是解**——這個 branch 一 merge，master 的行號就換成
+同樣的命運。所以本版起：
+
+> **只引用 symbol（`TeleDriveClient.trash()`、`Resolver._zip_cache`、
+> `ZipView.root()`、`tgio` 的兩個 `iter_download` 呼叫點），不引用檔案路徑加行號。**
+> §13 的檔案清單同時列出兩棵樹，因為實作必須真的打開某個檔。
+
+### 0.2 rev 3 處理的項目
+
+| # | rev 2 的問題 | 本版 |
 |---|---|---|
-| 1 | `isolate.exe` 只有整批輸出，拿不到單張 max | §3.1 加 `--jsonl` 逐檔輸出 |
-| 2 | `Log()` 每 host process 只讀一次 `LogPath`，動態設定對已載入的 surrogate 無效 | §3.2 改 DLL + preflight contract |
-| 3 | `/rpc/forget` 只清 dir listing，被當成清光全部快取 | §5 每個快取分別建模，`unknown` 是合法狀態 |
-| 4 | health 無 `cryptg`、status 無 sweep | §3.3 加 read-only diagnostics |
-| 5 | 拿被 throttle 的 log 行數當「沒有下載」的反證 | §6 改用 process 內 counter，並處理併發污染 |
-| 6 | sustain 重複瀏覽同一資料夾，幾輪後不再碰 Telegram | §8.3 拆成背景負載 + 前景 probe 兩條 lane |
-| 7 | 宣稱 backend row 刪不掉 | **錯誤**。`tdapi.trash()` 存在，§9.3 改用它 |
-| 8 | sample 選擇要求 backend 給不出的資訊，且自我矛盾 | §7 改成 bounded discovery + 可得資訊 |
-| 9 | 全域 `<5s` 與 zip `<8s` 互相矛盾 | §10 三級 severity，UX 與 functional 分開 |
-| 10 | `warm/cold >= 20x` 當硬門檻 | §10 降為 diagnostic |
+| 1 | 架構敘述綁在單一 tree | §0.1 改引用 symbol |
+| 2 | cache 路徑寫錯 | §5 依實際 store 重寫 |
+| 3 | 只看磁碟檔判 cold，忽略記憶體快取 | §5 改由 bridge 提供 per-key cache-state |
+| 4 | `LogPath` TTL 會產生 data race | §3.2 SRWLOCK + path/timestamp 一起同步 |
+| 5 | `fetch-local` 對 ZIPDIR 的語意寫錯 | §8.3 改成「完整虛擬目錄取回」 |
+| 6 | validity 只有全域一個 | §4 改 per-operation |
+| 7 | counter 來源只有 rpc/sweep | §6 改顯式 origin |
+| 8 | 類別 A 假設「前 N 個檔都是靜態圖」 | §8.1 manifest |
+| 9 | 類別 A 的 props validity 退化 | §8.1 補回 |
+| 10 | 類別 B 的跨界檢查沒有 oracle | §8.2 直接讀 part message 當 oracle |
+| 11 | `zip_index_reads_total` 會被 warm cache 掩蓋 | §8.3 拆 `zip_open_attempts_total` |
+| 12 | `preexisting` 的影響範圍寫反 | §8.3 只影響該 zip 的 cold-open |
+| 13 | 90 秒 idle 不代表真的 idle | §8.4 用 counter 靜止證明 |
+| 14 | `--with-sweep` 多半碰不到 active | §8.4 接受 `NOT_MEASURED` + `next_run_at` |
+| 15 | `taskkill dllhost.exe` 殺全機 | §8.4 只殺載入了本 DLL 的 PID |
+| 16 | roundtrip 等 `uploads` 排空不夠 | §9.2 也等 game staging unit |
+| 17 | sustain 背景負載走 `H:` 仍會被 rclone 吃掉 | §8.4 背景走 bridge HTTP |
+| 18 | `--sustain-max-bytes` 算 requested 會低估 | §8.4 依 `download_bytes_total` 實際增量 |
+| 19 | p95 樣本數未定義 | §10.2 `max` 當 gate，p95 需 N≥20 |
+| 20 | 時間出現在 functional 判定裡 | §10 correctness 只管內容 |
+| 21 | `means` 過度推論 | §12.1 因果需要 byte evidence |
+| 22 | 「每項 diagnostics 都有離線測試」涵蓋不到 C++ | §3.0 縮小宣稱，preflight 即 harness |
 
-**第 7 項是事實錯誤，要記下來。** rev 1 寫「backend 沒有刪除端點」，依據是 grep `tdapi.py`。
-但 `tdapi.py` 是 storage-parity 薄層，開頭把 `_tdapi_legacy.py` 的 `vars()` 整份灌進
-`globals()`；`trash()` 在 `_tdapi_legacy.py:819`，是 `DELETE /files/{file_id}`，
-soft-delete 整棵子樹、Telegram 訊息不動，`tests/test_bridge_e2e.py:941` 已在使用。
-**這個 repo 目前是 `tdapi.py` / `bridge.py` / `tgio.py` 三層薄殼疊在 `_*_legacy.py` 上，
-任何「這個功能不存在」的判斷都必須連 legacy 一起看。**
+三項不照 review 的建議走，理由見 §9.3（purge）、§8.4（sweep 觸發）、§3.0（C++ 測試）。
 
 ---
 
@@ -40,102 +62,109 @@ soft-delete 整棵子樹、Telegram 訊息不動，`tests/test_bridge_e2e.py:941
 
 > **「使用體驗可以跟本機硬碟一樣嗎？頂多開檔速度慢一點，但是不應該一直轉。」**
 
-「一直轉」可以量測，但**不能用平均值量**。一個資料夾 100 張圖，99 張 40 ms、
-1 張 30 秒，平均 340 ms 看起來很健康，而使用者只看到那 30 秒。所以全程用
-`max` 與 `p95`，並把「單一操作 ≥ 5 秒」直接定義成使用者感知得到的 stall。
+「一直轉」可以量測，但不能用平均值。100 張圖裡 99 張 40 ms、1 張 30 秒，
+平均 340 ms 看起來健康，而使用者只看到那 30 秒。全程用 `max`，
+並把「單一操作 ≥ 5 秒」定義成使用者感知得到的 stall。
 
-而這個問題**不能只靠自己新上傳的檔案回答**——理由見 §2。
+而這個問題不能只靠自己新上傳的檔案回答——見 §2。
 
 ---
 
 ## 2. 為什麼主角是唯讀巡檢
 
-腳本自己剛上傳的資料夾是**整個 drive 上最幸運的樣本**：全是 `document` 型、
-在 primary 帳號自己的 DC 上、剛註冊所以 `has_thumbnail` 與 `file_id` 都正確、
-數量小、只有一層深。
+腳本剛上傳的資料夾是整個 drive 上最幸運的樣本：全 `document` 型、在 primary 帳號
+自己的 DC 上、剛註冊所以 `has_thumbnail` 與 `file_id` 都正確、數量小、一層深。
 
-而讓人一直轉的每一條坑都需要特定觸發條件，**新資料夾一條都不滿足**：
+讓人一直轉的每一條坑都需要特定觸發條件，**新資料夾一條都不滿足**：
 
-| 成因（皆出自 CLAUDE.md 的實測紀錄） | 觸發條件 | 新資料夾滿足嗎 |
+| 成因（皆出自 CLAUDE.md 的實測紀錄） | 觸發條件 | 新資料夾 |
 |---|---|---|
-| exported sender 60 秒計時器 → 8 條連線同時重連 → `Server closed the connection` | 跨 DC 檔案 ＋ >60 秒空檔 | ✗ 兩者皆無 |
+| exported sender 60 秒計時器 → 8 條連線同時重連 → `Server closed the connection` | 跨 DC 檔案 ＋ >60 秒空檔 | ✗ |
 | FLOOD_WAIT 累積 | 持續拉取數分鐘 | ✗ |
 | backend keep-alive 斷線 → `/rpc/thumb` 500 → `delegating` 讀整檔 | 閒置數秒後再請求 | ✗ |
 | DLL `Settings` magic-static race | handler 冷載入的頭幾百微秒 | ✗ |
 | sweep 跟前景搶 | `BackgroundWarmup` 正在跑 | ✗ |
-| 路徑解析每層 0.52 秒 | 深層路徑 + 未快取 | ✗ 只有一層 |
-| 列 `/game` 打開每一個封存 | `/game` 底下有幾十上百個 zip | ✗ |
+| 路徑解析每層 0.52 秒 | 深層路徑 + 未快取 | ✗ |
+| 列 `/game` 打開每一個封存 | `/game` 底下幾十上百個 zip | ✗ |
 | chat import 的 `photo` 型 media | 該資料夾是 chat import 來的 | ✗ 結構上不可能 |
 
 **上傳往返證明「新東西是對的」，唯讀巡檢證明「舊東西不會卡」。**
 
 ---
 
-## 3. 產品程式碼的改動（rev 1 的「不動」已撤銷）
+## 3. 產品程式碼的改動
 
-### 3.0 取代後的不變量
+### 3.0 不變量與其誠實範圍
 
-> **不改變任何資料路徑或產品行為；只允許新增唯讀的 diagnostics（逐檔 telemetry、
-> counter、狀態欄位），且每一項都要有離線測試。**
+> **不改變任何資料路徑或產品行為；只新增唯讀 diagnostics。**
 
-代價要講清楚：**這支 audit 的正確性開始依賴它自己在測的程式碼**。一個記錯的 counter
-會讓 audit 往「假通過」的方向錯，跟沒有 counter 一樣糟。防線是 §3.4。
+覆蓋的誠實說法（rev 2 這句寫得太滿）：
 
-### 3.1 `shellthumb/isolate.cpp` — 加 `--jsonl`
+- **Python 側的每一項 diagnostics 都有離線測試**（counter 增量、`warmup.status()`
+  的狀態機、cache-state 回報）。
+- **C++ 那兩項沒有離線測試，也不假裝有。** Python parser 的測試只證明 parser，
+  不證明 `isolate.exe` 真的輸出合法 UTF-8 JSONL；thread-safety 更不是測得出來的，
+  是 SRWLOCK 保證的。**改由 preflight 當那個 harness**：它本來就要 probe
+  `--jsonl` 與 LogPath 重讀，那次 probe 就是這兩項每次執行前的驗證（§11）。
 
-現況 `isolate.cpp:92` 是整批跑完才印一行 aggregate 到 stdout，沒有逐檔 latency、
-沒有檔名、沒有 stderr 進度。rev 1 要的「單張 thumb max」與「逾時被 kill 也說得出
-做到哪一張」，**原始資訊根本不存在**，不是 Python parser 能補的。
+代價要講清楚：**audit 的正確性開始依賴它自己在測的程式碼**。一個記錯的 counter
+會往「假通過」的方向錯。防線是 §3.4。
 
-加 `--jsonl`，**每個檔一結束就往 stderr 印一行並 flush**，最後 stdout 仍印原本的
-aggregate（人工使用不受影響）：
+### 3.1 `isolate` — 加 `--jsonl` 與 manifest
+
+現況是整批跑完才印一行 aggregate 到 stdout，沒有逐檔 latency、沒有檔名、
+沒有進度。「單張 thumb max」與「逾時被 kill 也說得出做到哪一張」**原始資訊
+根本不存在**，不是 Python parser 能補的。
+
+兩個改動：
+
+**(a) `--jsonl`** — 每個檔一結束就往 **stderr** 印一行並 flush，stdout 仍印
+原本的 aggregate（人工使用不受影響）：
 
 ```
 {"op":"thumb","file":"a.jpg","elapsed_ms":83,"answered":true,"hr":"0x00000000"}
 {"op":"thumb","file":"b.jpg","elapsed_ms":7412,"answered":true,"hr":"0x00000000"}
 ```
 
-**走 stderr 而不是 stdout，narrow UTF-8 而不是 `fwprintf`** —— 這兩點都是
-`warmshell.cpp` 已經踩過的：寬字元輸出會被轉成 console codepage，而這裡的路徑
-大半是非 ASCII，那正是「URL 跳脫」那條坑的同一種死法。
+走 stderr、**narrow UTF-8 而不是 `fwprintf`**——寬字元輸出會被轉成 console
+codepage，而這裡的路徑大半是非 ASCII，那正是「URL 跳脫」那條坑的同一種死法。
+`warmshell` 已經踩過。
 
-選 `isolate.cpp` 而不是新增 `liveprobe.cpp`：不需要第三套 shell driver，
-而且 `isolate` 本來就是「單獨量一條路徑」的工具，逐檔輸出是它自然的延伸。
+**(b) `--manifest <file>`** — 從檔案讀要測的路徑清單，取代「掃資料夾前 N 個檔」。
+現況混到 `.txt` / `.zip` / 影片時，`answered == N` 與 `delegating == 0`
+就變成**錯誤的門檻**——那些檔本來就不該有縮圖。由 Python 端決定測哪些，
+才能讓門檻有意義。
 
-### 3.2 `shellthumb/TeleDriveThumb.cpp` — `LogPath` 的 lifecycle
+### 3.2 DLL — `LogPath` 的 lifecycle，且必須 thread-safe
 
-現況 `Log()`（`TeleDriveThumb.cpp:150-164`）是 `static bool checked`，
-**每個 host process 只讀一次 registry**。所以：
+現況 `Log()` 用 `static bool checked`，**每個 host process 只讀一次 registry**：
 
 ```
-dllhost 已載入 handler，當時沒有 LogPath   →  checked=true, path=""
+dllhost 已載入 handler，當時沒有 LogPath  →  checked=true, path=""
 audit 寫入 HKCU\...\LogPath
-同一個 dllhost 再被呼叫                     →  不重讀 registry
-audit 看不到任何 DLL log
-                                            →  依 §4 判成「沒量到」
+同一個 dllhost 再被呼叫                    →  不重讀  →  audit 看不到任何 log
+                                           →  依 §4 判成 NOT_MEASURED
 ```
 
-**這正是這份設計要避免的 measurement trap，而 rev 1 自己掉進去了。**
+**這正是這份設計要避免的 measurement trap，而 rev 1 掉了進去。**
 
-改法（選 A）：`Log()` 的 path 快取加一個**便宜的 TTL**——每 2 秒最多重讀一次
-registry。diagnostics 的效能要求跟 `GetSettings()` 不同：`GetSettings()` 在
-每個檔案的熱路徑上且結果永不變，所以必須是 magic static；`Log()` 在沒開記錄時
-第一件事就是 `path.empty()` 提早 return，加一個 `GetTickCount64()` 比較的成本
-可以忽略。
+改法：path 快取加 **2 秒 TTL**，且 **`path` 與 timestamp 由同一個 SRWLOCK
+一起保護**。rev 2 只寫了 TTL，那會在多執行緒 dllhost 上產生對
+`static std::wstring` 的 data race——Explorer 進一個資料夾就是好幾個執行緒
+同時進來，這不是理論風險，是這個 DLL 已經因為類似原因壞過一次的地方。
 
-> **不要改成 `GetSettings()` 那種 magic static。** 那條坑（Explorer 進資料夾時
-> 多執行緒同時冷載入，旗標在讀取之前就立起來）是**設定**的，不是記錄的；
-> 記錄需要的恰好是相反的性質——可以在 process 存活期間改變。
+讀取路徑用 `AcquireSRWLockShared` 拿現值；過期才升級成 exclusive 重讀，
+並在拿到 exclusive 之後**再檢查一次**時間戳（另一個執行緒可能已經刷新過）。
 
-並列成 preflight contract（§11）：audit 啟動時若偵測到 `LogPath` 是這次才設的、
-而且已經有 dllhost 在跑，就**明確告知**「DLL 記錄可能要 2 秒後才生效」，
-並在第一批量測前 warm 一次丟棄。
+> **不要改成 `GetSettings()` 那種 magic static。** 那條坑（多執行緒冷載入時
+> 旗標在讀取之前就立起來）是**設定**的：熱路徑、結果永不變，所以必須是
+> magic static。記錄需要的恰好相反——可以在 process 存活期間改變。
+> 這兩個相反的需求要寫在程式碼註解裡，否則下一個人會「順手統一」。
 
-### 3.3 read-only diagnostics（`_bridge_legacy.py` 的 `RpcApp`）
+### 3.3 read-only diagnostics（`RpcApp`）
 
-`_health`（`:1399`）目前只有 `ok` / `telegram_user_id` / `base_url` /
-`mount_drive` / `game_folder`；`_status`（`:1411`）是 stager + uploads + pool，
-而 `RpcApp(cfg, resolver, fetcher, stager, upload_stager)`（`:1569`）
+`_health` 目前只有 `ok` / `telegram_user_id` / `base_url` / `mount_drive` /
+`game_folder`；`_status` 是 stager + uploads + pool，而 `RpcApp` 的建構
 **根本沒收到 `BackgroundWarmup`**。
 
 新增：
@@ -145,169 +174,202 @@ registry。diagnostics 的效能要求跟 `GetSettings()` 不同：`GetSettings(
 { "cryptg": true }
 
 // GET /rpc/status
-{ "warmup": {"enabled": true, "active": false, "phase": "idle", "pass": 3} }
+{ "warmup": {"enabled": true, "active": false, "phase": "idle",
+             "pass": 3, "next_run_at": "2026-09-20T02:00:00"} }
 
-// GET /rpc/counters   ← 新端點，見 §6
+// GET /rpc/counters      ← §6
+// GET /rpc/cache-state   ← §5
 ```
 
-`BackgroundWarmup` 要被傳進 `RpcApp`，並長出一個 `status()`。這是三處裡唯一
-會碰到 wiring 的改動，仍然不改行為。
+`BackgroundWarmup` 要被傳進 `RpcApp` 並長出 `status()`。這是唯一碰到 wiring
+的改動，仍不改行為。
 
 ### 3.4 diagnostics 自己的防線
 
 - 每個 counter 都要有離線測試，斷言「做了 N 次讀取，counter 剛好加 N」。
-- counter 植入點**只有兩處**：`_tgio_legacy.py:665`（`_thumbnail_bytes`）與
-  `:795`（`_chunk`）——這是整個 repo 僅有的兩個 `iter_download` 呼叫點。
-  **植在更上層的便利函式會漏，而漏掉的方向正好是假通過。**
-- `/rpc/counters` 不得出現任何憑證，跟 `/rpc/status` 同一條規矩。
+- counter 植入點**只有兩處**：`tgio` 裡 `_thumbnail_bytes` 與 `_chunk` 的
+  `iter_download` 呼叫——這是整個 repo 僅有的兩個。**植在更上層的便利函式會漏，
+  而漏掉的方向正好是假通過。**
+- `/rpc/counters` 與 `/rpc/cache-state` 不得出現任何憑證，跟 `/rpc/status` 同規矩。
 
 ---
 
-## 4. 四層模型
-
-rev 1 讓 `Threshold` 直接面對一堆可能缺資料的 metrics。本版改成四層，
-**最重要的新不變量是：**
-
-> **只有 `validity == valid` 的量測才有資格進入 threshold evaluator。
-> 其餘一律是 `NOT_MEASURED`，既不是 pass 也不是 fail。**
+## 4. 四層模型與 per-operation validity
 
 ```
-1. Discovery         找候選樣本，且不可造成重負載
-2. Measurement validity   handler 真的被呼叫了嗎？bridge 真的收到請求了嗎？
-                          每個快取的狀態是 cold / warm / unknown？
-                          → 不成立就 NOT_MEASURED，不進第 3、4 層
-3. Functional correctness  bytes / SHA256 / CRC32 / split 邊界 / 尾端讀取
-4. UX performance         max / p95 / stall 次數 / 持續負載下的衰退
+1. Discovery              找候選樣本，且不可造成重負載
+2. Measurement validity   每個 operation 各自判定
+3. Functional correctness 只管內容：bytes / SHA256 / CRC32 / 覆蓋 / 邊界
+4. UX performance         只管時間：max / stall / 持續負載下的衰退
 ```
 
-第 3 層與第 4 層**分開產生 finding**：一個 zip 冷開 6.5 秒在功能上完全正確
-（讀 central directory 是該付的成本），在體驗上是一次 stall。rev 1 用一個布林
-把這兩件事混在一起，於是同一筆同時 PASS 又是 finding。
+> **不變量：只有 `validity == valid` 的量測才進 threshold evaluator。
+> 其餘是 `NOT_MEASURED`，既不是 pass 也不是 fail。**
+
+**validity 是 per-operation 的，不是全域一個布林**（rev 2 寫錯了）。
+「這個 drive 上沒有跨 DC 樣本」不該讓 A/B/C 已經成功量到的東西全部作廢。
+每個 measurement window 自己帶：
+
+```json
+{"op": "class_B.props_no_bytes",
+ "validity": "not_measured",
+ "why": "BackgroundWarmup was active during the window"}
+```
+
+top-level 只做 summary：`"valid_ops": 14, "not_measured": 3`。
+
+第 3 層與第 4 層**分開產生 finding**，而且**時間不得出現在 functional 判定裡**
+（rev 2 的「functional budget 8s」仍然混淆了兩者——9 秒但位元組完全正確不是
+correctness 失敗）。見 §10。
 
 ---
 
-## 5. 快取狀態模型
+## 5. Cache state：記憶體 + 磁碟，`unknown` 是合法狀態
 
-`/rpc/forget`（`_bridge_legacy.py:1429`）**只呼叫 `api.invalidate()`**，
-而 `invalidate()`（`_tdapi_legacy.py:646`）只清 `_dir_cache` 與 `meta/dirs/*.json`。
-它**不清** thumbnail 快取、property 快取、`meta/zips/` 的 `ShardedJsonStore`。
+`/rpc/forget` **只呼叫 `TeleDriveClient.invalidate()`**，而它只清 `_dir_cache`
+與 `<cache_dir>/dirs/*.json`。它**不清**縮圖、屬性、zip 索引。
 
-rev 1 寫「冷測之前 `POST /rpc/forget`」，等於宣告了一個它沒有做到的事。
-最嚴重的是類別 C：若 `meta/zips/<key>.json` 昨天就存在，**第一次進 zip 也是暖的**，
-量出 `<0.1s / <0.1s`，數字漂亮但 central-directory 冷路徑完全沒被測到。
+而且——**只看磁碟檔存不存在仍然判不出 cold**：
 
-所以每個快取分別建模，**`unknown` 是合法且常見的狀態，不准壓成 boolean**：
+| store | 磁碟 | 記憶體 |
+|---|---|---|
+| zip 索引 | `<cache_dir>/zips/`（`ShardedJsonStore`） | `ShardedJsonStore._memory`、`Resolver._zips` 的 `ZipView`、`ZipView._root` memo |
+| 屬性 | `<cache_dir>/media_props.json`（`JsonStore`） | `JsonStore` 的 in-memory dict |
+| 縮圖 | `<cache_dir>/thumbs/` | — |
+| 檔頭 | `<cache_dir>/heads/` | — |
+| listing | `<cache_dir>/dirs/` | `TeleDriveClient._dir_cache` |
 
-| 快取 | 怎麼確定 cold | 怎麼確定 warm | 何時是 unknown |
-|---|---|---|---|
-| `api_metadata` | `POST /rpc/forget` | 剛列過 | — 永遠可確定 |
-| `zip_index` | 檢查 `meta/zips/<key>.json` 不存在 | 檔案存在 | — 可由檔案系統確定 |
-| `thumb_cache` | 檢查 `meta/` 對應 key 不存在 | 存在 | — 可確定 |
-| `props_cache` | 同上 | 同上 | — 可確定 |
-| `rclone_vfs` | `rclone rc vfs/forget` 只清 dir cache，**不清已快取的位元組** | — | **多數情況 unknown**，除非刪 `<cache_dir>\rclone\vfs\` 對應檔 |
-| `windows_thumb` | 只有全新的資料夾路徑才能確定 | 看過一次 | **既有資料夾一律 unknown** |
+一個已經跑了一天的 bridge，`Resolver._zips` 裡可能已經有那個 `ZipView` 且
+`_root` 已 memo——**磁碟上沒有索引檔也照樣是暖的**。rev 2 用檔案存在與否判定，
+會把 warm 判成 cold，然後給出一個漂亮又錯誤的「冷開 0.08 秒」。
 
-報告因此是：
+所以改由 bridge 回答：
+
+```
+GET /rpc/cache-state?key=<entry key>&kinds=zip,thumb,props,listing
+→ {"zip": {"memory": true, "disk": true},
+   "thumb": {"memory": false, "disk": false},
+   ...}
+```
+
+Python 端據此推出 `cold` / `warm` / `unknown`：
+
+| 快取 | cold 的條件 | 何時 unknown |
+|---|---|---|
+| `api_metadata` | `/rpc/forget` 之後 | — |
+| `zip_index` | memory 與 disk 皆 false | — |
+| `thumb_cache` | 同上 | — |
+| `props_cache` | 同上 | — |
+| `rclone_vfs` | `rclone rc vfs/forget` **只清 dir cache，不清已快取的位元組** | **多數情況 unknown**，除非刪 `<cache_dir>/rclone/vfs/` 對應檔 |
+| `windows_thumb` | 只有全新的資料夾路徑能確定 | **既有資料夾一律 unknown** |
 
 ```json
 "cache_state": {
-  "api_metadata": "cold",
-  "zip_index": "preexisting",
-  "thumb_cache": "cold",
-  "props_cache": "warm",
-  "rclone_vfs": "unknown",
-  "windows_thumb": "unknown"
+  "api_metadata": "cold", "zip_index": "preexisting",
+  "thumb_cache": "cold", "props_cache": "warm",
+  "rclone_vfs": "unknown", "windows_thumb": "unknown"
 }
 ```
 
-**冷門檻只對 `cold` 的快取套用。** 是 `preexisting` 或 `unknown` 就記錄實測值、
-標成 `NOT_MEASURED`，並在 console 說明為什麼——「這個 zip 的索引昨天就在了，
-所以這次量不到冷開成本」比一個漂亮的 0.08 秒有用得多。
+**冷門檻只對 `cold` 套用**；`preexisting` / `unknown` 記錄實測值、標
+`NOT_MEASURED`、並說明原因。「這個 zip 的索引昨天就在了」比一個漂亮的
+0.08 秒有用得多。
 
 ---
 
 ## 6. Counter，以及它為什麼不能是 log 行數
 
-`_bridge_legacy.py:1659` 對 `telethon.client.downloads` 掛了 `ThrottleRepeats`：
-相同 message template 在 60 秒內只放一行過。所以 rev 1 的
-「屬性階段 `iter_download` 行數 == 0」有一條乾淨的假通過路徑：
+bridge 對 `telethon.client.downloads` 掛了 `ThrottleRepeats`：相同 template
+60 秒內只放一行過。所以「屬性階段 `iter_download` 行數 == 0」有乾淨的假通過：
 
 ```
-T-5s  某個 iter_download 被記錄（template 的配額用掉了）
+T-5s  某個 iter_download 被記錄（template 配額用掉）
 T+0s  props 量測開始
-T+1s  props 錯誤地下載了原檔  →  同一個 template，被 suppress
-T+3s  BridgeLog 讀新增區段    →  0 行  →  PASS
+T+1s  props 錯誤地下載原檔  →  同 template，被 suppress
+T+3s  讀新增區段  →  0 行  →  PASS
 ```
 
-**log 適合找 positive evidence，被 suppress 的 log 不能當 negative evidence。**
-這條 throttle 是這個專案自己為了讓 `bridge.log` 可讀而加的，rev 1 又設計了一個
-被它打敗的檢查——同一份文件裡的兩段互相抵銷。
+**log 適合找 positive evidence；被 suppress 的 log 不能當 negative evidence。**
+那條 throttle 是這個專案自己為了讓 `bridge.log` 可讀而加的，rev 1 又設計了
+一個被它打敗的檢查。
 
-改用 process 內的 monotonic counter，`GET /rpc/counters`：
+### 6.1 Origin 必須顯式傳遞
+
+rev 2 的 `source="rpc"|"sweep"` 不夠：位元組還可能來自 DAV read、zip 索引讀取、
+`fetch-local`、縮圖預抓。而且**所有請求共用同一個 asyncio worker loop，
+不能靠 thread-local 猜來源**。
+
+改成顯式傳一個 origin 到 `tgio` 的兩個 `iter_download` 呼叫點：
 
 ```
-download_requests_total
-download_bytes_total
-thumb_requests_total
-props_requests_total
-zip_index_reads_total
+props | thumb | thumb_prefetch | dav_read | zip_index | fetch_local | warmup | head
 ```
 
-probe 前後各取一次 snapshot，`before == after` 才是真的「沒讀位元組」。
+```
+GET /rpc/counters
+→ {"download_requests_total": {"props": 0, "dav_read": 1284, ...},
+   "download_bytes_total":    {"props": 0, "dav_read": 673185792, ...},
+   "zip_open_attempts_total": 12,
+   "zip_index_cache_misses_total": 3,
+   "thumb_requests_total": 8401,
+   "props_requests_total": 3120}
+```
 
-### 6.1 併發污染
+**origin 是參數，不是推斷。** 這會讓呼叫鏈上每一層都要帶著它——
+那是刻意的成本：推斷出來的來源在出錯時不會報錯，只會給出一個可信的錯誤答案。
 
-**`before == after` 在 sweep 同時在跑時必然假失敗**——`BackgroundWarmup`
-自己就在下載。這是 review 沒提到但會讓修法本身壞掉的地方。兩個做法：
+### 6.2 併發污染
 
-- **首選**：counter 帶來源標籤（`download_bytes_total{source="rpc"|"sweep"}`），
-  probe 只看自己那一維。
-- **退路**：那段 probe 前先用 §3.3 的 `warmup.active` 確認 sweep idle；
-  不 idle 就標 `NOT_MEASURED`，**不要等到它 idle**——那會讓 audit 的執行時間
-  變成不可預測。
-
-無論哪一種，`warmup.active` 都要記進報告。
+`before == after` 在 sweep 同時跑時必然假失敗。有了 origin 之後，probe 只看
+自己那一維（`props`），sweep 的位元組落在 `warmup` 維，互不干擾。
+仍然要把 `warmup.active` 記進報告，因為它會影響**延遲**，只是不再影響
+correctness 的判定。
 
 ---
 
-## 7. Discovery（樣本挑選）
+## 7. Discovery
 
-rev 1 有三個問題：要求 backend 給不出的資訊、自我矛盾、可能非常昂貴。
+**Cross-DC / photo — review 指出這比 rev 2 說的便宜。** backend 的 `FileInfo`
+已經回 `telegram_media_kind` / `telegram_chat_id` / `telegram_media_id` /
+`telegram_media_size`，只是 `_to_entry()` 把它們丟掉了（目前 `Entry` 只取
+13 個欄位）。本 branch 的 parity 層已經在 `parse_file_location` 消費這些欄位，
+所以把 `telegram_media_kind` 與 `telegram_chat_id` 納入 `Entry` 是自然的延伸。
 
-**Cross-DC / photo**：`Entry` 有 `file_id` / `mime` / `message_id` / `is_split` /
-`split_group_id` / `has_thumbnail` / `telegram_user_id`，**沒有** media 型別
-（photo vs document）、沒有 DC id、沒有「來源是 chat import」。所以
-「從 backend listing 找 photo 佔比高的資料夾」做不到。改成：
+於是：
 
-- `--sample-crossdc <H: 路徑>` **明確指定**（首選；使用者知道哪些資料夾是 chat import）
-- 沒指定時，可選的 `--probe-crossdc` 對候選資料夾抽樣 N 個檔做一次 Telegram
-  metadata 查詢來分類，**預設關**，因為它本身就是負載
+- `telegram_media_kind == "photo"` 佔比高 → **chat import 候選，零額外 Telegram 呼叫**
+- 要證明**真的跨 DC**才需要查 Telegram 的 `dc_id`，那一步 `--probe-crossdc`
+  才做，預設關
+- `--sample-crossdc <H: 路徑>` 永遠可以明確指定
 
-找不到就在報告寫「這個 drive 上沒有可辨識的跨 DC 樣本，§8.1 未執行」。
-**「沒測到」要說出來**，不能靜靜略過。
+**Zip 樣本**：rev 2 同時要求「依 entry 數挑」與「不可開任何 zip」，而不讀
+central directory 就不知道 entry 數。改成：
 
-**Zip entry count**：rev 1 同時要求「依 entry 數最多挑」與「不可開任何 zip」，
-而 **不讀 central directory 就不知道 entry 數**。改成：
+- `<cache_dir>/zips/` 已有索引 → 可依 entry 數挑（並標該 zip `zip_index: preexisting`）
+- 沒有索引 → 依封存的邏輯大小 / part 數挑，backend 給得出
 
-- `meta/zips/` 已有索引 → 可依 entry 數挑（順帶把該 zip 標成 `zip_index: preexisting`）
-- 沒有索引 → 依封存的**邏輯大小 / part 數**挑，這兩個 backend 給得出
-
-**「檔案數最多的資料夾」**：遞迴走完整棵 metadata tree 本身可能非常昂貴
-（每層 2 個往返）。改成 bounded discovery：
+**Bounded discovery**：遞迴走完整棵 metadata tree 每層 2 個往返，可能非常昂貴。
 
 ```
 --discovery-max-folders 200
 --discovery-max-seconds 30
 ```
 
-超過就從目前最佳候選挑，並在報告記下 discovery 是否被截斷。
+超過就從目前最佳候選挑，並記下 discovery 是否被截斷。
 **不要為了開始 benchmark 先 benchmark 半小時。**
+
+找不到某一類就明確跳過並在報告說明。**「沒測到」要說出來。**
 
 ---
 
-## 8. 三個結構類別 + 壓力情境
+## 8. 三個結構類別與壓力情境
 
 ### 8.1 類別 A — 小檔（單一 message，非 split）
+
+先由 Python 端組 **manifest**：從樣本資料夾挑出符合條件的靜態圖
+（`IMAGE_EXTS`、非 split、`has_thumbnail == true`），寫成檔案交給
+`isolate --manifest`。**不要讓 `isolate` 自己掃前 N 個檔**——混到
+`.txt` / `.zip` / 影片時 `answered == N` 與 `delegating == 0` 是錯誤的門檻。
 
 冷列舉 → `isolate --jsonl thumb` → `isolate --jsonl props` → `bench` →
 抽樣整檔讀回比對 → 立刻重跑 thumb（暖）。
@@ -318,37 +380,54 @@ rev 1 有三個問題：要求 backend 給不出的資訊、自我矛盾、可�
 
 | 層 | 指標 | 判準 |
 |---|---|---|
-| Validity | DLL log 的 `GetThumbnail` 行數 | 必須 == 檔案數，否則 `NOT_MEASURED` |
-| Validity | `thumb_requests_total` 增量 | 必須 > 0 |
+| Validity | DLL log 的 `GetThumbnail` 行數 | `== manifest 長度`，否則 `NOT_MEASURED` |
+| Validity | DLL log 的 props `Initialize` 行數與目標路徑 | 同上（rev 2 漏了這半） |
+| Validity | `thumb_requests_total` / `props_requests_total` 增量 | 皆 > 0 |
 | Functional | `delegating` 次數 | `== 0` |
-| Functional | answered | `== 檔案數` |
+| Functional | thumb answered | `== manifest 長度` |
+| Functional | props 回報 dimensions 的數量 | `== manifest 長度` |
 | Functional | SHA256 | 全中 |
-| UX | 單張 thumb `max` | `< 2 s`（budget）／`>= 5 s` 為 stall |
+| UX | 單張 thumb `max` | budget `2 s`；`>= 5 s` 為 `UX_STALL` |
 
 ### 8.2 類別 B — 大檔（split，多 part）
 
-樣本優先挑各 part `telegram_user_id` **不同**的（跨帳號 split 讀得回來唯一的實證）。
+樣本優先挑各 part `telegram_user_id` **不同**的（跨帳號 split 讀得回來
+唯一的實證）。
 
 1. 冷列舉
-2. **屬性**——用 §6 的 counter 驗證：`download_bytes_total` 增量必須是 **0**。
+2. **屬性**：`download_bytes_total{origin="props"}` 增量必須是 **0**。
    寬高／duration 該來自 Telegram document attributes。
 3. **seek 三處**各讀 1 MiB：頭、**刻意跨 part 邊界的中點**、**尾**
 4. 起播模擬：只讀頭 256 KB
 5. 整檔 SHA256 — `--full-hash` 才做
 
+**跨界檢查需要 oracle（rev 2 沒有）。** part 表只有 message / offset / size，
+**沒有「這一段正確的位元組是什麼」**，所以「與 part 表對得上」是一句沒有
+判定方法的話。改成：
+
+```
+對邊界左右兩側，分別直接讀 part N 的尾端與 part N+1 的開頭
+（繞過 split 層，直接對該 part 的 message 發請求）
+        ↓
+拼成期望的 1 MiB
+        ↓
+與從 H: 讀同一個 logical range 的結果逐位元組比對
+```
+
+這樣 oracle 與被測路徑是兩條獨立的程式路徑，差異才有意義。
+
 **尾端那 1 MiB 是這一類最重要的單一檢查。** 後端 `filesize` 以 512 KB 為單位
 進位（實測多報 523,424 bytes），真實長度在 `file_hash` 的 `:<n>` 後綴。
 `_clip_parts` 若失效，尾端會等一段長 timeout 然後拿到 **0 bytes**——
-那正是非 faststart MP4 無法起播的成因，而且在檔案總覽上完全看不出來。
+那正是非 faststart MP4 無法起播的成因，在檔案總覽上完全看不出來。
 
 | 層 | 指標 | 判準 |
 |---|---|---|
-| Validity | 屬性階段 sweep 是否 idle | 不 idle → 該項 `NOT_MEASURED` |
-| Functional | 屬性階段 `download_bytes_total` 增量 | `== 0` |
+| Functional | 屬性階段 `download_bytes{props}` 增量 | `== 0` |
 | Functional | 尾端 1 MiB | 讀到 1 MiB 真實資料，非 0、非短讀 |
-| Functional | 跨界那次的內容 | 與 backend part 表相符 |
-| UX | 任一 seek | `< 3 s`（budget）／`>= 5 s` 為 stall |
-| UX | 起播 | `< 3 s` |
+| Functional | 跨界 1 MiB | 與 oracle 逐位元組相符 |
+| UX | 任一 seek | budget `3 s`；`>= 5 s` 為 `UX_STALL` |
+| UX | 起播（頭 256 KB） | budget `3 s` |
 
 ### 8.3 類別 C — `/game` 的 zip
 
@@ -358,57 +437,87 @@ rev 1 有三個問題：要求 backend 給不出的資訊、自我矛盾、可�
    （巡檢半沒有本機原檔；CRC32 是 zip 自帶、唯一可離線驗證的真值。
    上傳往返半才用本機素材的 SHA256）
 4. **第二次進同一個 zip**
-5. `POST /rpc/fetch-local` → 解壓驗證，**只在封存 ≤ `--fetch-local-max-bytes`
-   （預設 200 MB）時做**，否則記 `skipped`
+5. **完整虛擬目錄取回**（見下）
+
+**步驟 5 的語意，rev 2 寫錯了。** 產品行為不是「下載整個 `.zip` 再解壓」，
+而是 walk 虛擬樹、**每個 member 各做 range read、直接寫進 `local_dir`**。
+所以這一項測的是**完整虛擬目錄取回**，判定用**每一個 entry 的 CRC32 與大小**，
+不是「解壓出來的 zip 對不對」。
+
+只在封存 ≤ `--fetch-local-max-bytes`（預設 200 MB）時做，否則記 `skipped`。
+
+**`preexisting` 的影響範圍（rev 2 寫反了一部分）**：zip 索引是暖的，
+只影響**該 zip 第一次開啟的 cold-open 量測**。它**不影響**步驟 1
+（列 `/game` 跟某個 zip 的索引暖不暖無關），也**不影響**步驟 4
+（那本來就是暖的第二次開啟）。
+
+**`zip_open_attempts_total` 與 `zip_index_cache_misses_total` 要分開。**
+rev 2 只有後者，於是若 bug 又變成「列 `/game` 對每個 zip 呼叫 lookup」但
+索引全部已暖，remote read 是 0，**counter 仍然 0，bug 隱形**。
+前者在 `ZipView.root()` 被請求時就 +1（不管答案從哪來），**列 `/game` 期間
+它必須是 0**——因為列表根本不該問任何一個封存的樹長什麼樣子。
 
 | 層 | 指標 | 判準 |
 |---|---|---|
-| Validity | `zip_index` 狀態 | `preexisting` → 步驟 1、4 的冷門檻 `NOT_MEASURED` |
-| Functional | 列 `/game` 期間 `zip_index_reads_total` 增量 | `<= 1`。**這個指標比時間更早發現「列表打開每個封存」** |
-| Functional | CRC32 | 相符 |
-| UX | 列 `/game` | `< 1 s` |
-| UX | 第一次進 zip | functional budget `8 s`，**但 `>= 5 s` 仍記 UX stall**（見 §10） |
-| UX | 第二次進同一個 zip | `< 0.1 s` |
+| Validity | `zip_index` 狀態 | `preexisting` → **只有**步驟 2 的 cold-open `NOT_MEASURED` |
+| Functional | 列 `/game` 期間 `zip_open_attempts_total` 增量 | **`== 0`**。這比時間更早發現「列表打開每個封存」 |
+| Functional | 步驟 3 的 CRC32 | 相符 |
+| Functional | 步驟 5 每個 entry 的 CRC32 與大小 | 全中 |
+| UX | 列 `/game` | budget `1 s` |
+| UX | 第一次進 zip | budget `5 s` |
+| UX | 第二次進同一個 zip | budget `0.1 s` |
 
 ### 8.4 壓力情境
 
-**閒置後重訪（`--idle-seconds`，預設 90）**——什麼都不做等 90 秒（Telethon 的
-`_DISCONNECT_EXPORTED_AFTER` 是 60，要確定跨過），再重跑同一批縮圖。這是唯一能抓到
-exported sender 那條坑的方法：實測一份 `bridge.log` 有 248 次
+**閒置後重訪（`--idle-seconds`，預設 90）** — 等 90 秒（Telethon 的
+`_DISCONNECT_EXPORTED_AFTER` 是 60，要確定跨過），再重跑同一批縮圖。
+這是唯一能抓到 exported sender 那條坑的方法：實測一份 `bridge.log` 有 248 次
 `Disconnecting borrowed sender for DC 1`、387 次重連、138 次 `Server closed`。
-**只在樣本含跨 DC 檔案時有意義**，否則 `NOT_MEASURED`。
 
-**冷 COM surrogate（`--cold-surrogate`，預設關）**——`taskkill /f /im dllhost.exe`
-後立刻跑一批。專打 `Settings` race（只在冷載入的頭幾百微秒發作）。
-**順帶解決 §3.2 的 LogPath 問題**：新 surrogate 一定讀得到新設的 `LogPath`。
+**「等了 90 秒」不等於「idle 了 90 秒」（rev 2 漏了）。** `BackgroundWarmup`
+或任何一個 Explorer 視窗只要中途碰 Telegram，exported sender 就沒有真正閒置。
+判定改成：**idle window 前後 `download_requests_total` 全維度都不變**；
+中途有任何活動就 `NOT_MEASURED`。只在樣本含跨 DC 檔案時執行。
 
-**持續負載（`--sustain-minutes`，預設 10）—— rev 1 這裡是壞的。**
-重複瀏覽同一個資料夾，幾輪之後答案全部來自 Windows thumbcache／bridge 的預覽快取／
-rclone VFS，等於在量一個**完全不碰 Telegram 的 workload**。那當然 `flood wait == 0`，
-但它沒有證明任何事。改成兩條 lane：
+**冷 COM surrogate（`--cold-surrogate`，預設關）** — 專打 `Settings` race
+（只在冷載入的頭幾百微秒發作），順帶保證新 surrogate 讀得到新設的 `LogPath`。
+
+**只殺載入了本 DLL 的 `dllhost.exe`（rev 2 的 `taskkill /f /im dllhost.exe`
+會殺全機所有 COM surrogate）。** 用模組清單找出載入 `TeleDriveThumb.dll` 的
+PID，只殺那些；一個都找不到就說「沒有需要殺的 surrogate」而不是照殺。
+
+**持續負載（`--sustain-minutes`，預設 10）** — 兩條 lane：
 
 ```
 背景負載產生器                            前景 UX probe
 持續讀「未快取、不重複」的               每分鐘跑一次固定的
-Telegram byte range                      shell workload
+byte range，**直接打 bridge HTTP**        shell workload，走 H:
         │                                        ▲
         └──────▶ Telegram 連線池 ◀───────────────┘
 ```
 
-要回答的是「**Telegram 正在被持續使用時，Explorer 前景會不會垮**」，
-不是「Explorer 重畫同一批已快取的圖會不會垮」。只有這樣，
-最後一分鐘 / 第一分鐘的**前景** latency ratio 才有意義。
+**背景 lane 必須走 bridge 的 HTTP Range，不能走 `H:`**（rev 2 沒說清楚）——
+走 `H:` 會被 rclone 的 VFS 快取吃掉，於是又回到 rev 1 那個「以為在壓 Telegram，
+其實在壓快取」的問題。前景 lane 才走 `H:`，因為要量的就是 Explorer 的體感。
 
-背景產生器要有 `--sustain-max-bytes` 上限。而且**背景產生器自己撞到 FLOOD_WAIT
-不自動算 finding**——那會讓前景因為「不是 bug 的原因」而 fail。它要記成這次 run 的
-條件（`"background_flood_wait": true`），讓讀報告的人自己判斷。
+**`--sustain-max-bytes` 依 `download_bytes_total` 的實際增量停止**，
+不是依 requested bytes：一個 64 KiB 的讀取會因為 512 KiB block 對齊而
+實際抓更多，照 requested 算會嚴重低估真正燒掉的 Telegram 額度。
 
-**sweep 併發（`--with-sweep`，預設關）**——用 §3.3 的 `warmup.active` 對照
-sweep 活躍與否時的前景延遲。門檻：活躍時的縮圖 `max` 不超過非活躍時的 3 倍。
+背景產生器自己撞到 FLOOD_WAIT **不自動算 finding**——那會讓前景因為
+「不是 bug 的原因」而 fail。記成這次 run 的條件（`"background_flood_wait": true`），
+讓讀報告的人判斷。
+
+**sweep 併發（`--with-sweep`，預設關）** — warmup 的間隔可能是數小時，
+只讀 status 可能一整天都碰不到 `active`。**接受這個情境經常 `NOT_MEASURED`**，
+並在報告附上 `warmup.next_run_at` 讓人自己排時間。
+
+> **不加「觸發 warmup 一次」的端點。** 那會直接違反 §3.0 的唯讀不變量，
+> 而這個情境的價值不足以換掉那條不變量。
 
 ---
 
-## 9. 上傳往返半（`live_shell_roundtrip.py`）
+## 9. 上傳往返半
 
 ### 9.1 素材
 
@@ -425,112 +534,133 @@ sweep 活躍與否時的前景延遲。門檻：活躍時的縮圖 `max` 不超�
 
 預設總計約 **11 MB**。
 
-### 9.2 流程
+### 9.2 流程與「完成」的定義
 
 Preflight → 建 `H:\_roundtrip-<時間戳>\`（全新名字，`windows_thumb` 因此是
-**確定的 cold**，這是 §5 裡少數能確定的一格）→ 寫入 → 等 `/rpc/status` 的
-`uploads` 排空 → 用 `tdapi` 確認 row 存在且 `has_thumbnail` 正確 →
+**確定的 cold**，§5 裡少數能確定的一格）→ 寫入 → **等待完成** →
 `/rpc/forget` → 跑 §8 的三類 → 清理。
 
-### 9.3 清理（rev 1 的前提是錯的）
+**「等 `uploads` 排空」不夠（rev 2 的定義是壞的）。** `/game` 走 `GameStager`，
+先 debounce、再 `packing`、再 `uploading`，而 `/rpc/status` 的 `uploads`
+是**一般路徑**的佇列。一般佇列空掉時 `gamezip` 可能連打包都還沒開始。
 
-rev 1 寫「backend row 清不掉」。**錯。** `tdapi.trash(file_id)` 是
-`DELETE /files/{file_id}`，backend 在整棵子樹蓋 `trashed_at`，
-Telegram 訊息不動，正常 listing 預設排除 trashed row。
+完成的定義是**兩個條件同時成立**：
+
+1. `/rpc/status` 的 `uploads` 為空
+2. `/rpc/status` 的 `/game` `units` 裡，這次建立的那個 unit 已完成或消失
+
+再加上 backend 真的查得到 row 且 `has_thumbnail` 正確（圖 `True`、zip `False`）。
+
+### 9.3 清理
+
+`TeleDriveClient.trash(file_id)` 是 `DELETE /files/{file_id}`，backend 在整棵
+子樹蓋 `trashed_at`，Telegram 訊息不動，正常 listing 預設排除 trashed row。
 
 ```
 自動清：
   - 本機素材 temp dir
   - POST /rpc/forget
-  - rclone rc vfs/forget dir=<folder>  ＋ 刪 <cache_dir>\rclone\vfs\ 對應檔
+  - rclone rc vfs/forget dir=<folder> ＋ 刪 <cache_dir>/rclone/vfs/ 對應檔
   - HKCU\...\LogPath 還原（含「原本就沒有這個值」的情況）
-  - probe 子樹 → tdapi.trash(<probe folder root_id>)
+  - probe 子樹          → trash(<probe folder root_id>)
+  - /game/<name>.zip    → trash(<那一筆>)   ← 它不在 probe 子樹底下
 
 永久 residue：
-  - Telegram 訊息（送出即永久，這是唯一真的清不掉的）
+  - Telegram 訊息（送出即永久，唯一真的清不掉的）
 ```
 
-**兩個邊界要處理：**
+**`gamezip` 打包後是 `/game/<name>.zip`，不在 probe 資料夾底下**，
+trash 根目錄清不到，必須單獨一筆。
 
-- **`gamezip` 打包後是 `/game/<name>.zip`，不在 probe 資料夾底下**，
-  trash 根目錄清不到它。要單獨 trash 那一筆。
-- **trashed row 與 `check_hash` 去重的互動未知。** 下一次跑同樣位元組會不會
-  命中一筆已 trash 的 row（然後沿用它的 `has_thumbnail`、或註冊失敗）？
-  **實作時必須實測並記錄結果**，這會決定 `--reuse-folder` 能不能跟 trash 並存。
+**去重的疑問已解，但有一個 review 沒展開的後果。** review 核對過 backend 的
+hash lookup SQL 帶 `trashed_at IS NULL`，所以 trashed row 不會被 dedup 命中。
+連帶結果：**trash 會打掉 `--reuse-folder` 的「零新增位元組」性質**
+（下一次跑會真的重傳）。所以 `--reuse-folder` 與清理必須互斥，見 §9.4。
 
-- `uploads/` 若有殘留**不刪**——上傳失敗時那是唯一副本。報告點名，交給人決定。
+**`--purge` 是 opt-in，不是預設。** review 指出 backend 另有
+`DELETE /files/{id}/purge`（只永久刪 metadata，不碰 Telegram）。
+**這個 repo 驗不到那個端點**——沒有對應的 client 方法，端點在 backend repo。
+所以：預設只 trash；`--purge` 才進一步永久刪；**preflight 探測該端點，
+不存在就退回 trash 並說明**。一個 audit 工具預設永久刪 metadata 是壞的預設。
 
-報告：
+`uploads/` 若有殘留**不刪**——上傳失敗時那是唯一副本。報告點名，交給人決定。
 
 ```json
 "remote_residue": {
   "backend_visible_rows": 0,
+  "backend_trashed_rows": 14,
+  "purged": false,
   "telegram_messages": [{"name": "...", "message_id": 12345, "file_id": "..."}]
 }
 ```
 
 ### 9.4 `--reuse-folder <name>`
 
-固定資料夾重複跑，同名覆寫命中去重，第二次起零新增位元組。
-**定義為「不 trash」**，當長期 regression fixture 用。
+固定資料夾重複跑，同名覆寫命中去重，第二次起零新增位元組，
+當長期 regression fixture 用。
+
+**`--reuse-folder` 蘊含不 trash、不 purge，且與 `--purge` 互斥**
+（trash 過的 row 不會被 dedup 命中，零位元組的前提就沒了）。
 代價是 `windows_thumb` 已暖，所有冷門檻 `NOT_MEASURED`。
 
 ---
 
-## 10. Severity 模型
-
-rev 1 的全域 `<5s` 與類別 C 的 `<8s` 直接矛盾：6.5 秒同時 PASS 又是 finding。
-最上層的問題是「不應該一直轉」，所以 **global stall budget 優先**，
-但**功能正確性與體驗要分開記**：
+## 10. Severity
 
 ```
-FAIL          functional 錯了（bytes 不對、覆蓋不完整、answered 不足）
+FAIL          functional 錯了（bytes 不對、覆蓋不完整、answered 不足、CRC 不符）
 UX_STALL      >= 5 s，使用者感知得到的停頓
 SLOW          超過該 subsystem 的 budget，但 < 5 s
 OK            在 budget 內
 NOT_MEASURED  validity 不成立（§4）
 ```
 
-一筆量測可以同時是 `OK`（functional）與 `UX_STALL`（體驗）。類別 C 冷開 zip
-6.5 秒就是這一格：
+**時間不進 functional 判定。** rev 2 把 zip 冷開的 8 秒叫做「functional budget」，
+那仍然混淆了兩件事——9 秒但位元組完全正確**不是** correctness 失敗。
+correctness 只管內容；時間只有 `OK` / `SLOW` / `UX_STALL`。
 
-```
-class_C.cold_open: functional_budget=8s → OK
-                   ux_budget=5s        → UX_STALL
-```
+一筆量測可以同時是 functional `OK` 與 `UX_STALL`：類別 C 冷開 zip 6.5 秒
+正是這一格。**這不是雙重標準，是兩個不同的問題**——把它們壓成一個布林
+會讓其中一個永遠被隱藏。
 
-**這不是雙重標準，是兩個不同的問題。** 「技術上這個成本合理」與
-「使用者會覺得卡」可以同時為真，而把它們壓成一個布林會讓其中一個永遠被隱藏。
-
-### 10.1 `warm/cold` ratio 降為 diagnostic
+### 10.1 `warm/cold` ratio 是 diagnostic，不是 gate
 
 rev 1 把 `>= 20x` 當硬門檻。兩個反例足以推翻：
 
 | | cold | warm | ratio | 實際體驗 |
 |---|---|---|---|---|
-| 最佳化之後 | 180 ms | 25 ms | 7.2× | 很好，但 rev 1 判 FAIL |
-| 冷路徑很糟 | 10 s | 0.4 s | 25× | 很差，但 rev 1 判 PASS |
+| 最佳化之後 | 180 ms | 25 ms | 7.2× | 很好，卻判 FAIL |
+| 冷路徑很糟 | 10 s | 0.4 s | 25× | 很差，卻判 PASS |
 
-ratio 保留在報告裡，用來判斷**快取有沒有產生效果**（接近 1 就是快取沒生效，
-那是個值得知道的事實），但**不單獨產生 finding**。
-**user-facing gate 一律是絕對延遲。**
+ratio 保留在報告，用來判斷**快取有沒有產生效果**（接近 1 就是沒生效，
+那是值得知道的事實），但不單獨產生 finding。**user-facing gate 一律是絕對延遲。**
 
-### 10.2 總門檻表
+### 10.2 統計量
 
-| 面向 | UX budget | Functional budget |
+**hard gate 一律用 `max`。** p95 只有在 **N ≥ 20** 時才報告；
+少於 20 就輸出 `"p95": null, "p95_note": "insufficient samples (n=8)"`。
+3 次或 8 次的「p95」實際上就是 `max`，掛一個統計學的名字只會讓人以為
+它比實際更穩健。
+
+### 10.3 門檻表
+
+| 面向 | UX budget | Functional |
 |---|---|---|
 | **任何單一操作** | **`< 5 s`**（超過 = `UX_STALL`） | — |
 | `delegating` | — | `== 0` |
 | `Server closed the connection` | — | `== 0` |
 | 開已快取資料夾 | `< 0.05 s` | — |
-| 開未快取資料夾 p95 | `< 1 s` | — |
-| 單張縮圖 max | `< 2 s` | — |
-| 列 `/game` | `< 1 s` | `zip_index_reads <= 1` |
-| 第一次進 zip | `< 5 s` | `< 8 s` |
+| 開未快取資料夾 | `< 1 s`（max） | — |
+| 單張縮圖 | `< 2 s`（max） | answered == manifest 長度 |
+| 屬性 | — | dimensions == manifest 長度 |
+| 列 `/game` | `< 1 s` | `zip_open_attempts 增量 == 0` |
+| 第一次進 zip | `< 5 s` | — |
 | 第二次進同一個 zip | `< 0.1 s` | — |
 | 大檔任意 seek | `< 3 s` | — |
-| 大檔屬性階段 | — | `download_bytes 增量 == 0` |
+| 大檔屬性階段 | — | `download_bytes{props} 增量 == 0` |
 | 大檔尾端 1 MiB | — | 讀到真實資料 |
+| 大檔跨界 1 MiB | — | 與 oracle 逐位元組相符 |
+| 虛擬目錄完整取回 | — | 每個 entry 的 CRC32 與大小全中 |
 | 前景延遲在持續負載下的衰退 | `< 30%` | — |
 | SHA256 / CRC32 | — | 相符 |
 | `warm/cold` ratio | *diagnostic only* | *diagnostic only* |
@@ -547,12 +677,13 @@ ratio 保留在報告裡，用來判斷**快取有沒有產生效果**（接近 
 | 檢查 | 怎麼查 | 不過的訊息 |
 |---|---|---|
 | bridge 活著 | `GET /rpc/health` | 先跑 `start.bat` |
-| `cryptg` | `/rpc/health` 的新欄位（§3.3） | 少了它解密把下載壓在 ~0.15 MiB/s，量什麼都沒意義 |
+| `cryptg` | `/rpc/health` 的新欄位 | 少了它解密把下載壓在 ~0.15 MiB/s，量什麼都沒意義 |
 | `H:` 掛著 | `cfg.mount_drive` 存在 | 沒掛載時 `SHCreateItemFromParsingName` 微秒級失敗，log 上跟「handler 答錯了」一模一樣 |
 | rclone rc 通 | `POST 127.0.0.1:5572/rc/noop` | 少了 `--rc-no-auth` 會回 `403 authentication must be set up` |
-| `isolate.exe` 支援 `--jsonl` | 跑一次 `--help` | 先跑 `shellthumb\buildbench.bat` |
-| DLL 版本支援 LogPath 重讀 | 設 `LogPath` → 等 2 秒 → 用一個已知檔案 probe | 先跑 `shellthumb\build.bat`（需先 `taskkill /f /im dllhost.exe`） |
-| `/rpc/counters` 存在 | `GET` | bridge 是舊版，先 `restart.bat` |
+| **`isolate --jsonl` 輸出合法 UTF-8 JSONL** | 對一個已知的非 ASCII 檔名跑一次，解析回來比對 | 這就是 C++ 那半的 harness（§3.0）。先跑 `shellthumb\buildbench.bat` |
+| **DLL 的 LogPath 會重讀** | 設 `LogPath` → 等 2 秒 → probe 一個已知檔案 → 看有沒有出現記錄 | 同上。先 `shellthumb\build.bat`（需先殺載入本 DLL 的 dllhost） |
+| `/rpc/counters` 與 `/rpc/cache-state` 存在 | `GET` | bridge 是舊版，先 `restart.bat` |
+| `/files/{id}/purge` 是否存在 | 僅在 `--purge` 時探測 | 不存在就退回 trash 並說明（§9.3） |
 | DLL 已註冊 | HKCU 的 ProgID 與 `SystemFileAssociations` | 先跑 `install_thumb.py` |
 | `bridge.log` 讀得到 | `cfg.cache_dir / "bridge.log"` | 沒有 log 就沒有 positive evidence |
 
@@ -564,10 +695,8 @@ ratio 保留在報告裡，用來判斷**快取有沒有產生效果**（接近 
 {
   "generated": "2026-09-19T15:30:12",
   "mount": "H:",
-  "measurement": {
-    "valid": false,
-    "invalid_reasons": ["DLL logging was not active in the existing COM surrogate"]
-  },
+  "target_tree": {"branch": "...", "head": "aa59943"},
+  "summary": {"ok": 11, "slow": 2, "ux_stall": 1, "fail": 0, "not_measured": 3},
   "cache_state": {
     "api_metadata": "cold", "zip_index": "preexisting",
     "thumb_cache": "cold", "props_cache": "warm",
@@ -575,25 +704,44 @@ ratio 保留在報告裡，用來判斷**快取有沒有產生效果**（接近 
   },
   "discovery": {"truncated": false, "folders_scanned": 87, "seconds": 12.4},
   "samples": {"small": "...", "big": "...", "zip": "...", "crossdc": null},
-  "classes": {"A": {"metrics": {}, "verdicts": {}}, "B": {}, "C": {}},
-  "stress": {
-    "idle_revisit": {"status": "NOT_MEASURED", "why": "no cross-DC sample"},
-    "cold_surrogate": {}, "sustain": {"background_flood_wait": false},
-    "with_sweep": {}
-  },
+  "operations": [
+    {"op": "class_A.thumb_cold", "validity": "valid",
+     "metrics": {"max_s": 7.4, "p95_s": null,
+                 "p95_note": "insufficient samples (n=12)"},
+     "verdicts": {"functional": "OK", "ux": "UX_STALL"}},
+    {"op": "class_B.props_no_bytes", "validity": "not_measured",
+     "why": "BackgroundWarmup was active during the window"}
+  ],
   "counters": {"before": {}, "after": {}},
-  "warmup_active_during": {"class_B_props": false},
-  "findings": [
-    {"class": "A", "layer": "ux", "metric": "thumb_max_s",
-     "observed": 7.4, "budget": 2.0, "severity": "UX_STALL",
-     "means": "shell 讀了整張原圖"}
-  ]
+  "stress": {
+    "idle_revisit": {"validity": "not_measured",
+                     "why": "download_requests moved during the idle window"},
+    "sustain": {"background_flood_wait": false,
+                "background_bytes": 2147483648}
+  },
+  "warmup": {"active_during": {"class_B_props": false},
+             "next_run_at": "2026-09-20T02:00:00"},
+  "findings": []
 }
 ```
 
-**Exit code**：`0` 全過、`1` 有 finding、`2` preflight 失敗、
-**`3` 有 `NOT_MEASURED` 但沒有 finding**——「跑了但有些沒量到」必須跟
-「跑了而且都好」區分開，否則 §4 的整個設計會被一個 `exit 0` 抹平。
+### 12.1 `means` 的紀律
+
+rev 2 的範例把 `thumb_max=7.4s` 標成「shell 讀了整張原圖」。
+**那個數字本身推不出那個結論。**
+
+> **因果解讀只有在同時看到 `delegating`，或看到明確的 byte evidence
+> （`download_bytes{origin}` 的增量與原圖大小相當）時才寫。**
+> 否則 `means` 留空，只報「慢」。
+
+一個可信度很高但其實是猜的因果，比沒有解讀更糟——它會讓人去修錯的東西。
+
+### 12.2 Exit code
+
+`0` 全過、`1` 有 finding、`2` preflight 失敗、
+**`3` 有 `NOT_MEASURED` 但沒有 finding**。
+「跑了但有些沒量到」必須跟「跑了而且都好」分開，
+否則 §4 的整個 validity 模型會被一個 `exit 0` 抹平。
 
 ---
 
@@ -603,22 +751,26 @@ ratio 保留在報告裡，用來判斷**快取有沒有產生效果**（接近 
 
 | 檔案 | 內容 |
 |---|---|
-| `scripts/_liveprobe.py` | `ShellDriver`（JSONL）／`DllLog`／`BridgeLog`／`Counters`／`CacheState`／`Validity`／`Severity`／`Report` |
+| `scripts/_liveprobe.py` | `ShellDriver`（JSONL + manifest）／`DllLog`／`BridgeLog`／`Counters`／`CacheState`／`Validity`／`Severity`／`Report` |
 | `scripts/live_browse_audit.py` | 唯讀巡檢 |
 | `scripts/live_shell_roundtrip.py` | 上傳往返 |
-| `tests/test_liveprobe.py` | 見 §14 |
+| `tests/test_liveprobe.py` | §14 |
 | `tests/live/test_shell_roundtrip.py` | opt-in 包裝 |
 
-**修改（唯讀 diagnostics，不改行為）**
+**修改（唯讀 diagnostics，不改行為）** — symbol 在兩棵樹的落點不同：
 
-| 檔案 | 改動 | 收尾 |
-|---|---|---|
-| `shellthumb/isolate.cpp` | `--jsonl` 逐檔 stderr | `shellthumb\buildbench.bat` |
-| `shellthumb/TeleDriveThumb.cpp` | `Log()` 的 path 加 2 秒 TTL | `shellthumb\build.bat`（先 `taskkill /f /im dllhost.exe`） |
-| `_bridge_legacy.py` | `_health` 加 `cryptg`；`_status` 加 `warmup`；新增 `/rpc/counters`；`RpcApp` 收 `BackgroundWarmup` | `pytest tests -q` → `restart.bat` |
-| `_tgio_legacy.py` | 兩處 `iter_download`（`:665`、`:795`）加 counter | 同上 |
-| `warmup.py` | `BackgroundWarmup.status()` | 同上 |
-| `CLAUDE.md` | 「測試」節加這兩支；手動清單標註哪幾項現在有腳本代跑 | — |
+| Symbol / 改動 | `master` | `feat/current-backend-storage-parity` | 收尾 |
+|---|---|---|---|
+| `isolate` 的 `--jsonl` / `--manifest` | `shellthumb/isolate.cpp` | 同左 | `shellthumb\buildbench.bat` |
+| `Log()` 的 SRWLOCK + TTL | `shellthumb/TeleDriveThumb.cpp` | 同左 | `shellthumb\build.bat`（先殺載入本 DLL 的 dllhost） |
+| `RpcApp._health` / `_status`／新增 `/rpc/counters`、`/rpc/cache-state`／`RpcApp` 收 `BackgroundWarmup` | `bridge.py` | `_bridge_legacy.py` | `pytest tests -q` → `restart.bat` |
+| `tgio` 兩個 `iter_download` 呼叫點加 origin-tagged counter | `tgio.py` | `_tgio_legacy.py` | 同上 |
+| `Entry` / `_to_entry()` 納入 `telegram_media_kind`、`telegram_chat_id` | `tdapi.py` | `_tdapi_legacy.py`（本 branch 的 parity 層已消費這些欄位） | 同上 |
+| `BackgroundWarmup.status()` | `warmup.py` | 同左 | 同上 |
+| 「測試」節加這兩支；手動清單標註哪幾項有腳本代跑 | `CLAUDE.md` | 同左 | — |
+
+**實作前要先確定落在哪一棵樹上。** 兩棵的 symbol 相同、檔名不同；
+`d0f63b2` 之後的薄層架構若會 merge，就直接以 branch 為準。
 
 ---
 
@@ -627,20 +779,27 @@ ratio 保留在報告裡，用來判斷**快取有沒有產生效果**（接近 
 `tests/test_liveprobe.py`（進 `pytest tests -q`）：
 
 - `ShellDriver` 解析 JSONL：含非 ASCII 路徑、**逾時被 kill 的殘缺輸出仍說得出做到哪一張**
-- `DllLog` 解析；**還原「原本沒有這個登錄值」的情況**
+- `ShellDriver` 產生的 manifest 只含符合條件的靜態圖
+- `DllLog` 解析 thumb 與 props 兩種記錄；**還原「原本沒有這個登錄值」的情況**
 - `BridgeLog` 只讀新增區段
-- `Counters` 的差值計算，以及 **sweep 活躍時標成 `NOT_MEASURED` 而不是 fail**
-- `CacheState` 的 `cold` / `warm` / `preexisting` / `unknown` 判定
-- **`Validity` 不成立時 metrics 不進 threshold evaluator**（這是 §4 的核心不變量，
-  也是最容易寫錯的一條）
-- `Severity` 的三級判定，特別是**同一筆同時 `OK`(functional) 與 `UX_STALL`(ux)**
+- `Counters` 的**每個 origin 各自**差值計算
+- `CacheState` 的 `cold` / `warm` / `preexisting` / `unknown` 判定，
+  **包含「磁碟沒有但記憶體有 → warm」**
+- **`Validity` 不成立時 metrics 不進 threshold evaluator**，且**是 per-operation
+  的，一個 op 失效不影響其他 op**（§4 的核心不變量，最容易寫錯的一條）
+- `Severity` 三級，特別是**同一筆同時 functional `OK` 與 `UX_STALL`**
 - `warm/cold` ratio **不**產生 finding
+- **p95 在 N < 20 時輸出 `null` 加說明，不輸出一個數字**
+- **`means` 在沒有 `delegating` 也沒有 byte evidence 時留空**
 - 報告不含憑證
 
-diagnostics 那半（§3.4）：
+diagnostics 側（§3.4）：
 
-- counter 的離線測試，斷言「做了 N 次讀取，counter 剛好加 N」
+- 每個 counter 的離線測試：「做了 N 次讀取，該 origin 的 counter 剛好加 N」
 - `warmup.status()` 的狀態機
+- `/rpc/cache-state` 對 memory-only 與 disk-only 兩種情況的回答
+
+**C++ 那兩項沒有離線測試**，由 §11 的 preflight 每次執行前驗證（§3.0）。
 
 **巡檢半整體只能靠真的跑一次**——這是它存在的全部理由。
 
@@ -651,6 +810,9 @@ diagnostics 那半（§3.4）：
 - **不清 Windows 的 `thumbcache_*.db`**、**不重啟 `explorer.exe`**、
   **不殺 rclone、不卸載 `H:`**：影響 `H:` 以外的全機使用，而且開一個新資料夾
   就得到同樣乾淨的冷狀態。
+- **不殺全部的 `dllhost.exe`**：只殺載入了本 DLL 的 PID（§8.4）。
+- **不加「觸發 warmup」的端點**：違反唯讀不變量，價值不足以換（§8.4）。
+- **不預設 purge**：opt-in，且端點存在與否要探測（§9.3）。
 - **不刪 Telegram 訊息**：做不到。
 - **不改任何資料路徑或產品行為**：只加唯讀 diagnostics（§3.0）。
 - **不做 GUI、趨勢圖、歷史比較**：一次跑出一個判定就是全部的產出。
