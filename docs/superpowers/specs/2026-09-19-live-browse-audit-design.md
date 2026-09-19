@@ -1,6 +1,10 @@
 # 真實 `H:` 巡檢與上傳往返探測 — 設計
 
-**日期：** 2026-09-19（rev 3）
+**日期：** 2026-09-19（rev 3.1）
+
+**實作 base：** `feat/current-backend-storage-parity` @ `39ad472`（vs `master` ahead 40 / behind 0）。
+Audit 實作走 `feat/live-browse-audit`，**不與 parity 的修復 commit 混在同一條開發線**。
+既存測試失敗記在 `tests/known_failures.txt`（77 筆），以便分辨 audit 弄壞的與本來就紅的。
 
 **狀態：** Proposed
 
@@ -187,9 +191,14 @@ audit 寫入 HKCU\...\LogPath
 ### 3.4 diagnostics 自己的防線
 
 - 每個 counter 都要有離線測試，斷言「做了 N 次讀取，counter 剛好加 N」。
-- counter 植入點**只有兩處**：`tgio` 裡 `_thumbnail_bytes` 與 `_chunk` 的
-  `iter_download` 呼叫——這是整個 repo 僅有的兩個。**植在更上層的便利函式會漏，
+- **記帳點**只有兩處：`_thumbnail_bytes` 與 `_chunk` 的 `iter_download` 呼叫——
+  這是整個 repo 僅有的兩個 wire I/O 點。**植在更上層的便利函式會漏，
   而漏掉的方向正好是假通過。**
+- **但 origin 的傳遞是跨 seam 的。** canonical 的入口
+  （`read_location()` / `thumbnail_location()`）在薄層 `tgio.py`，最後才呼叫到
+  inherited 的 `_read()` / `_thumbnail_bytes()`；legacy Saved Messages 的入口
+  則在 legacy 那邊。所以「只改 legacy 檔」會讓 canonical 那條路徑的 origin
+  永遠是預設值——**又是一個只會靜靜給錯答案、不會報錯的漏法**。
 - `/rpc/counters` 與 `/rpc/cache-state` 不得出現任何憑證，跟 `/rpc/status` 同規矩。
 
 ---
@@ -243,14 +252,35 @@ correctness 失敗）。見 §10。
 `_root` 已 memo——**磁碟上沒有索引檔也照樣是暖的**。rev 2 用檔案存在與否判定，
 會把 warm 判成 cold，然後給出一個漂亮又錯誤的「冷開 0.08 秒」。
 
-所以改由 bridge 回答：
+所以改由 bridge 回答，**而且 audit 傳路徑，不傳 key**：
 
 ```
-GET /rpc/cache-state?key=<entry key>&kinds=zip,thumb,props,listing
+GET /rpc/cache-state?path=H:\...\foo.zip&kinds=zip,thumb,props,listing
 → {"zip": {"memory": true, "disk": true},
    "thumb": {"memory": false, "disk": false},
    ...}
 ```
+
+bridge 自己走 `resolve(path)` → `entry` → `Resolver._cache_key(entry)` →
+檢查 `Resolver._zips` / `ZipView._root` / `ShardedJsonStore._memory` / 磁碟。
+
+**audit 不可以自己算 key。** 這條 branch 的 cache key 不再是
+`telegram_user_id-file_id`，而是：
+
+```
+current backend physical location
+  → current_parts(entry)
+  → physical_location_key(part.location)
+  → ordered set hash
+  → loc3-<sha256>
+```
+
+而且 `_cache_key(entry)` **每次都會重新向 backend 取得目前的 physical row**。
+client 手上算出來的 key 因此隨時可能跟 bridge 此刻認定的 authoritative
+physical location 不一致——而「physical location 會更新」正是這條 branch
+存在的理由之一。用一個過期的 key 去問快取狀態，答案會是
+「沒快取」，audit 於是把一個暖的東西當成冷的量，**這正是本節要防的那個錯誤，
+只是換了一條路徑發生**。
 
 Python 端據此推出 `cold` / `warm` / `unknown`：
 
@@ -764,7 +794,7 @@ rev 2 的範例把 `thumb_max=7.4s` 標成「shell 讀了整張原圖」。
 | `isolate` 的 `--jsonl` / `--manifest` | `shellthumb/isolate.cpp` | 同左 | `shellthumb\buildbench.bat` |
 | `Log()` 的 SRWLOCK + TTL | `shellthumb/TeleDriveThumb.cpp` | 同左 | `shellthumb\build.bat`（先殺載入本 DLL 的 dllhost） |
 | `RpcApp._health` / `_status`／新增 `/rpc/counters`、`/rpc/cache-state`／`RpcApp` 收 `BackgroundWarmup` | `bridge.py` | `_bridge_legacy.py` | `pytest tests -q` → `restart.bat` |
-| `tgio` 兩個 `iter_download` 呼叫點加 origin-tagged counter | `tgio.py` | `_tgio_legacy.py` | 同上 |
+| origin-tagged counter：wire I/O 在 `_thumbnail_bytes()` / `_chunk()`，**但 origin 要從入口一路傳下來**——canonical 的 `read_location()` / `thumbnail_location()` 在薄層，legacy Saved Messages 的入口在 legacy | `tgio.py` | **`tgio.py` ＋ `_tgio_legacy.py`（跨 seam）** | 同上 |
 | `Entry` / `_to_entry()` 納入 `telegram_media_kind`、`telegram_chat_id` | `tdapi.py` | `_tdapi_legacy.py`（本 branch 的 parity 層已消費這些欄位） | 同上 |
 | `BackgroundWarmup.status()` | `warmup.py` | 同左 | 同上 |
 | 「測試」節加這兩支；手動清單標註哪幾項有腳本代跑 | `CLAUDE.md` | 同左 | — |
