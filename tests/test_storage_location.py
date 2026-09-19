@@ -96,3 +96,46 @@ def test_parse_pre_schema_row_uses_explicit_legacy_location():
         "filesize": 12,
     })
     assert loc == LegacySavedMessagesLocation(0, 8, "old", 12)
+
+
+@pytest.mark.parametrize("version", [0, "0"])
+def test_default_zero_version_does_not_require_canonical_media(version):
+    loc = parse_file_location({
+        "file_id": "old", "telegram_user_id": 42,
+        "telegram_message_id": 8, "filesize": 12,
+        "location_version": version, "telegram_chat_id": None,
+        "telegram_media_kind": None, "telegram_media_id": None,
+        "telegram_media_size": None,
+    })
+    assert loc == LegacySavedMessagesLocation(42, 8, "old", 12)
+
+
+@pytest.mark.parametrize("chat", [None, "-100123"])
+def test_complete_media_accepts_initial_zero_location_version(chat):
+    row = {
+        "file_id": "f", "telegram_user_id": 42, "telegram_chat_id": chat,
+        "telegram_message_id": 8, "telegram_media_kind": "document",
+        "telegram_media_id": "9001", "telegram_media_size": 12,
+        "location_version": 0,
+    }
+    loc = parse_file_location(row)
+    assert loc == FileLocation(chat, 42, 8, "document", "9001", 12, None, 0)
+    assert physical_location_key(loc) != physical_location_key(replace(loc, location_version=1))
+    with pytest.raises(LocationMetadataError):
+        parse_file_location({**row, "location_version": -1})
+
+
+@pytest.mark.parametrize("extra", [
+    {"telegram_chat_id": "-100123"},
+    {"telegram_media_kind": "document"},
+    {"location_version": 1},
+    {"location_version": -1},
+    {"location_version": "invalid"},
+])
+def test_partial_or_invalid_identity_is_not_downgraded_to_legacy(extra):
+    with pytest.raises(LocationMetadataError):
+        parse_file_location({
+            "file_id": "f", "telegram_user_id": 42,
+            "telegram_message_id": 8, "filesize": 12,
+            "location_version": 0, **extra,
+        })

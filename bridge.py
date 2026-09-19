@@ -199,6 +199,7 @@ def _needs_warming(self, entry):
 
 
 Resolver.fresh_parts = _fresh_parts
+Resolver._fresh_parts = _fresh_parts
 Resolver._cache_key = _cache_key
 Resolver.open_remote = _open_remote
 Resolver._thumb_path = _thumb_path

@@ -30,8 +30,12 @@ def parse_file_location(row: dict):
     if not isinstance(row, dict):
         raise LocationMetadataError("file location row must be an object")
     chat_id = row.get("telegram_chat_id")
-    canonical_fields = ("telegram_media_kind", "telegram_media_id", "telegram_media_size", "telegram_photo_variant", "location_version")
-    canonical = _present(chat_id) or any(_present(row.get(name)) for name in canonical_fields)
+    canonical_fields = ("telegram_media_kind", "telegram_media_id", "telegram_media_size", "telegram_photo_variant")
+    # The backend defaults location_version to zero, including rows without
+    # canonical media metadata. That default alone is not a format marker.
+    raw_version = row.get("location_version")
+    version_evidence = _present(raw_version) and raw_version not in (0, "0")
+    canonical = _present(chat_id) or version_evidence or any(_present(row.get(name)) for name in canonical_fields)
     message_id = row.get("telegram_message_id", row.get("message_id"))
     if not canonical:
         if message_id is None or not _present(row.get("file_id")):
@@ -64,7 +68,7 @@ def parse_file_location(row: dict):
         size, version, message_id = int(required["telegram_media_size"]), int(required["location_version"]), int(message_id)
     except (TypeError, ValueError) as exc:
         raise LocationMetadataError("canonical location has non-numeric id/size/version") from exc
-    if size < 0 or version < 1:
+    if size < 0 or version < 0:
         raise LocationMetadataError("canonical location has invalid size/version")
     variant = row.get("telegram_photo_variant")
     if kind == "photo" and not _present(variant):
