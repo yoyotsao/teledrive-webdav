@@ -1,6 +1,6 @@
 # 真實 `H:` 巡檢與上傳往返探測 — 設計
 
-**日期：** 2026-09-19（rev 3.1）
+**日期：** 2026-09-19（rev 3.2）
 
 **實作 base：** `feat/current-backend-storage-parity` @ `39ad472`（vs `master` ahead 40 / behind 0）。
 Audit 實作走 `feat/live-browse-audit`，**不與 parity 的修復 commit 混在同一條開發線**。
@@ -59,6 +59,23 @@ rev 2 寫了 `_tdapi_legacy.py:819` 這種定位，review 指出 master 上沒�
 | 22 | 「每項 diagnostics 都有離線測試」涵蓋不到 C++ | §3.0 縮小宣稱，preflight 即 harness |
 
 三項不照 review 的建議走，理由見 §9.3（purge）、§8.4（sweep 觸發）、§3.0（C++ 測試）。
+
+### 0.3 rev 3.2 追加
+
+實作計畫 review 指出六件在 rev 3 還會造成假量測的事：
+
+| # | 問題 | 本版 |
+|---|---|---|
+| 23 | named counter 只定義不接線，永遠是 0 —— §8.3 的 `/game` 檢查因此**無條件通過** | §6.1b 列出四個 bump 點 |
+| 24 | origin 只穿過 `tgio` seam，沒穿過 request 來源 | §6.1 補完整 provenance chain 與 `ZipView` 的 per-call origin |
+| 25 | 成功才記一筆，retry 與失敗 attempt 不算 | §6.1a 拆 `record_request` / `record_bytes`，記在 attempt 上 |
+| 26 | `resolve()` 收段落串列、回 `Loc` 不是 `Entry`；`_cache_key()` 與 `_thumb_path()` 各打一次 backend | §5 改在薄層一次算完，legacy 只做 HTTP |
+| 27 | `key in Resolver._zips` 不等於 warm —— 列 `/game` 就會建 view | §5 改判 `view._root is not None` |
+| 28 | `JsonStore` 是 `_data` + 單一 `_path`，跟 `ShardedJsonStore._memory` 不同 | §5 兩個 store 分開實作，不共用 helper |
+
+另外三點是 review 之外補的：**`origin` 的預設值一律 `unknown`**（冒充 `dav_read`
+是最難發現的錯標）、**`unknown` 非零即 validity 失敗**（§4）、
+**baseline 的 failure signature 要正規化**（否則記憶體位址與行號讓它每次都「變了」）。
 
 ---
 
@@ -227,6 +244,8 @@ audit 寫入 HKCU\...\LogPath
 
 top-level 只做 summary：`"valid_ops": 14, "not_measured": 3`。
 
+**一條全域的 validity 規則：量測窗內 `download_requests_total["unknown"]` 的增量必須是 0。** 非零代表還有 call site 沒有標 origin，於是那個窗裡「某個 origin 是 0」這種斷言全部失去意義——它可能只是流量被記到 `unknown` 去了。
+
 第 3 層與第 4 層**分開產生 finding**，而且**時間不得出現在 functional 判定裡**
 （rev 2 的「functional budget 8s」仍然混淆了兩者——9 秒但位元組完全正確不是
 correctness 失敗）。見 §10。
@@ -261,8 +280,31 @@ GET /rpc/cache-state?path=H:\...\foo.zip&kinds=zip,thumb,props,listing
    ...}
 ```
 
-bridge 自己走 `resolve(path)` → `entry` → `Resolver._cache_key(entry)` →
-檢查 `Resolver._zips` / `ZipView._root` / `ShardedJsonStore._memory` / 磁碟。
+bridge 自己走 `dav_path_from_windows(path)` → `resolve(segments) -> Loc` →
+`loc.entry` → 檢查記憶體與磁碟。（`Resolver.resolve()` 收的是路徑**段落串列**、
+回的是 `Loc` 不是 `Entry`；解不出 entry 要明確回 4xx，不要回一個看起來像
+「沒快取」的答案。）
+
+**實作要落在薄層 `bridge.py`，不是 `_bridge_legacy.py`。** 這條 branch 的
+cache identity 只有薄層知道：`_cache_key()` 與 `_thumb_path()` **各自**呼叫
+`_fresh_parts()` → `api.current_parts(entry)`，也就是各打一次 backend。
+照 legacy 那邊直覺實作，一個 `/rpc/cache-state` 回應會打兩三次 backend，
+而且**剛好在 storage migration 發生時，同一個回應裡會混到兩代 physical
+generation**。正確作法是一次算完：
+
+```python
+# bridge.py（薄層）
+parts = self._fresh_parts(entry)
+key = _physical_set_key(parts)
+# zip / thumb / props 全部用這同一代 parts 判斷
+```
+
+`_bridge_legacy.py` 的 `RpcApp._cache_state()` 只負責 HTTP 與路徑解析。
+
+**`key in Resolver._zips` 不等於 warm。** 列 `/game` 本身就會建立 `ZipView`
+（`Loc(ZIPDIR, node=None)`），但那個 view 的 `_root` 可能根本還沒 parse——
+那正是「列表不打開封存」要保證的事。所以 zip 的 memory 判定是
+**`view._root is not None`**，或 `_zip_cache` 的記憶體命中；光有 view 不算。
 
 **audit 不可以自己算 key。** 這條 branch 的 cache key 不再是
 `telegram_user_id-file_id`，而是：
@@ -332,12 +374,46 @@ rev 2 的 `source="rpc"|"sweep"` 不夠：位元組還可能來自 DAV read、zi
 改成顯式傳一個 origin 到 `tgio` 的兩個 `iter_download` 呼叫點：
 
 ```
-props | thumb | thumb_prefetch | dav_read | zip_index | fetch_local | warmup | head
+props | thumb | thumb_prefetch | dav_read | zip_index | fetch_local | warmup | head | unknown
 ```
+
+**但 origin 的起點不是 `tgio`，是 request 的來源。** 真實的鏈是：
+
+```
+DAV read / fetch-local / zip / warmup head
+        ↓
+Resolver.open_remote(entry, *, origin)
+        ↓
+SeekableRemoteFile(..., origin)      ← 目前完全不知道 origin
+        ↓
+_fetch() → read_part(..., origin=self._origin)
+```
+
+只改 `tgio` 那一段的話，zip 的 central directory、`fetch-local`、warmup 的檔頭
+**全部會被記成 `dav_read`**；縮圖那邊則是資料夾預抓與 sweep 全部被記成 `thumb`。
+數字看起來很乾淨，但 §8.2 的「屬性階段沒讀位元組」以外的每一條都在問錯的桶。
+
+**`ZipView` 要特別處理。** 它只有一個零參數的 `_open_stream` callback，同時服務
+central directory 解析、member 的 DAV 讀取、以及 `fetch-local` 的 member 讀取。
+把它綁成 `lambda: open_remote(entry, origin="zip_index")` 會讓**讀 zip 裡的檔案
+也被算成索引讀取**。介面要改成收 origin：
+
+```python
+ZipView(lambda origin: resolver.open_remote(entry, origin=origin))
+
+view.root                          → _open_stream("zip_index")
+view.open(node)                    → _open_stream("dav_read")
+view.open(node, origin="fetch_local")  → _open_stream("fetch_local")
+```
+
+**預設值一律是 `unknown`，不是 `dav_read`。** 一個沒更新到的 call site 冒充成
+DAV 讀取，會落進最大的那個桶裡，是最難發現的一種錯標。連帶得到一個免費的
+自我檢查：**量測窗內 `unknown` 非零就是 validity 失敗**——代表還有 call site
+沒標到，而不是「沒有流量」。
 
 ```
 GET /rpc/counters
-→ {"download_requests_total": {"props": 0, "dav_read": 1284, ...},
+→ {"download_requests_total": {"props": 0, "dav_read": 1284, ..., "unknown": 0},
    "download_bytes_total":    {"props": 0, "dav_read": 673185792, ...},
    "zip_open_attempts_total": 12,
    "zip_index_cache_misses_total": 3,
@@ -347,6 +423,39 @@ GET /rpc/counters
 
 **origin 是參數，不是推斷。** 這會讓呼叫鏈上每一層都要帶著它——
 那是刻意的成本：推斷出來的來源在出錯時不會報錯，只會給出一個可信的錯誤答案。
+
+### 6.1a request 與 bytes 要分開記，而且記在 attempt 上
+
+**不可以「成功回傳之後才記一筆」。** 那樣 retry、部分下載、以及失敗的 attempt
+全部不算，於是：
+
+- §8.4 的 idle 靜止判定會**假通過**——閒置窗內有失敗的重試，counter 卻沒動
+- `--sustain-max-bytes` 會**低估真正燒掉的 Telegram 額度**
+
+所以拆成兩個動作：
+
+```
+每次 iter_download attempt 一開始       → record_request(origin)
+每個 yield 回來的 chunk 立刻            → record_bytes(origin, len(chunk))
+```
+
+連帶語意要寫進註解：`download_requests_total` 是 **wire attempt 次數**，
+不是邏輯讀取次數（retry 會重複計）。這對「花掉多少額度」是對的讀法，
+拿它當讀取次數用就是錯的。
+
+### 6.1b named counter 必須真的被 bump
+
+`zip_open_attempts_total` / `zip_index_cache_misses_total` /
+`thumb_requests_total` / `props_requests_total` 只定義不接線的話會**永遠是 0**，
+而 §8.3 那條「列 `/game` 期間 `zip_open_attempts_total` 增量 == 0」就會
+**無條件通過**——這份 spec 最在意的那個 bug 因此永遠測不出來。接線點：
+
+| counter | bump 的位置 |
+|---|---|
+| `zip_open_attempts_total` | `ZipView.root()` 被請求時，**不管答案從哪來** |
+| `zip_index_cache_misses_total` | 同上，但只在真的要去解析 central directory 時 |
+| `thumb_requests_total` | `RpcApp._thumb` 入口 |
+| `props_requests_total` | `RpcApp._props` 入口 |
 
 ### 6.2 併發污染
 
