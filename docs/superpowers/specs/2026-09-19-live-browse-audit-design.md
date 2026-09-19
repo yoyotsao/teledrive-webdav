@@ -1,6 +1,6 @@
 # 真實 `H:` 巡檢與上傳往返探測 — 設計
 
-**日期：** 2026-09-19（rev 3.3）
+**日期：** 2026-09-19（rev 3.4）
 
 **實作 base：** `feat/current-backend-storage-parity` @ `39ad472`（vs `master` ahead 40 / behind 0）。
 Audit 實作走 `feat/live-browse-audit`，**不與 parity 的修復 commit 混在同一條開發線**。
@@ -73,6 +73,22 @@ rev 2 寫了 `_tdapi_legacy.py:819` 這種定位，review 指出 master 上沒�
 | 27 | `key in Resolver._zips` 不等於 warm —— 列 `/game` 就會建 view | §5 改判 `view._root is not None` |
 | 28 | `JsonStore` 是 `_data` + 單一 `_path`，跟 `ShardedJsonStore._memory` 不同 | §5 兩個 store 分開實作，不共用 helper |
 
+### 0.5 rev 3.4 追加
+
+consolidated review 走完了七條路徑，找到的設計層問題：
+
+| # | 問題 | 本版 |
+|---|---|---|
+| 31 | **`strict_routing.py` 才是 live read 的 seam** —— 它把 `tgio.read_part` 與 `tgio._legacy.read_part` 都重新綁到自己，而前三版完全沒提到它 | §13 file map 列入；實作計畫的 origin 任務以它為主 seam |
+| 32 | 宣稱 sweep 的位元組都落在 `warmup` 桶 —— `shell_warm()` 叫 shell 經 `H:` 回來打 bridge，那些請求不知道自己源自 sweep | §6.2 改成「`warmup` 只代表 in-process I/O」，與 sweep 重疊的窗一律 `NOT_MEASURED` |
+| 33 | §10.3 總表還留舊的單桶 `props == 0` | 同步成三桶 |
+| 34 | Class B 的 oracle 寫成「直接讀 part message」，在 canonical identity 下會讀錯檔 | §8.2 改成從 `current_parts(entry)` 取 authoritative part |
+
+**第 31 項跟第 24 項（rev 3.2）是同一個錯誤犯第二次**：都是「以為找到了最底層，
+其實下面還有一層 rebind」。這個 repo 有三層 monkey-patch（`tgio.py` 蓋 legacy、
+`bridge.py` 蓋 `Resolver`、`strict_routing.py` 蓋 `read_part`），**任何
+「這個函式就是實作」的判斷都必須先 grep 過有沒有人在 import 之後重新綁定它。**
+
 ### 0.4 rev 3.3 追加
 
 | # | 問題 | 本版 |
@@ -97,7 +113,7 @@ rev 2 寫了 `_tdapi_legacy.py:819` 這種定位，review 指出 master 上沒�
 
 「一直轉」可以量測，但不能用平均值。100 張圖裡 99 張 40 ms、1 張 30 秒，
 平均 340 ms 看起來健康，而使用者只看到那 30 秒。全程用 `max`，
-並把「單一操作 ≥ 5 秒」定義成使用者感知得到的 stall。
+並把「單一操作 `>= 5 s`」定義成使用者感知得到的 stall（全篇一致用 `>=`）。
 
 而這個問題不能只靠自己新上傳的檔案回答——見 §2。
 
@@ -471,10 +487,23 @@ GET /rpc/counters
 
 ### 6.2 併發污染
 
-`before == after` 在 sweep 同時跑時必然假失敗。有了 origin 之後，probe 只看
-自己那一維（`props`），sweep 的位元組落在 `warmup` 維，互不干擾。
-仍然要把 `warmup.active` 記進報告，因為它會影響**延遲**，只是不再影響
-correctness 的判定。
+`before == after` 在 sweep 同時跑時必然假失敗。
+
+**但 origin 沒辦法把 sweep 完全隔開，這一點要說死。** `Warmer.fill()` 在
+process 內直接發的讀取可以標成 `warmup`，**而 `shell_warm()` 不行**——它是叫
+Windows 的 shell 去要縮圖，shell 於是透過 `H:` 回來打 bridge，那些請求抵達時
+只知道自己是 `dav_read` / `thumb` / `props`，**沒有任何地方記得它們源自 sweep**。
+`Warmer.fill()` 觸發的 shell 讀取（第 4 節的檔頭）也一樣。
+
+所以：
+
+- **`warmup` 桶只代表「sweep 在 process 內直接發出的 I/O」**，不是「sweep 造成的
+  全部流量」。
+- **量測窗只要與 `BackgroundWarmup.active` 重疊，整個 op 就判 `NOT_MEASURED`**，
+  不要試圖用扣掉 `warmup` 桶的方式救它——扣不乾淨，而扣得不乾淨的結果是一個
+  看起來精確的錯誤數字。
+
+`warmup.active` 因此不只是報告欄位，是 validity 的一部分。
 
 ---
 
@@ -570,13 +599,21 @@ central directory 就不知道 entry 數。改成：
 判定方法的話。改成：
 
 ```
+current_parts(entry)                    ← authoritative physical parts
+        ↓
 對邊界左右兩側，分別直接讀 part N 的尾端與 part N+1 的開頭
-（繞過 split 層，直接對該 part 的 message 發請求）
+（各自走該 part 自己的 FileLocation，繞過 split 串接層）
         ↓
 拼成期望的 1 MiB
         ↓
 與從 H: 讀同一個 logical range 的結果逐位元組比對
 ```
+
+**oracle 繞過的只有 split 串接，不是 physical identity。** 這條 branch 的
+authoritative location 可能是 channel 或 photo 型的 `FileLocation`，
+所以 oracle 必須從 `current_parts(entry)` 拿到當下的 physical part，
+再逐 part 直接讀——**退回「對 Saved Messages 的 message id 發請求」會讓
+oracle 自己讀錯檔案**，然後把一個正確的實作判成失敗。
 
 這樣 oracle 與被測路徑是兩條獨立的程式路徑，差異才有意義。
 
@@ -821,7 +858,7 @@ ratio 保留在報告，用來判斷**快取有沒有產生效果**（接近 1 �
 | 第一次進 zip | `< 5 s` | — |
 | 第二次進同一個 zip | `< 0.1 s` | — |
 | 大檔任意 seek | `< 3 s` | — |
-| 大檔屬性階段 | — | `download_bytes{props} 增量 == 0` |
+| 大檔屬性階段 | — | `download_bytes` 的 `props` ＋ `dav_read` ＋ `unknown` 增量皆 `== 0`（§8.2；只看 `props` 會被 delegate 之後的原檔讀取繞過） |
 | 大檔尾端 1 MiB | — | 讀到真實資料 |
 | 大檔跨界 1 MiB | — | 與 oracle 逐位元組相符 |
 | 虛擬目錄完整取回 | — | 每個 entry 的 CRC32 與大小全中 |
@@ -928,7 +965,8 @@ rev 2 的範例把 `thumb_max=7.4s` 標成「shell 讀了整張原圖」。
 | `isolate` 的 `--jsonl` / `--manifest` | `shellthumb/isolate.cpp` | 同左 | `shellthumb\buildbench.bat` |
 | `Log()` 的 SRWLOCK + TTL | `shellthumb/TeleDriveThumb.cpp` | 同左 | `shellthumb\build.bat`（先殺載入本 DLL 的 dllhost） |
 | `RpcApp._health` / `_status`／新增 `/rpc/counters`、`/rpc/cache-state`／`RpcApp` 收 `BackgroundWarmup` | `bridge.py` | `_bridge_legacy.py` | `pytest tests -q` → `restart.bat` |
-| origin-tagged counter：wire I/O 在 `_thumbnail_bytes()` / `_chunk()`，**但 origin 要從入口一路傳下來**——canonical 的 `read_location()` / `thumbnail_location()` 在薄層，legacy Saved Messages 的入口在 legacy | `tgio.py` | **`tgio.py` ＋ `_tgio_legacy.py`（跨 seam）** | 同上 |
+| 記帳點：`_thumbnail_bytes()` / `_chunk()` 的兩個 `iter_download` | `tgio.py` | `_tgio_legacy.py` | 同上 |
+| origin 的傳遞：**`strict_routing.py` 最後把 `tgio.read_part` 與 `tgio._legacy.read_part` 都重新綁到自己**，所以那是 live 讀取真正的 seam；再加上薄層的 canonical 入口、`Resolver` 的 monkey-patch、`ZipView`、`fetchlocal`、`warmup` | `tgio.py` | **`strict_routing.py` ＋ `tgio.py` ＋ `_tgio_legacy.py` ＋ `bridge.py` ＋ `_bridge_legacy.py` ＋ `zipfs.py` ＋ `fetchlocal.py` ＋ `warmup.py`** | 同上 |
 | `Entry` / `_to_entry()` 納入 `telegram_media_kind`、`telegram_chat_id` | `tdapi.py` | `_tdapi_legacy.py`（本 branch 的 parity 層已消費這些欄位） | 同上 |
 | `BackgroundWarmup.status()` | `warmup.py` | 同左 | 同上 |
 | 「測試」節加這兩支；手動清單標註哪幾項有腳本代跑 | `CLAUDE.md` | 同左 | — |

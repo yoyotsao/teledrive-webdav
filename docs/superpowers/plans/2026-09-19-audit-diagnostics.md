@@ -1,4 +1,4 @@
-# Audit Diagnostics Implementation Plan (rev 3)
+# Audit Diagnostics Implementation Plan (rev 4)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -11,7 +11,7 @@
 
 **Tech Stack:** Python 3 / pytest、cheroot WSGI、Telethon、C++（MSVC，`shellthumb/*.bat`）
 
-**Spec:** `docs/superpowers/specs/2026-09-19-live-browse-audit-design.md`（rev 3.3）
+**Spec:** `docs/superpowers/specs/2026-09-19-live-browse-audit-design.md`（rev 3.4）
 
 ## Global Constraints
 
@@ -25,11 +25,22 @@
   / `head` / `fetch_local` **一律由 caller 明寫**。給一個「合理的」預設，
   等於讓漏標的 call site 躲進一個合法的桶裡拿到假 PASS；預設 `unknown` 則會讓
   那個窗判 `NOT_MEASURED`。
-- **live 的 `Resolver` 方法是薄層 monkey-patch 的那一份。** `bridge.py` 覆寫了
-  `open_remote` / `thumbs_for` / `props_for` / `heads_for` / `_cache_key` /
-  `_thumb_path` / `needs_warming`。**只改 `_bridge_legacy.py` 的同名方法，
-  測試會綠而 live 行為不變**——所有 signature 檢查一律對 `bridge.Resolver`。
-- **絕不 `taskkill /f /im dllhost.exe`。** 只殺載入了 `TeleDriveThumb.dll` 的 PID（spec §8.4、§15）。
+- **這個 repo 有三層 import-time rebind，改任何函式前先 grep 過有沒有人蓋掉它：**
+
+  | 蓋的人 | 被蓋的 |
+  |---|---|
+  | `tgio.py` | `_legacy.read_part`、`_legacy.make_preview` |
+  | `bridge.py` | `Resolver.open_remote` / `thumbs_for` / `props_for` / `heads_for` / `_cache_key` / `_thumb_path` / `needs_warming` |
+  | **`strict_routing.py`** | **`tgio.read_part` 與 `tgio._legacy.read_part`（兩個都蓋）** |
+
+  **`strict_routing.read_part` 才是 live 讀取真正的 seam。** 改 `tgio.read_part`
+  而不改它，等於什麼都沒改；而 signature 測試會對著一個沒人呼叫的函式通過。
+  所有 signature 檢查一律對**最終被綁定的那個物件**（`bridge.Resolver`、
+  `tgio.read_part` 在 import `strict_routing` 之後的值）。
+- **絕不 `taskkill /f /im dllhost.exe`。** 只殺載入了 `TeleDriveThumb.dll` 的 COM surrogate PID（spec §8.4、§15）。
+  **而且不要假設一定有一個。** `install_thumb.py` 設了 `DisableProcessIsolation=1`，
+  handler 通常就載入在 `explorer.exe` 裡——killer 找不到目標是正常結果，
+  不是失敗；任何「需要冷 host」的驗證都不能建立在「殺得掉某個 dllhost」上。
 - **薄層架構事實：** `RpcApp` / `build_app()` / `main()` 在 `_bridge_legacy.py`；`Resolver` 的 physical cache identity（`_fresh_parts` / `_cache_key` / `_thumb_path`）在薄層 `bridge.py`；`Entry` / `_to_entry()` / `JsonStore` / `ShardedJsonStore` 在 `_tdapi_legacy.py`；wire I/O 在 `_tgio_legacy.py` 的 `_thumbnail_bytes()` / `_chunk()`。
 - **測試指令：** `.venv\Scripts\python.exe -m pytest tests -q`
 
@@ -633,16 +644,20 @@ def test_thumbnail_bytes_counts_the_whole_preview_it_drains(monkeypatch):
     # the end -- so this is where multi-chunk accumulation belongs. Without
     # this test the "every Python diagnostic has an offline test" invariant
     # is false at one of the only two places that matter.
+    #
+    # The fake document MUST carry a thumbnail _best_thumb() will pick, and the
+    # worker MUST have a pool the download can be issued on. A bare fake doc
+    # makes _best_thumb() return None, the function returns before any wire
+    # call, and the test passes while measuring nothing -- see
+    # tests/test_thumbnails.py and tests/test_photo_media.py for the shapes
+    # this repo already uses for both document and photo media.
     before = COUNTERS.snapshot()
-    worker = _tgio_legacy.TelegramWorker.__new__(_tgio_legacy.TelegramWorker)
+    worker = _thumbnail_worker(_Chunks(b"j" * 8000, b"k" * 2000), monkeypatch)
+    doc = _doc_with_thumb(size=10_000)
 
-    class _Client:
-        def iter_download(self, *a, **kw):
-            return _Chunks(b"j" * 8000, b"k" * 2000)
+    out = asyncio.run(worker._thumbnail_bytes(doc, origin="thumb_prefetch"))
 
-    doc = type("Doc", (), {"dc_id": 1, "size": 10_000})()
-    asyncio.run(worker._thumbnail_bytes(doc, origin="thumb_prefetch"))
-
+    assert out, "the fake never reached iter_download; the counts below are vacuous"
     after = COUNTERS.snapshot()
     assert after["download_requests_total"]["thumb_prefetch"] - before["download_requests_total"]["thumb_prefetch"] == 1
     assert after["download_bytes_total"]["thumb_prefetch"] - before["download_bytes_total"]["thumb_prefetch"] == 10_000
@@ -723,14 +738,19 @@ git commit -m "feat: record every telegram wire attempt against an origin"
 ### Task 3: Origin provenance chain
 
 **Files:**
-- Modify: `_tgio_legacy.py` — `read_part()`、`TelegramWorker.read()`、`_read()`、`thumbnails()`、`thumb_bytes()`、`SeekableRemoteFile.__init__()` 與 `_fetch()`
+- Modify: **`strict_routing.py` — `read_part()`（live seam，最重要的一個）**
+- Modify: `_tgio_legacy.py` — `read_part()`、`TelegramWorker.read()`、`_read()`、`thumbnails()`、`SeekableRemoteFile.__init__()` 與 `_fetch()`
 - Modify: `tgio.py` — `read_part()`、`_read_location()`、`_thumbnail_location()`
 - Modify: `zipfs.py` — `ZipView.__init__()`、`root`、`open()`
 - Modify: **`bridge.py`（薄層，live 的就是這一份）** — `_open_remote()`、`_thumbs_for()`、`_props_for()`、`_heads_for()`
-- Modify: `_bridge_legacy.py` — ZipView lambda、`RemoteFileResource.get_content()`、`RpcApp._thumb` / `_props`、`prefetch_folder_thumbs()`
+- Modify: `_bridge_legacy.py` — ZipView lambda、`RemoteFileResource.get_content()`、**`ZipFileResource.get_content()`**、**`Resolver.thumb_bytes()`**、`RpcApp._thumb` / `_props`、`prefetch_folder_thumbs()`
 - Modify: `fetchlocal.py` — **兩個 `open_remote` lambda ＋ 兩個 `v.open(node)` lambda**
 - Modify: `warmup.py` — sweep 的縮圖／屬性／檔頭呼叫
 - Modify: `tests/test_zipfs.py` — 四個 `ZipView(...)` 建構點的 callable 改收 origin
+- Modify: **既有測試的 fake 簽章**（origin 變成 kw-only 之後會連帶紅，這不是 product regression）：
+  `tests/test_split_math.py` 的 `FakeReader`、`tests/test_account_routing.py` 的 fake worker、
+  `tests/test_bridge_e2e.py` 的 `FakeWorker`、`tests/test_thumbnails.py` monkeypatch 的
+  `_thumbnail_bytes(doc)`。**`test_split_math` 必須維持 37/37。**
 - Test: `tests/test_origin_chain.py`
 
 **Interfaces:**
@@ -758,18 +778,25 @@ sweep 縮圖      → thumb      ✗ 應為 warmup
 解析（`root`）與 member 讀取（`open()`，兩處）。綁死成 `zip_index` 會讓
 **讀 zip 裡的檔案也算成索引讀取**。
 
-**改哪一層更危險。** `bridge.py` 在 import legacy 之後 monkey-patch：
+**改哪一層更危險，而且有兩層要注意。**
 
-```
-Resolver.open_remote  = bridge._open_remote
-Resolver.thumbs_for   = bridge._thumbs_for
-Resolver.props_for    = bridge._props_for
-Resolver.heads_for    = bridge._heads_for
+第一層：`bridge.py` 在 import legacy 之後 monkey-patch `Resolver.open_remote` /
+`thumbs_for` / `props_for` / `heads_for`。**live 跑的是薄層那一份**，
+只改 `_bridge_legacy.Resolver` 的同名方法，`inspect.signature` 會很好看
+而實際行為一個位元組都沒變。
+
+第二層更深：**`strict_routing.py` 最後做**
+
+```python
+tgio.read_part = read_part
+tgio._legacy.read_part = read_part
 ```
 
-**live 跑的是薄層那一份。** 只改 `_bridge_legacy.Resolver` 的同名方法，
-`inspect.signature(_bridge_legacy.Resolver.thumbs_for)` 會很好看，而實際行為
-一個位元組都沒變。所以本任務改的是 `bridge.py`，而測試一律對 `bridge.Resolver`。
+**兩個 surface 都蓋掉**，所以每一次 HEAD / range / 整檔讀取都是
+`strict_routing.read_part` 在答。它目前不收 `origin`——**在它沒改之前，
+底下 `tgio` 與 `_tgio_legacy` 加的 origin 參數永遠收到預設值**，
+而所有測試都會通過。它要跟 `tgio.read_part` 一樣的處理：legacy fallback
+與 canonical `worker.read_location()` 兩條都把 origin 傳下去。
 
 `fetchlocal.py` 有**四個** call site，不是兩個：兩個 `resolver.open_remote(...)`
 （一般檔案與 split），以及兩個 `v.open(node)`（虛擬 zip 目錄的 member 取回）。
@@ -911,9 +938,12 @@ def test_the_reader_hands_its_origin_to_read_part(monkeypatch):
     assert seen["origin"] == "fetch_local"
 
 
-def test_thumbs_for_hands_its_origin_to_the_worker(monkeypatch):
-    # A signature test alone would pass on a method that accepts origin and
-    # then drops it on the floor.
+def test_thumbs_for_hands_its_origin_to_the_worker(monkeypatch, tmp_path):
+    # NOT a signature test and NOT exception-swallowing. An earlier draft did
+    # `except Exception: pass` then `seen.get("origin", "thumb_prefetch")`,
+    # which passes when the worker is never called at all -- i.e. it passes on
+    # a completely unwired implementation, which is the one outcome it exists
+    # to catch.
     import bridge
 
     seen = {}
@@ -921,17 +951,43 @@ def test_thumbs_for_hands_its_origin_to_the_worker(monkeypatch):
     class _Worker:
         def thumbnails(self, parts, *, origin="unknown"):
             seen["origin"] = origin
-            return {}
+            return {(p.message_id, str(p.file_id)): b"jpegbytes" for p in parts}
 
-    resolver = object.__new__(bridge.Resolver)
-    monkeypatch.setattr(resolver, "_fresh_parts", lambda e: (), raising=False)
-    # Fill in whatever else _thumbs_for touches; the assertion is only that
-    # the origin it was given reaches worker.thumbnails().
-    try:
-        bridge.Resolver.thumbs_for(resolver, [], origin="thumb_prefetch")
-    except Exception:
-        pass
-    assert seen.get("origin", "thumb_prefetch") == "thumb_prefetch"
+    entry = _eligible_entry()          # has_thumbnail=True, not split
+    resolver = _resolver_with_worker(bridge, tmp_path, _Worker(), monkeypatch)
+
+    bridge.Resolver.thumbs_for(resolver, [entry], origin="thumb_prefetch")
+
+    assert seen == {"origin": "thumb_prefetch"}, "worker.thumbnails was never reached"
+
+
+def test_read_part_after_strict_routing_carries_origin():
+    # tgio.read_part is rebound by strict_routing at import time, so this must
+    # be checked on the bound value, not on the definition in tgio.py.
+    import strict_routing  # noqa: F401  (imported for its rebinding side effect)
+    import tgio
+
+    param = inspect.signature(tgio.read_part).parameters["origin"]
+    assert param.kind is inspect.Parameter.KEYWORD_ONLY
+    assert param.default == "unknown"
+    assert tgio.read_part.__module__ == "strict_routing", (
+        "strict_routing no longer owns read_part; re-check which layer is live")
+
+
+def test_the_live_read_part_hands_origin_to_the_worker(monkeypatch):
+    import strict_routing
+    import tgio
+
+    seen = {}
+
+    class _Worker:
+        def read_location(self, location, peer, offset, length, *, origin="unknown"):
+            seen["origin"] = origin
+            return b"\0" * length
+
+    pool = _pool_routing_to(_Worker())
+    tgio.read_part(pool, _canonical_part(), 0, 16, origin="fetch_local")
+    assert seen == {"origin": "fetch_local"}
 ```
 
 ```python
@@ -942,16 +998,44 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_no_open_remote_call_site_was_left_untagged():
+def _eligible_entry():
+    """An Entry thumbs_for will actually act on: not a directory, not split,
+    has_thumbnail true. An empty list or an ineligible entry makes the
+    provenance assertion vacuous."""
+    raise NotImplementedError("build from tdapi.Entry; see tests/test_bridge_e2e.py")
+
+
+def _resolver_with_worker(bridge, tmp_path, worker, monkeypatch):
+    """A Resolver whose pool routes to `worker` and whose thumb cache is a real
+    empty directory, so thumbs_for misses the cache and reaches the worker."""
+    raise NotImplementedError("mirror the rig in tests/test_transfer_status.py")
+
+
+def _pool_routing_to(worker):
+    raise NotImplementedError("mirror tests/test_account_routing.py's pool fake")
+
+
+def _canonical_part():
+    raise NotImplementedError("a ResolvedRemotePart; see tests/test_account_routing.py")
+
+
+def test_no_provenance_call_site_was_left_untagged():
     """Every caller names its origin. An untagged one silently becomes
     'unknown', and a window that sees unknown traffic is invalid -- which is
     better than it impersonating dav_read, but still a hole worth closing at
     the source."""
+    # Named provenance APIs only. A generic ".open(" scan flags Path.open,
+    # item.open and zipfile.open -- noise that gets the whole test disabled --
+    # while still missing strict_routing.py, which is the one that matters.
+    # The behavioural tests above are the real coverage; this is a reminder
+    # for call sites nobody thought about.
     offenders = []
-    watched = ("open_remote(", "thumbs_for(", "props_for(", "heads_for(", ".open(")
-    for name in ("_bridge_legacy.py", "fetchlocal.py", "bridge.py", "warmup.py"):
+    watched = ("open_remote(", "thumbs_for(", "props_for(", "heads_for(",
+               "read_part(", "view.open(", "self.view.open(")
+    for name in ("_bridge_legacy.py", "fetchlocal.py", "bridge.py", "warmup.py",
+                 "strict_routing.py"):
         for i, line in enumerate((ROOT / name).read_text(encoding="utf-8").splitlines(), 1):
-            if "def " in line or "origin=" in line:
+            if "def " in line or "origin=" in line or line.lstrip().startswith("#"):
                 continue
             if any(call in line for call in watched):
                 offenders.append(f"{name}:{i}: {line.strip()}")
@@ -978,8 +1062,9 @@ Expected: FAIL — `ZipView.open` 沒有 `origin` 參數
 ```
 
 `root` 那處改 `self._open_stream("zip_index")`；`open()` 改
-`def open(self, node, *, origin: str = "dav_read")`，內部兩處（含
-`open_member` 閉包）都用 `self._open_stream(origin)`。
+`def open(self, node, *, origin: str = "unknown")`（**`unknown`，不是
+`dav_read`**——真正的 DAV caller 在 `ZipFileResource.get_content()` 自己明寫），
+內部兩處（含 `open_member` 閉包）都用 `self._open_stream(origin)`。
 
 `_tgio_legacy.py`：
 
@@ -1005,12 +1090,15 @@ Expected: FAIL — `ZipView.open` 沒有 `origin` 參數
 
 | 位置 | 檔案 | origin |
 |---|---|---|
+| **`read_part()`（live seam）** | **`strict_routing.py`** | 收 `origin`，兩條分支都往下傳 |
 | `RemoteFileResource.get_content()` | `_bridge_legacy.py` | `dav_read` |
+| **`ZipFileResource.get_content()`** | `_bridge_legacy.py` | **`dav_read`**（`self.view.open(self.node, origin="dav_read")`；不明寫就會落進 `unknown`） |
+| **`Resolver.thumb_bytes()`** | `_bridge_legacy.py` | 收 `origin="unknown"` 並傳給 `thumbs_for` |
+| `RpcApp._thumb` → `thumb_bytes(...)` | `_bridge_legacy.py` | `thumb` |
 | ZipView 建構的 lambda | `_bridge_legacy.py` | `lambda origin, e=entry: self.open_remote(e, origin=origin)` |
 | 兩個 `resolver.open_remote(...)` | `fetchlocal.py` | `fetch_local` |
 | **兩個 `v.open(node)`** | `fetchlocal.py` | **`fetch_local`** |
 | `_heads_for()` 內部的讀取 | **`bridge.py`** | `head` |
-| `RpcApp._thumb` → `thumbs_for(...)` | `_bridge_legacy.py` | `thumb` |
 | `RpcApp._props` → `props_for(...)` | `_bridge_legacy.py` | `props` |
 | `prefetch_folder_thumbs()` → `thumbs_for(...)` | `_bridge_legacy.py` | `thumb_prefetch` |
 | `Warmer` 的縮圖／屬性／檔頭 | `warmup.py` | `warmup` |
@@ -1104,6 +1192,26 @@ def test_only_a_real_central_directory_parse_counts_as_a_miss(tmp_path):
     assert after_first - before == 1
     view.root
     assert COUNTERS.snapshot()["zip_index_cache_misses_total"] == after_first
+
+
+def test_a_cache_hit_is_an_open_attempt_but_not_a_miss(tmp_path):
+    # Without this, an implementation that bumps the miss counter before
+    # consulting _cache.get() passes every other test in this file: the memo
+    # hit is covered, the cold parse is covered, and the cached-tree path --
+    # the one that actually distinguishes the two counters -- is not.
+    from _tdapi_legacy import ShardedJsonStore
+
+    store = ShardedJsonStore(tmp_path / "zips")
+    warm = _view(tmp_path, cache=store, key="file-1")
+    warm.root                                   # populates the store
+    warm.save(force=True)
+
+    fresh = _view(tmp_path, cache=store, key="file-1")   # new view, cached tree
+    opens = COUNTERS.snapshot()["zip_open_attempts_total"]
+    misses = COUNTERS.snapshot()["zip_index_cache_misses_total"]
+    assert fresh.root is not None
+    assert COUNTERS.snapshot()["zip_open_attempts_total"] - opens == 1
+    assert COUNTERS.snapshot()["zip_index_cache_misses_total"] - misses == 0
 ```
 
 ```python
@@ -1321,7 +1429,34 @@ def test_the_real_pass_moves_through_its_phases(monkeypatch):
     w = _w()
     w._run_pass_body()
     assert ("pending", "walking") in seen
+    assert ("fill", "filling") in seen
     assert ("shell_warm", "shell_warm") in seen
+
+
+def test_a_pass_whose_fill_did_not_finish_is_not_a_completed_pass(monkeypatch):
+    # Warmer.fill() catches its own per-batch errors and returns a partial
+    # count rather than raising, so "_run_pass_body returned normally" is not
+    # evidence the pass finished. Completion is done == len(todo) and no stop.
+    class _Warmer:
+        def __init__(self, *a, **kw):
+            pass
+
+        def pending(self):
+            return ["f1", "f2"], ["f1", "f2"]
+
+        def fill(self, todo):
+            return 1                 # one of two: a batch failed silently
+
+        def shell_warm(self, files):
+            return 0
+
+    import warmup as warmup_mod
+
+    monkeypatch.setattr(warmup_mod, "Warmer", _Warmer)
+    w = _w()
+    assert w._run_pass_body() is False
+    w._pass()
+    assert w.status()["pass"] == 0
 
 
 def test_status_does_not_block_on_the_sweep_thread():
@@ -1388,8 +1523,16 @@ Expected: FAIL with `AttributeError: ... has no attribute 'status'`
         files, todo = warmer.pending()
         if self._stop.is_set():
             return False
-        ...
-        return True
+        self._enter("filling")
+        done = warmer.fill(todo) if todo else 0
+        if self._stop.is_set():
+            return False
+        self._enter("shell_warm")
+        warmer.shell_warm(files)
+        self.resolver.clear_heads()
+        # fill() swallows per-batch failures and returns a partial count, so
+        # a normal return is not evidence the pass finished.
+        return not self._stop.is_set() and done == len(todo)
 ```
 
 ```python
@@ -1485,6 +1628,23 @@ def _app(warmup=None):
 
 def test_health_reports_whether_cryptg_is_importable():
     assert isinstance(_body(_app(), "/health")["cryptg"], bool)
+
+
+def test_build_app_actually_hands_the_warmup_to_the_rpc_app(monkeypatch):
+    """The tests above poke app.warmup in by hand, so they stay green even if
+    main() forgets to pass the warmer to build_app() -- which is the only way
+    this wiring can be wrong in production."""
+    captured = {}
+    real = legacy.RpcApp
+
+    class _Spy(real):
+        def __init__(self, *a, **kw):
+            captured["warmup"] = kw.get("warmup", a[5] if len(a) > 5 else None)
+
+    monkeypatch.setattr(legacy, "RpcApp", _Spy)
+    sentinel = object()
+    legacy.build_app(_cfg(), _resolver(), _fetcher(), _stager(), warmup=sentinel)
+    assert captured["warmup"] is sentinel
 
 
 def test_cryptg_is_false_when_the_native_module_cannot_be_imported(monkeypatch):
@@ -1657,6 +1817,13 @@ git commit -m "feat: expose cryptg, sweep state and the counters over rpc"
    而那個 view 的 `_root` 可能根本沒 parse。判定要用 `view._root is not None`。
 4. `JsonStore` 是 `_data` ＋ 單一 `_path`，`ShardedJsonStore` 是 `_memory` ＋
    一鍵一檔。**兩個 store 要分開實作，不能共用一段 helper。**
+5. **`disk=true` 對兩個 store 的意義不一樣，端點照實回報即可，但解讀要分開。**
+   `ShardedJsonStore.get()` 在 miss 時會去讀磁碟，所以 `disk=true` 代表下一次
+   查詢真的會命中；`JsonStore` 只在 constructor 載入一次，之後只查 `_data`，
+   所以別的 process 後來寫進 `media_props.json` 的東西，**對現在這個 bridge
+   仍然是 miss**。端點回 `{"memory": false, "disk": true}` 是誠實的；
+   把它一律當 warm 的是第二份計畫的 classifier，那裡要 store-specific。
+   這一條寫進 `_liveprobe` 的 TODO，不在本任務實作。
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1759,17 +1926,48 @@ def _call(app, qs):
 
 
 def test_the_endpoint_converts_the_windows_path_itself():
+    # Plain functions, not `setdefault(...) or [...]`: a Windows path is
+    # truthy, so that expression returns the path string instead of the
+    # segment list, and a resolve() fake that accepts anything then passes on
+    # an implementation that never converted the path at all.
     seen = {}
+
+    def dav_path_from_windows(p):
+        seen["win"] = p
+        return ["game", "a.zip"]
+
+    def resolve(segments):
+        seen["segments"] = segments
+        return type("L", (), {"entry": "E"})()
+
+    def cache_state(entry, kinds):
+        seen["entry"] = entry
+        return {"zip": {"memory": True, "disk": False}}
+
     app = legacy.RpcApp.__new__(legacy.RpcApp)
     app.resolver = type("R", (), {
-        "dav_path_from_windows": staticmethod(lambda p: seen.setdefault("win", p) or ["game", "a.zip"]),
-        "resolve": staticmethod(lambda segs: type("L", (), {"entry": "E"})()),
-        "cache_state": staticmethod(lambda e, kinds: {"zip": {"memory": True, "disk": False}}),
+        "dav_path_from_windows": staticmethod(dav_path_from_windows),
+        "resolve": staticmethod(resolve),
+        "cache_state": staticmethod(cache_state),
     })()
     status, body = _call(app, "path=H%3A%5Cgame%5Ca.zip&kinds=zip")
     assert status.startswith("200")
     assert seen["win"] == "H:\\game\\a.zip"
+    assert seen["segments"] == ["game", "a.zip"]
+    assert seen["entry"] == "E"
     assert json.loads(body)["zip"]["memory"] is True
+
+
+def test_the_cache_state_response_carries_no_credential():
+    app = legacy.RpcApp.__new__(legacy.RpcApp)
+    app.resolver = type("R", (), {
+        "dav_path_from_windows": staticmethod(lambda p: ["game", "a.zip"]),
+        "resolve": staticmethod(lambda segs: type("L", (), {"entry": "E"})()),
+        "cache_state": staticmethod(lambda e, kinds: {"zip": {"memory": True, "disk": False}}),
+    })()
+    _, body = _call(app, "path=H%3A%5Cgame%5Ca.zip&kinds=zip")
+    for needle in ("session", "token", "jwt", "auth_key"):
+        assert needle not in body.lower()
 
 
 def test_a_path_with_no_entry_is_a_4xx_not_a_cold_looking_answer():
@@ -1957,6 +2155,19 @@ def test_a_row_without_them_reads_as_none():
     assert e.telegram_media_kind is None and e.telegram_chat_id is None
 
 
+def test_an_integer_chat_id_is_normalised_to_str():
+    # The backend can send this as a number while the thin layer's
+    # parse_file_location works in strings. Two shapes for one field makes
+    # `entry.telegram_chat_id == location.telegram_chat_id` fail silently.
+    e = _to_entry(_row(telegram_chat_id=-100123))
+    assert e.telegram_chat_id == "-100123"
+
+
+def test_media_kind_is_normalised_to_lower_case():
+    e = _to_entry(_row(telegram_media_kind="Photo"))
+    assert e.telegram_media_kind == "photo"
+
+
 def test_an_empty_string_is_normalised_to_none():
     # "" and None both mean "the backend did not say"; leaving both shapes in
     # makes every consumer write the same two-way check.
@@ -1988,11 +2199,14 @@ Expected: FAIL with `AttributeError: 'Entry' object has no attribute 'telegram_m
     telegram_chat_id: Optional[str] = None
 ```
 
-`_to_entry()` 加兩行，`or None` 同時處理缺鍵、`None` 與空字串：
+`_to_entry()` 加兩行。`or None` 同時處理缺鍵、`None` 與空字串；
+**`telegram_chat_id` 還要 `str()`**——backend 可能回整數，而薄層的
+`parse_file_location` 已經是按字串處理的，兩邊形狀不一致會讓
+`Entry.telegram_chat_id == location.telegram_chat_id` 這種比較靜靜失敗：
 
 ```python
-        telegram_media_kind=(row.get("telegram_media_kind") or None),
-        telegram_chat_id=(row.get("telegram_chat_id") or None),
+        telegram_media_kind=(str(k).lower() if (k := row.get("telegram_media_kind")) else None),
+        telegram_chat_id=(str(c) if (c := row.get("telegram_chat_id")) else None),
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -2047,11 +2261,17 @@ static std::string Utf8(const std::wstring& w) {
     // Convert exactly w.size() code units and ask for no NUL, so the length
     // returned is the length needed. Passing -1 counts the terminator, and
     // sizing the buffer to n-1 while still writing n bytes overruns it.
+    //
+    // &out[0], not out.data(): the non-const data() overload is C++17 and the
+    // build scripts set no /std: flag, so MSVC compiles these at its default.
+    // warmshell.cpp already does it this way; copy it rather than making the
+    // first diagnostics change a compiler-version argument.
     const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(),
                                       nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return std::string();
     std::string out((size_t)n, '\0');
     WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(),
-                        out.data(), n, nullptr, nullptr);
+                        &out[0], n, nullptr, nullptr);
     return out;
 }
 
@@ -2076,10 +2296,21 @@ static void EmitJsonl(const char* op, const std::wstring& path,
 每行一個完整路徑。在既有 per-file 迴圈裡用同一個 `Now(freq)` 計時，
 每檔結束呼叫一次 `EmitJsonl`。
 
-- [ ] **Step 2: Build**
+- [ ] **Step 2: Teach buildbench.bat to build isolate as well**
+
+`buildbench.bat` 現在**只編 `bench.cpp`**，完全沒碰 `isolate.cpp`——
+照 rev 3 寫的 `Run: shellthumb\buildbench.bat` 不會產生新的 `isolate.exe`，
+於是後面每一步都在測舊的執行檔。在 `bench.exe` 那行後面加：
+
+```bat
+cl /nologo /O2 /EHsc /W3 /utf-8 /DUNICODE /D_UNICODE isolate.cpp /Fe:isolate.exe
+if errorlevel 1 exit /b 1
+```
+
+並把結尾的 `echo [ok] bench.exe` 改成 `echo [ok] bench.exe isolate.exe`。
 
 Run: `shellthumb\buildbench.bat`
-Expected: 產生新的 `shellthumb\isolate.exe`，無編譯錯誤
+Expected: `[ok] bench.exe isolate.exe`，且 `isolate.exe` 的時間戳是剛剛
 
 - [ ] **Step 3: Verify the aggregate output is unchanged**
 
@@ -2095,19 +2326,29 @@ shellthumb\isolate.exe --jsonl thumb <那個資料夾> 1 2>jsonl.txt
 .venv\Scripts\python.exe -c "import json,io; [print(json.loads(l)['file']) for l in io.open('jsonl.txt',encoding='utf-8') if l.strip()]"
 ```
 
-Expected: 印出的檔名與磁碟上完全相同（不是 `æ¹...`）。**這是 Task 9 唯一的
-自動化驗證，不可跳過**——它同時證明 UTF-8 轉換與 JSON 逸出都對。
+Expected: 印出的檔名與磁碟上完全相同（不是 `æ¹...`）。**這是 Task 9 唯一能驗證 UTF-8 轉換與 JSON 逸出的步驟，不可跳過。**
+（它是 preflight harness 的一部分，不是 `pytest` 會跑到的自動化測試——
+C++ 那半沒有離線測試，見 Global Constraints。）
 
 - [ ] **Step 5: Verify the manifest is honoured**
 
-把兩個路徑寫進 `m.txt`（其中一個是 `.txt` 檔），跑
+把兩個路徑寫進 `m.txt`：一個真的 JPEG，一個**不存在的路徑**。跑
 `shellthumb\isolate.exe --jsonl --manifest m.txt thumb .`
-Expected: stderr 剛好兩行、`file` 就是那兩個、`.txt` 那行 `answered` 為 `false`
+
+Expected: stderr 剛好兩行、`file` 就是 manifest 裡那兩個（**不是目錄掃描的結果**）、
+不存在那行 `answered` 為 `false`。
+
+> 不要用 `.txt` 當「一定失敗」的樣本——Windows shell 對文字檔給不給縮圖
+> 不是穩定契約，而且那跟「manifest 有沒有被遵守」無關。不存在的路徑才是
+> 確定會失敗的。真正要驗的是**送出去的清單就是 manifest 的內容**。
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add shellthumb/isolate.cpp shellthumb/isolate.exe
+# Source and build script only: .gitignore excludes *.exe / *.dll and none of
+# the binaries are tracked. `git add` on isolate.exe would need -f and would
+# start tracking a build artefact this repo deliberately does not.
+git add shellthumb/isolate.cpp shellthumb/buildbench.bat
 git commit -m "feat: per-file jsonl telemetry and an explicit manifest for isolate"
 ```
 
@@ -2258,35 +2499,61 @@ static std::wstring CurrentLogPath() {
 shellthumb\build.bat
 ```
 
-Expected: 建置成功。仍被鎖住就再跑一次 killer，必要時重啟 `explorer.exe`。
-**不要改用 `taskkill /f /im dllhost.exe`。**
+**`install_thumb.py` 設了 `DisableProcessIsolation=1`，所以 handler 通常
+載入在 `explorer.exe` 裡，不是 `dllhost.exe`。** killer 找不到東西是正常的，
+不是錯誤。DLL 若被鎖住，要重啟的是 `explorer.exe`。killer 留著當
+「真的有隔離 surrogate 時」的安全工具，**不是這個 lifecycle 驗證的核心**。
+無論如何**不要用 `taskkill /f /im dllhost.exe`**。
 
-- [ ] **Step 4: Verify logging turns on without a new surrogate**
+- [ ] **Step 4: Verify the SAME host re-reads LogPath**
+
+rev 3 的寫法（設值 → 等 → probe）**證不出任何事**：如果 handler 是在設值
+**之後**才第一次載入，連舊的 one-shot 實作也會通過。必須讓同一個 host
+process 先在「沒有 LogPath」的狀態下被呼叫過一次。
+
+用 `isolate.exe`（它是一個長命的行程，一次載入 handler 之後持續呼叫）：
 
 ```powershell
 reg delete "HKCU\Software\TeleDriveWebDAV" /v LogPath /f
-# 讓 surrogate 載入 handler：開一個沒看過的 H: 圖片資料夾
+del C:\Temp\dll.log 2>$null
+
+# A. 同一個行程，先在「沒有 LogPath」時跑一批（handler 在此載入並讀到空值）
+shellthumb\isolate.exe --jsonl thumb <沒看過的 H: 資料夾 A> 5 2>$null
+
+# B. 設值，等過 TTL
 reg add "HKCU\Software\TeleDriveWebDAV" /v LogPath /t REG_SZ /d C:\Temp\dll.log /f
-# 等 3 秒（> TTL），再開另一個沒看過的資料夾
+Start-Sleep 3
+
+# C. 同一個 host 再跑一批
+shellthumb\isolate.exe --jsonl thumb <沒看過的 H: 資料夾 B> 5 2>$null
 type C:\Temp\dll.log
 ```
 
-Expected: `dll.log` 有 `GetThumbnail` 行。**這是 Task 10 的核心驗證**——
-修改之前這裡是空的。
+Expected: C 之後 `dll.log` 有 `GetThumbnail` 行。
+**A 是這個驗證的關鍵**——沒有 A，舊實作也會過。
 
-- [ ] **Step 5: Verify it turns back off in the same process**
+> 若 A 與 C 之間 shell 換了一個 host process，這個 harness 就退化成 rev 3
+> 那個證不出事的版本。用 `LogPath` 記錄裡的 process 啟動時間戳，
+> 或在同一個 `isolate.exe` 執行中涵蓋 A 與 C（`--manifest` 兩批），
+> 來確認確實是同一個 host。
+
+- [ ] **Step 5: Verify it turns back off in the same host**
 
 ```powershell
+$before = (Get-Item C:\Temp\dll.log).Length
 reg delete "HKCU\Software\TeleDriveWebDAV" /v LogPath /f
-# 等 3 秒，再開另一個沒看過的資料夾
+Start-Sleep 3
+shellthumb\isolate.exe --jsonl thumb <沒看過的 H: 資料夾 C> 5 2>$null
+(Get-Item C:\Temp\dll.log).Length -eq $before
 ```
 
-Expected: `dll.log` 沒有再長大
+Expected: `True`（關掉也要在同一個 process 內生效）
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add scripts/kill_thumb_hosts.py shellthumb/TeleDriveThumb.cpp shellthumb/TeleDriveThumb.dll
+# Source only -- *.dll is gitignored and untracked (see Task 9).
+git add scripts/kill_thumb_hosts.py shellthumb/TeleDriveThumb.cpp
 git commit -m "fix: let the DLL pick up LogPath changes without a new surrogate"
 ```
 
@@ -2309,7 +2576,9 @@ git commit -m "fix: let the DLL pick up LogPath changes without a new surrogate"
 restart.bat
 curl 127.0.0.1:8081/rpc/health
 curl 127.0.0.1:8081/rpc/counters
-curl "127.0.0.1:8081/rpc/cache-state?path=H:\game&kinds=zip"
+# H:\game itself is Loc(GAME) with no entry, so it 404s by design (Task 7).
+# Point at an actual archive.
+curl "127.0.0.1:8081/rpc/cache-state?path=H:\game\<某個封存>.zip&kinds=zip"
 ```
 
 baseline gate 要 `0 new, 0 changed`；三個端點都要 200 且內容合理。
