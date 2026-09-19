@@ -1,6 +1,6 @@
 # 真實 `H:` 巡檢與上傳往返探測 — 設計
 
-**日期：** 2026-09-19（rev 3.2）
+**日期：** 2026-09-19（rev 3.3）
 
 **實作 base：** `feat/current-backend-storage-parity` @ `39ad472`（vs `master` ahead 40 / behind 0）。
 Audit 實作走 `feat/live-browse-audit`，**不與 parity 的修復 commit 混在同一條開發線**。
@@ -72,6 +72,18 @@ rev 2 寫了 `_tdapi_legacy.py:819` 這種定位，review 指出 master 上沒�
 | 26 | `resolve()` 收段落串列、回 `Loc` 不是 `Entry`；`_cache_key()` 與 `_thumb_path()` 各打一次 backend | §5 改在薄層一次算完，legacy 只做 HTTP |
 | 27 | `key in Resolver._zips` 不等於 warm —— 列 `/game` 就會建 view | §5 改判 `view._root is not None` |
 | 28 | `JsonStore` 是 `_data` + 單一 `_path`，跟 `ShardedJsonStore._memory` 不同 | §5 兩個 store 分開實作，不共用 helper |
+
+### 0.4 rev 3.3 追加
+
+| # | 問題 | 本版 |
+|---|---|---|
+| 29 | Class B 的「屬性不讀位元組」只看 `props` 一個桶 —— DLL delegate 之後 Windows 自己從 `H:` 讀原檔，那些位元組落在 `dav_read`，檢查照樣通過 | §8.2 改看整個窗的 `props` ＋ `dav_read` ＋ `unknown` |
+| 30 | `kinds` 列了 `listing` 但無從實作 | §5 拿掉；`api_metadata` 在 `/rpc/forget` 之後必然 cold，不需要查 |
+
+**第 29 項是這一輪最重要的。** 它是「假通過」的教科書範例：檢查本身沒寫錯，
+但**失敗的位元組會流進另一個桶**，於是那條 gate 在它最該響的時候完全安靜。
+同一個形狀值得記住——每加一個「某個桶必須是 0」的斷言，都要先問
+**「真正的失敗會不會記到別的桶去」**。
 
 另外三點是 review 之外補的：**`origin` 的預設值一律 `unknown`**（冒充 `dav_read`
 是最難發現的錯標）、**`unknown` 非零即 validity 失敗**（§4）、
@@ -274,7 +286,7 @@ correctness 失敗）。見 §10。
 所以改由 bridge 回答，**而且 audit 傳路徑，不傳 key**：
 
 ```
-GET /rpc/cache-state?path=H:\...\foo.zip&kinds=zip,thumb,props,listing
+GET /rpc/cache-state?path=H:\...\foo.zip&kinds=zip,thumb,props
 → {"zip": {"memory": true, "disk": true},
    "thumb": {"memory": false, "disk": false},
    ...}
@@ -328,7 +340,7 @@ Python 端據此推出 `cold` / `warm` / `unknown`：
 
 | 快取 | cold 的條件 | 何時 unknown |
 |---|---|---|
-| `api_metadata` | `/rpc/forget` 之後 | — |
+| `api_metadata` | `/rpc/forget` 之後 | — 不經 `/rpc/cache-state`：`/rpc/forget` 之後它必然 cold |
 | `zip_index` | memory 與 disk 皆 false | — |
 | `thumb_cache` | 同上 | — |
 | `props_cache` | 同上 | — |
@@ -534,8 +546,21 @@ central directory 就不知道 entry 數。改成：
 唯一的實證）。
 
 1. 冷列舉
-2. **屬性**：`download_bytes_total{origin="props"}` 增量必須是 **0**。
-   寬高／duration 該來自 Telegram document attributes。
+2. **屬性**：這一段不可以下載任何位元組，寬高／duration 該來自 Telegram
+   document attributes。**但只檢查 `props` 那個桶是不夠的**——真正的失敗長這樣：
+
+   ```
+   property 操作 → DLL 的 /rpc/props 失敗 → delegate
+                → Windows 自己去開 H: 上的原檔 → WebDAV Range
+                → origin = dav_read
+   ```
+
+   於是 `download_bytes{props} == 0` **照樣成立**，而那正是「shell 為了拿寬高
+   去讀整張原圖」——這條檢查存在的全部理由。所以判定的是**整個量測窗的前景
+   位元組**：`props`、`dav_read`、`unknown` 三個增量都必須是 0。
+   `props` 那個桶保留，用來定位 `/rpc/props` 自己的 regression，
+   **但不單獨當 correctness gate**。（`warmup` 桶不列入——sweep 活躍時
+   依既有規則整個 op 判 `NOT_MEASURED`。）
 3. **seek 三處**各讀 1 MiB：頭、**刻意跨 part 邊界的中點**、**尾**
 4. 起播模擬：只讀頭 256 KB
 5. 整檔 SHA256 — `--full-hash` 才做
@@ -562,7 +587,7 @@ central directory 就不知道 entry 數。改成：
 
 | 層 | 指標 | 判準 |
 |---|---|---|
-| Functional | 屬性階段 `download_bytes{props}` 增量 | `== 0` |
+| Functional | 屬性階段 `download_bytes` 的 `props` **＋ `dav_read` ＋ `unknown`** 增量 | 三者皆 `== 0`，見上 |
 | Functional | 尾端 1 MiB | 讀到 1 MiB 真實資料，非 0、非短讀 |
 | Functional | 跨界 1 MiB | 與 oracle 逐位元組相符 |
 | UX | 任一 seek | budget `3 s`；`>= 5 s` 為 `UX_STALL` |

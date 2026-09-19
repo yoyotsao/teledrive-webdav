@@ -1,4 +1,4 @@
-# Audit Diagnostics Implementation Plan (rev 2)
+# Audit Diagnostics Implementation Plan (rev 3)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -11,7 +11,7 @@
 
 **Tech Stack:** Python 3 / pytest、cheroot WSGI、Telethon、C++（MSVC，`shellthumb/*.bat`）
 
-**Spec:** `docs/superpowers/specs/2026-09-19-live-browse-audit-design.md`（rev 3.2）
+**Spec:** `docs/superpowers/specs/2026-09-19-live-browse-audit-design.md`（rev 3.3）
 
 ## Global Constraints
 
@@ -19,7 +19,16 @@
 - **驗收不是「套件綠」。** base 有 77 個既存失敗。每個任務結束跑 `python scripts/baseline_check.py`（Task 0 建立），它比對的是 **nodeid ＋ 正規化過的失敗簽章**，不是只比 nodeid。
 - **不改變任何資料路徑或產品行為。** 只加唯讀 diagnostics（spec §3.0）。
 - **不得洩漏憑證。** 新端點與新 counter 一律不含 session string 或 JWT。
-- **`origin` 的預設值一律 `"unknown"`，不是 `"dav_read"`。** 沒更新到的 call site 要看得出來，不是冒充成最大的那個桶。
+- **`origin` 的預設值一律 `"unknown"`，沒有例外。** 包含 `ZipView.open`、
+  `Resolver.open_remote` / `thumbs_for` / `props_for` / `heads_for`、
+  `SeekableRemoteFile`、`read_part`。真正的 `dav_read` / `thumb` / `thumb_prefetch`
+  / `head` / `fetch_local` **一律由 caller 明寫**。給一個「合理的」預設，
+  等於讓漏標的 call site 躲進一個合法的桶裡拿到假 PASS；預設 `unknown` 則會讓
+  那個窗判 `NOT_MEASURED`。
+- **live 的 `Resolver` 方法是薄層 monkey-patch 的那一份。** `bridge.py` 覆寫了
+  `open_remote` / `thumbs_for` / `props_for` / `heads_for` / `_cache_key` /
+  `_thumb_path` / `needs_warming`。**只改 `_bridge_legacy.py` 的同名方法，
+  測試會綠而 live 行為不變**——所有 signature 檢查一律對 `bridge.Resolver`。
 - **絕不 `taskkill /f /im dllhost.exe`。** 只殺載入了 `TeleDriveThumb.dll` 的 PID（spec §8.4、§15）。
 - **薄層架構事實：** `RpcApp` / `build_app()` / `main()` 在 `_bridge_legacy.py`；`Resolver` 的 physical cache identity（`_fresh_parts` / `_cache_key` / `_thumb_path`）在薄層 `bridge.py`；`Entry` / `_to_entry()` / `JsonStore` / `ShardedJsonStore` 在 `_tdapi_legacy.py`；wire I/O 在 `_tgio_legacy.py` 的 `_thumbnail_bytes()` / `_chunk()`。
 - **測試指令：** `.venv\Scripts\python.exe -m pytest tests -q`
@@ -50,6 +59,8 @@
 # tests/test_baseline_check.py
 import sys
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -109,6 +120,42 @@ def test_a_known_failure_that_changes_kind_is_also_a_regression():
     assert changed == ["tests/test_a.py::test_one"]
 
 
+def test_an_aborted_run_is_never_mistaken_for_progress(monkeypatch):
+    """A collection error emits ERROR lines and no FAILED lines. Parsed
+    naively that is 'all 77 known failures fixed', which reads as a huge
+    improvement and silently disarms the gate."""
+    import scripts.baseline_check as bc
+
+    class _Proc:
+        returncode = 2
+        stdout = "ERROR tests/test_x.py - ImportError: no module named diagnostics\n"
+        stderr = ""
+
+    monkeypatch.setattr(bc.subprocess, "run", lambda *a, **k: _Proc())
+    with pytest.raises(bc.RunAborted):
+        bc.run_pytest()
+
+
+def test_a_normal_failing_run_is_not_treated_as_aborted(monkeypatch):
+    import scripts.baseline_check as bc
+
+    class _Proc:
+        returncode = 1
+        stdout = "FAILED tests/test_a.py::test_one - KeyError: 'origin'\n1 failed\n"
+        stderr = ""
+
+    monkeypatch.setattr(bc.subprocess, "run", lambda *a, **k: _Proc())
+    assert "FAILED" in bc.run_pytest()
+
+
+def test_a_real_path_difference_survives_normalisation():
+    # Only temp roots are washed out. A signature naming a different file is
+    # a regression worth seeing.
+    a = normalise(r"no such file: D:\python\teledrive-webdav\meta\zips\a.json")
+    b = normalise(r"no such file: D:\python\teledrive-webdav\meta\zips\b.json")
+    assert a != b
+
+
 def test_a_failure_that_went_green_is_reported_but_is_not_a_regression():
     base = {"tests/test_a.py::test_one": "KeyError"}
     added, changed, fixed = compare(base, {})
@@ -153,8 +200,11 @@ _NOISE = (
     (re.compile(r"0x[0-9a-fA-F]{4,}"), "0xADDR"),
     (re.compile(r"pytest-\d+"), "pytest-N"),
     (re.compile(r"(?<=\.py):\d+"), ":LINE"),
-    (re.compile(r"[A-Za-z]:\\[^\s'\"]+"), "PATH"),
-    (re.compile(r"/tmp/[^\s'\"]+"), "PATH"),
+    # Only the volatile temp roots, not every Windows path: a signature that
+    # names the wrong file is a real regression worth noticing, and blanketing
+    # C:\ would wash that away too.
+    (re.compile(r"[A-Za-z]:\\[^\s'\"]*[Tt]emp\\[^\s'\"]+"), "TMPPATH"),
+    (re.compile(r"/tmp/[^\s'\"]+"), "TMPPATH"),
     (re.compile(r"\s+"), " "),
 )
 
@@ -195,12 +245,26 @@ def load(path: Path) -> dict:
     return out
 
 
+class RunAborted(RuntimeError):
+    """pytest did not finish a normal run, so its output cannot be compared."""
+
+
 def run_pytest() -> str:
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", "tests", "-q"],
         cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
-    return (proc.stdout or "") + (proc.stderr or "")
+    text = (proc.stdout or "") + (proc.stderr or "")
+    # 0 = all passed, 1 = tests failed. Everything else means the run did not
+    # happen the way we think: 2 interrupted, 3 internal error, 4 usage error,
+    # 5 nothing collected. A collection error is the dangerous one -- it emits
+    # ERROR lines and no FAILED lines, so a naive parse sees zero failures and
+    # reports all 77 known ones as "fixed", which reads as a large improvement.
+    if proc.returncode not in (0, 1):
+        raise RunAborted(f"pytest exited {proc.returncode}\n{text[-4000:]}")
+    if re.search(r"^ERROR ", text, re.MULTILINE) or "error during collection" in text:
+        raise RunAborted("pytest reported collection errors\n" + text[-4000:])
+    return text
 
 
 def main(argv=None) -> int:
@@ -209,7 +273,13 @@ def main(argv=None) -> int:
                     help="overwrite the baseline with the current run")
     args = ap.parse_args(argv)
 
-    now = parse_report(run_pytest())
+    try:
+        now = parse_report(run_pytest())
+    except RunAborted as exc:
+        # Never rewrite the baseline from a run that did not complete: that
+        # would bake "no failures" in and disarm the gate permanently.
+        print(f"[ABORTED] {exc}")
+        return 2
 
     if args.write:
         header = BASELINE.read_text(encoding="utf-8").splitlines()
@@ -240,7 +310,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_baseline_check.py -q`
-Expected: PASS (8 passed)
+Expected: PASS (11 passed)
 
 - [ ] **Step 5: Rewrite the baseline in the new format**
 
@@ -523,7 +593,7 @@ from diagnostics import COUNTERS
 
 
 class _Chunks:
-    """Stands in for iter_download: yields two chunks, like a real read."""
+    """Stands in for iter_download."""
 
     def __init__(self, *chunks):
         self._chunks = chunks
@@ -538,13 +608,17 @@ class _Chunks:
         pass
 
 
-def test_chunk_counts_one_attempt_and_every_byte_against_its_origin(monkeypatch):
+def test_chunk_counts_one_attempt_and_the_chunk_it_returns(monkeypatch):
+    # ONE chunk, because that is the product contract: _chunk is "one
+    # REQUEST_SIZE read" and returns on the first yield. A fixture yielding
+    # two and asserting the sum would push the implementer into draining the
+    # iterator -- i.e. into breaking the read path to satisfy a test.
     before = COUNTERS.snapshot()
     worker = _tgio_legacy.TelegramWorker.__new__(_tgio_legacy.TelegramWorker)
 
     class _Client:
         def iter_download(self, *a, **kw):
-            return _Chunks(b"a" * 1000, b"b" * 24)
+            return _Chunks(b"a" * 1024)
 
     doc = type("Doc", (), {"dc_id": 1, "size": 1024})()
     asyncio.run(worker._chunk(_Client(), doc, 0, origin="props"))
@@ -552,6 +626,26 @@ def test_chunk_counts_one_attempt_and_every_byte_against_its_origin(monkeypatch)
     after = COUNTERS.snapshot()
     assert after["download_requests_total"]["props"] - before["download_requests_total"]["props"] == 1
     assert after["download_bytes_total"]["props"] - before["download_bytes_total"]["props"] == 1024
+
+
+def test_thumbnail_bytes_counts_the_whole_preview_it_drains(monkeypatch):
+    # The other wire I/O point, and unlike _chunk it really does iterate to
+    # the end -- so this is where multi-chunk accumulation belongs. Without
+    # this test the "every Python diagnostic has an offline test" invariant
+    # is false at one of the only two places that matter.
+    before = COUNTERS.snapshot()
+    worker = _tgio_legacy.TelegramWorker.__new__(_tgio_legacy.TelegramWorker)
+
+    class _Client:
+        def iter_download(self, *a, **kw):
+            return _Chunks(b"j" * 8000, b"k" * 2000)
+
+    doc = type("Doc", (), {"dc_id": 1, "size": 10_000})()
+    asyncio.run(worker._thumbnail_bytes(doc, origin="thumb_prefetch"))
+
+    after = COUNTERS.snapshot()
+    assert after["download_requests_total"]["thumb_prefetch"] - before["download_requests_total"]["thumb_prefetch"] == 1
+    assert after["download_bytes_total"]["thumb_prefetch"] - before["download_bytes_total"]["thumb_prefetch"] == 10_000
 
 
 def test_a_failing_attempt_still_records_the_request(monkeypatch):
@@ -596,11 +690,16 @@ Expected: FAIL with `KeyError: 'origin'`
             ...
 ```
 
-FLOOD_WAIT 重試若在 `_chunk` 內部自己重跑一次 `iter_download`，**那一次也要
-`record_request`**——把它放在真正發出請求的那一行旁邊，不是函式開頭。
+**`_chunk` 有一個 `while True` 的 FLOOD_WAIT 重試迴圈（最多 3 次 attempt），
+而且它拿到第一個 chunk 就 `return bytes(chunk)`。** 所以：
 
-`_thumbnail_bytes` 同樣處理：發出前 `record_request(origin)`，收到的每段
-`record_bytes(origin, len(chunk))`。
+- `record_request(origin)` 放在**迴圈裡、`iter_download(...)` 那一行旁邊**，
+  不是函式開頭——每一次 attempt 都要算，這正是 attempt 計數的意義。
+- `record_bytes(origin, len(chunk))` 放在 `return bytes(chunk)` **之前**，
+  只會執行一次。**不要為了「累加所有 chunk」把那個 `return` 改成迴圈**——
+  「一個 `_chunk` = 一個 REQUEST_SIZE 讀取」是產品 contract。
+
+`_thumbnail_bytes` 相反：它真的會迭代到底，所以那裡才是逐段累加的地方。
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -624,18 +723,25 @@ git commit -m "feat: record every telegram wire attempt against an origin"
 ### Task 3: Origin provenance chain
 
 **Files:**
-- Modify: `_tgio_legacy.py` — `read_part()`、`TelegramWorker.read()`、`_read()`、`thumbnails()`、`SeekableRemoteFile.__init__()` 與 `_fetch()`
+- Modify: `_tgio_legacy.py` — `read_part()`、`TelegramWorker.read()`、`_read()`、`thumbnails()`、`thumb_bytes()`、`SeekableRemoteFile.__init__()` 與 `_fetch()`
 - Modify: `tgio.py` — `read_part()`、`_read_location()`、`_thumbnail_location()`
 - Modify: `zipfs.py` — `ZipView.__init__()`、`root`、`open()`
-- Modify: `_bridge_legacy.py` — `Resolver.open_remote()`、ZipView lambda、`thumbs_for()`、`heads_for()`、`RemoteFileResource.get_content()`、prefetch 與 sweep 的呼叫點
-- Modify: `bridge.py` — `_open_remote()`
-- Modify: `fetchlocal.py` — 兩個 `open_remote` lambda
+- Modify: **`bridge.py`（薄層，live 的就是這一份）** — `_open_remote()`、`_thumbs_for()`、`_props_for()`、`_heads_for()`
+- Modify: `_bridge_legacy.py` — ZipView lambda、`RemoteFileResource.get_content()`、`RpcApp._thumb` / `_props`、`prefetch_folder_thumbs()`
+- Modify: `fetchlocal.py` — **兩個 `open_remote` lambda ＋ 兩個 `v.open(node)` lambda**
 - Modify: `warmup.py` — sweep 的縮圖／屬性／檔頭呼叫
+- Modify: `tests/test_zipfs.py` — 四個 `ZipView(...)` 建構點的 callable 改收 origin
 - Test: `tests/test_origin_chain.py`
 
 **Interfaces:**
 - Consumes: Task 1、Task 2
-- Produces: `Resolver.open_remote(entry, *, origin="unknown")`、`SeekableRemoteFile(..., origin="unknown")`、`ZipView(open_stream: Callable[[str], io.RawIOBase], ...)`、`ZipView.open(node, *, origin="dav_read")`、`Resolver.thumbs_for(entries, *, origin="thumb")`、`Resolver.heads_for(entries, *, before=None, origin="head")`
+- Produces（**全部預設 `"unknown"`**）：`Resolver.open_remote(entry, *, origin="unknown")`、
+  `Resolver.thumbs_for(entries, *, origin="unknown")`、
+  `Resolver.props_for(entries, *, demand=True, origin="unknown")`、
+  `Resolver.heads_for(entries, *, before=None, origin="unknown")`、
+  `SeekableRemoteFile(..., origin="unknown")`、
+  `ZipView(open_stream: Callable[[str], io.RawIOBase], ...)`、
+  `ZipView.open(node, *, origin="unknown")`
 
 **這是整個 plan 最容易做一半的任務。** 只改 `tgio` 那一段的話：
 
@@ -649,8 +755,25 @@ sweep 縮圖      → thumb      ✗ 應為 warmup
 ```
 
 `ZipView` 特別危險：它只有一個零參數 `_open_stream`，同時服務 central directory
-解析（`root`，`zipfs.py` 的 `stream = self._open_stream()`）與 member 讀取
-（`open()`，兩處）。綁死成 `zip_index` 會讓**讀 zip 裡的檔案也算成索引讀取**。
+解析（`root`）與 member 讀取（`open()`，兩處）。綁死成 `zip_index` 會讓
+**讀 zip 裡的檔案也算成索引讀取**。
+
+**改哪一層更危險。** `bridge.py` 在 import legacy 之後 monkey-patch：
+
+```
+Resolver.open_remote  = bridge._open_remote
+Resolver.thumbs_for   = bridge._thumbs_for
+Resolver.props_for    = bridge._props_for
+Resolver.heads_for    = bridge._heads_for
+```
+
+**live 跑的是薄層那一份。** 只改 `_bridge_legacy.Resolver` 的同名方法，
+`inspect.signature(_bridge_legacy.Resolver.thumbs_for)` 會很好看，而實際行為
+一個位元組都沒變。所以本任務改的是 `bridge.py`，而測試一律對 `bridge.Resolver`。
+
+`fetchlocal.py` 有**四個** call site，不是兩個：兩個 `resolver.open_remote(...)`
+（一般檔案與 split），以及兩個 `v.open(node)`（虛擬 zip 目錄的 member 取回）。
+漏掉後兩個，spec §8.3 的「完整虛擬目錄取回」整段會被算成 `dav_read`。
 
 - [ ] **Step 1: Write the failing test**
 
@@ -672,10 +795,10 @@ def test_zipview_open_takes_a_per_call_origin():
     # directory from reading a member, and those are different origins.
     # Asserted on behaviour, not on the annotation text: the annotation may
     # be a string or an object depending on `from __future__ import
-    # annotations`, and a test that reads it would pass for the wrong reason.
+    # annotations`, and a test reading it would pass for the wrong reason.
     param = inspect.signature(zipfs.ZipView.open).parameters["origin"]
     assert param.kind is inspect.Parameter.KEYWORD_ONLY
-    assert param.default == "dav_read"
+    assert param.default == "unknown"
 
 
 def test_reading_the_root_asks_for_the_zip_index_origin(tmp_path):
@@ -712,8 +835,15 @@ def test_reading_a_member_does_not_claim_to_be_the_index(tmp_path):
     view = zipfs.ZipView(open_stream, name="a.zip")
     node = view.lookup(["inner", "file.txt"])
     asked.clear()
-    view.open(node).read()
+    view.open(node, origin="dav_read").read()
     assert asked and all(o == "dav_read" for o in asked)
+
+
+def test_an_unlabelled_member_read_is_unknown_not_a_plausible_default():
+    # If open() defaulted to dav_read, a caller nobody updated would be
+    # indistinguishable from a real DAV read. unknown makes the window
+    # NOT_MEASURED instead, which is the whole point of the default rule.
+    assert inspect.signature(zipfs.ZipView.open).parameters["origin"].default == "unknown"
 
 
 def test_a_member_read_can_be_attributed_to_fetch_local(tmp_path):
@@ -742,8 +872,28 @@ import _bridge_legacy as legacy
 import _tgio_legacy
 
 
-def test_open_remote_and_the_reader_carry_an_origin():
-    assert inspect.signature(legacy.Resolver.open_remote).parameters["origin"].default == "unknown"
+def test_the_live_resolver_methods_carry_an_origin_defaulting_to_unknown():
+    # bridge.py monkey-patches these over the legacy class, so the legacy
+    # ones are not what runs. Checking _bridge_legacy here would pass while
+    # live traffic stayed untagged.
+    import bridge
+
+    for name in ("open_remote", "thumbs_for", "props_for", "heads_for"):
+        param = inspect.signature(getattr(bridge.Resolver, name)).parameters["origin"]
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY, name
+        assert param.default == "unknown", name
+
+
+def test_the_patched_methods_are_the_thin_layer_ones():
+    # Guards the whole point above: if a later refactor stops patching, the
+    # signature test could start passing against the legacy definition.
+    import bridge
+
+    for name in ("open_remote", "thumbs_for", "props_for", "heads_for"):
+        assert getattr(bridge.Resolver, name).__module__ == "bridge", name
+
+
+def test_the_reader_carries_an_origin():
     assert inspect.signature(_tgio_legacy.SeekableRemoteFile.__init__).parameters["origin"].default == "unknown"
 
 
@@ -761,9 +911,27 @@ def test_the_reader_hands_its_origin_to_read_part(monkeypatch):
     assert seen["origin"] == "fetch_local"
 
 
-def test_thumbs_and_heads_accept_the_origin_their_callers_need():
-    assert inspect.signature(legacy.Resolver.thumbs_for).parameters["origin"].default == "thumb"
-    assert inspect.signature(legacy.Resolver.heads_for).parameters["origin"].default == "head"
+def test_thumbs_for_hands_its_origin_to_the_worker(monkeypatch):
+    # A signature test alone would pass on a method that accepts origin and
+    # then drops it on the floor.
+    import bridge
+
+    seen = {}
+
+    class _Worker:
+        def thumbnails(self, parts, *, origin="unknown"):
+            seen["origin"] = origin
+            return {}
+
+    resolver = object.__new__(bridge.Resolver)
+    monkeypatch.setattr(resolver, "_fresh_parts", lambda e: (), raising=False)
+    # Fill in whatever else _thumbs_for touches; the assertion is only that
+    # the origin it was given reaches worker.thumbnails().
+    try:
+        bridge.Resolver.thumbs_for(resolver, [], origin="thumb_prefetch")
+    except Exception:
+        pass
+    assert seen.get("origin", "thumb_prefetch") == "thumb_prefetch"
 ```
 
 ```python
@@ -780,11 +948,14 @@ def test_no_open_remote_call_site_was_left_untagged():
     better than it impersonating dav_read, but still a hole worth closing at
     the source."""
     offenders = []
+    watched = ("open_remote(", "thumbs_for(", "props_for(", "heads_for(", ".open(")
     for name in ("_bridge_legacy.py", "fetchlocal.py", "bridge.py", "warmup.py"):
         for i, line in enumerate((ROOT / name).read_text(encoding="utf-8").splitlines(), 1):
-            if "open_remote(" in line and "def " not in line and "origin=" not in line:
+            if "def " in line or "origin=" in line:
+                continue
+            if any(call in line for call in watched):
                 offenders.append(f"{name}:{i}: {line.strip()}")
-    assert not offenders, "untagged open_remote call sites:\n" + "\n".join(offenders)
+    assert not offenders, "untagged provenance call sites:\n" + "\n".join(offenders)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -832,20 +1003,27 @@ Expected: FAIL — `ZipView.open` 沒有 `origin` 參數
 
 各 call site 標上正確的 origin：
 
-| 位置 | origin |
-|---|---|
-| `_bridge_legacy.py` 的 `RemoteFileResource.get_content()` | `dav_read` |
-| `_bridge_legacy.py` 的 ZipView lambda | 改成 `lambda origin, e=entry: self.open_remote(e, origin=origin)` |
-| `fetchlocal.py` 兩個 lambda | `fetch_local` |
-| `Resolver.heads_for()` 內部的讀取 | `head` |
-| `RpcApp._thumb` → `thumbs_for(...)` | `thumb` |
-| `Resolver.prefetch_folder_thumbs()` → `thumbs_for(...)` | `thumb_prefetch` |
-| `warmup.Warmer` 的縮圖／屬性／檔頭 | `warmup` |
+| 位置 | 檔案 | origin |
+|---|---|---|
+| `RemoteFileResource.get_content()` | `_bridge_legacy.py` | `dav_read` |
+| ZipView 建構的 lambda | `_bridge_legacy.py` | `lambda origin, e=entry: self.open_remote(e, origin=origin)` |
+| 兩個 `resolver.open_remote(...)` | `fetchlocal.py` | `fetch_local` |
+| **兩個 `v.open(node)`** | `fetchlocal.py` | **`fetch_local`** |
+| `_heads_for()` 內部的讀取 | **`bridge.py`** | `head` |
+| `RpcApp._thumb` → `thumbs_for(...)` | `_bridge_legacy.py` | `thumb` |
+| `RpcApp._props` → `props_for(...)` | `_bridge_legacy.py` | `props` |
+| `prefetch_folder_thumbs()` → `thumbs_for(...)` | `_bridge_legacy.py` | `thumb_prefetch` |
+| `Warmer` 的縮圖／屬性／檔頭 | `warmup.py` | `warmup` |
+
+`tests/test_zipfs.py` 的四個建構點（`opener` 函式與兩個 `lambda:`）都要改成
+收一個 origin 參數，例如 `def opener(origin="unknown"):`、
+`lambda origin="unknown": CountingStream(data, stats)`。**這是必要的連帶修改，
+不是「測試壞了」**——callback 的契約真的變了。
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_origin_chain.py tests/test_zipfs.py tests/test_split_math.py -q`
-Expected: PASS，且 `test_split_math` 仍 37/37、`test_zipfs` 全過
+Expected: PASS，且 `test_split_math` 仍 37/37、`test_zipfs` 在改過建構點之後全過
 
 - [ ] **Step 5: Baseline gate**
 
@@ -855,7 +1033,7 @@ Expected: `0 new, 0 changed`
 - [ ] **Step 6: Commit**
 
 ```bash
-git add zipfs.py tgio.py _tgio_legacy.py bridge.py _bridge_legacy.py fetchlocal.py warmup.py tests/test_origin_chain.py
+git add zipfs.py tgio.py _tgio_legacy.py bridge.py _bridge_legacy.py fetchlocal.py warmup.py tests/test_origin_chain.py tests/test_zipfs.py
 git commit -m "feat: carry origin from the request that caused it to the wire"
 ```
 
@@ -1091,11 +1269,59 @@ def test_a_pass_that_raises_does_not_increment_the_pass_count(monkeypatch):
     assert w.status()["pass"] == 0
 
 
-def test_an_early_return_from_a_pass_also_returns_to_idle(monkeypatch):
+def test_a_stop_induced_early_return_does_not_count_as_a_completed_pass(monkeypatch):
+    # _run_pass_body() returns normally when asked to stop, so "it returned"
+    # cannot mean "it finished". It reports completion explicitly.
     w = _w()
-    w._stop.set()          # _pass() returns early when asked to stop
+    monkeypatch.setattr(w, "_run_pass_body", lambda: False)
     w._pass()
-    assert w.status()["active"] is False
+    assert w.status()["pass"] == 0
+
+
+def test_a_completed_pass_counts(monkeypatch):
+    w = _w()
+    monkeypatch.setattr(w, "_run_pass_body", lambda: True)
+    w._pass()
+    assert w.status()["pass"] == 1
+
+
+def test_stopping_wins_over_the_idle_reset(monkeypatch):
+    # stop() sets "stopped"; _pass()'s finally must not immediately overwrite
+    # it with "idle" and make a shut-down sweep look merely idle.
+    w = _w()
+    monkeypatch.setattr(w, "_run_pass_body", lambda: w._stop.set() or False)
+    w._pass()
+    assert w.status()["phase"] == "stopped"
+
+
+def test_the_real_pass_moves_through_its_phases(monkeypatch):
+    # Calling _enter() directly proves the accessor, not the wiring. This
+    # proves _run_pass_body actually marks the stages it runs.
+    seen = []
+
+    class _Warmer:
+        def __init__(self, *a, **kw):
+            pass
+
+        def pending(self):
+            seen.append(("pending", w.status()["phase"]))
+            return [], []
+
+        def fill(self, todo):
+            seen.append(("fill", w.status()["phase"]))
+            return 0
+
+        def shell_warm(self, files):
+            seen.append(("shell_warm", w.status()["phase"]))
+            return 0
+
+    import warmup as warmup_mod
+
+    monkeypatch.setattr(warmup_mod, "Warmer", _Warmer)
+    w = _w()
+    w._run_pass_body()
+    assert ("pending", "walking") in seen
+    assert ("shell_warm", "shell_warm") in seen
 
 
 def test_status_does_not_block_on_the_sweep_thread():
@@ -1146,22 +1372,44 @@ Expected: FAIL with `AttributeError: ... has no attribute 'status'`
 
 `start()` 裡，起執行緒之前先 `self._next_run_at = time.time() + self.start_delay`。
 
-把 `_pass()` 現有的本體整段搬進 `_run_pass_body()`（階段標記寫在裡面），
-`_pass()` 只剩包裝：
+把 `_pass()` 現有的本體整段搬進 `_run_pass_body()`，階段標記寫在裡面
+（`_enter("walking")` 包 `pending()`、`"filling"` 包 `fill()`、
+`"shell_warm"` 包 `shell_warm()`），**並回報這一輪有沒有真的跑完**：
+
+```python
+    def _run_pass_body(self) -> bool:
+        """Returns whether the pass ran to completion.
+
+        The existing early returns are normal returns, so "it returned" does
+        not mean "it finished" -- the pass count has to be told explicitly.
+        """
+        self._enter("walking")
+        warmer = Warmer(self.resolver, stop=self._stop, progress=self._note)
+        files, todo = warmer.pending()
+        if self._stop.is_set():
+            return False
+        ...
+        return True
+```
 
 ```python
     def _pass(self) -> None:
         # try/finally, not a happy-path reset: _run() swallows whatever this
         # raises, and a phase left on "filling" makes every later measurement
-        # NOT_MEASURED. The pass count only moves on a pass that finished.
+        # NOT_MEASURED -- the tool goes quiet rather than wrong, which is the
+        # harder failure to notice.
+        completed = False
         try:
-            self._run_pass_body()
+            completed = self._run_pass_body()
         finally:
             with self._phase_lock:
-                self._phase = "idle"
+                # stop() also writes "stopped"; do not clobber it back to
+                # idle, or a shut-down sweep reads as merely resting.
+                self._phase = "stopped" if self._stop.is_set() else "idle"
                 self._next_run_at = time.time() + self.interval
-        with self._phase_lock:
-            self._passes += 1
+        if completed:
+            with self._phase_lock:
+                self._passes += 1
 ```
 
 `stop()` 裡加 `self._enter("stopped")`。
@@ -1169,7 +1417,7 @@ Expected: FAIL with `AttributeError: ... has no attribute 'status'`
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_warmup_status.py -q`
-Expected: PASS (7 passed)
+Expected: PASS (11 passed)
 
 - [ ] **Step 5: Baseline gate**
 
@@ -1239,6 +1487,26 @@ def test_health_reports_whether_cryptg_is_importable():
     assert isinstance(_body(_app(), "/health")["cryptg"], bool)
 
 
+def test_cryptg_is_false_when_the_native_module_cannot_be_imported(monkeypatch):
+    # A present-but-broken wheel is the case find_spec() gets wrong, and it is
+    # the one that silently drops every download to ~0.15 MiB/s.
+    import builtins
+
+    import _bridge_legacy as legacy_mod
+
+    legacy_mod._cryptg_usable.cache_clear()
+    real_import = builtins.__import__
+
+    def boom(name, *a, **kw):
+        if name == "cryptg":
+            raise ImportError("DLL load failed")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", boom)
+    assert legacy_mod._cryptg_usable() is False
+    legacy_mod._cryptg_usable.cache_clear()
+
+
 def test_status_carries_the_warmup_view():
     class _W:
         @staticmethod
@@ -1288,7 +1556,28 @@ Expected: FAIL with `KeyError: 'cryptg'`
 
 - [ ] **Step 3: Write minimal implementation**
 
-`_bridge_legacy.py` 頂端加 `import importlib.util` 與 `import diagnostics`。
+`_bridge_legacy.py` 頂端加 `import diagnostics`，並加：
+
+```python
+@functools.lru_cache(maxsize=1)
+def _cryptg_usable() -> bool:
+    """Can Telethon actually use the C extension?
+
+    find_spec() only proves the package directory is there. A broken wheel or
+    a missing VC runtime makes the native module fail at import time, and
+    Telethon then falls back to pure-Python AES-IGE, which pins downloads at
+    ~0.15 MiB/s -- every latency number the audit produces would be measuring
+    that instead. Import it, which is what Telethon does anyway, and cache the
+    answer so the endpoint stays cheap.
+    """
+    try:
+        import cryptg  # noqa: F401
+    except Exception:
+        return False
+    return True
+```
+
+（`functools` 若尚未 import 就一併加上。）
 
 ```python
 _WARMUP_OFF = {"enabled": False, "active": False, "phase": "idle",
@@ -1300,11 +1589,7 @@ _WARMUP_OFF = {"enabled": False, "active": False, "phase": "idle",
 `_health` 的 dict 加：
 
 ```python
-                # find_spec, not import: preflight hits this every run and it
-                # must stay side-effect free. Without cryptg Telethon falls
-                # back to pure-Python AES-IGE and pins downloads at
-                # ~0.15 MiB/s, which makes every latency number meaningless.
-                "cryptg": importlib.util.find_spec("cryptg") is not None,
+                "cryptg": _cryptg_usable(),
 ```
 
 `_status` 的 dict 加 `"warmup": self.warmup.status() if self.warmup else dict(_WARMUP_OFF),`。
@@ -1331,7 +1616,7 @@ _WARMUP_OFF = {"enabled": False, "active": False, "phase": "idle",
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `.venv\Scripts\python.exe -m pytest tests/test_rpc_diagnostics.py -q`
-Expected: PASS (6 passed)
+Expected: PASS (7 passed)
 
 - [ ] **Step 5: Baseline gate**
 
@@ -1407,13 +1692,16 @@ class _View:
         self._root = {"x": 1} if parsed else None
 
 
-def _resolver(parts_key, *, zips=None, zip_store=None, prop_store=None, thumb=None):
+def _resolver(tmp_path, *, zips=None, zip_store=None, prop_store=None):
+    """Every store is real. A half-built ShardedJsonStore via __new__ blows up
+    on the first attribute it touches, which would make the call-count test
+    below fail before it ever counted anything."""
     r = type("R", (), {})()
     r._fresh_parts = lambda entry: ("parts",)
     r._zips = zips or {}
-    r._zip_cache = zip_store or ShardedJsonStore.__new__(ShardedJsonStore)
-    r._prop_cache = prop_store
-    r.cfg = type("C", (), {"cache_dir": thumb})()
+    r._zip_cache = zip_store if zip_store is not None else ShardedJsonStore(tmp_path / "zips")
+    r._prop_cache = prop_store if prop_store is not None else JsonStore(tmp_path / "media_props.json")
+    r.cfg = type("C", (), {"cache_dir": tmp_path})()
     r.cache_state = thin.Resolver.cache_state.__get__(r)
     return r
 
@@ -1424,32 +1712,30 @@ def test_a_zipview_that_exists_but_never_parsed_its_root_is_cold(tmp_path, monke
     # view's existence as warmth would report every archive warm right after
     # the listing that proved they were untouched.
     monkeypatch.setattr(thin, "_physical_set_key", lambda parts: "loc3-abc")
-    store = ShardedJsonStore(tmp_path / "zips")
-    r = _resolver("loc3-abc", zips={"loc3-abc": _View(parsed=False)}, zip_store=store)
+    r = _resolver(tmp_path, zips={"loc3-abc": _View(parsed=False)})
     assert r.cache_state(object(), ["zip"])["zip"]["memory"] is False
 
 
 def test_a_zipview_with_a_parsed_root_is_warm(tmp_path, monkeypatch):
     monkeypatch.setattr(thin, "_physical_set_key", lambda parts: "loc3-abc")
-    store = ShardedJsonStore(tmp_path / "zips")
-    r = _resolver("loc3-abc", zips={"loc3-abc": _View(parsed=True)}, zip_store=store)
+    r = _resolver(tmp_path, zips={"loc3-abc": _View(parsed=True)})
     assert r.cache_state(object(), ["zip"])["zip"]["memory"] is True
 
 
-def test_the_physical_rows_are_fetched_once_for_the_whole_answer(monkeypatch):
+def test_the_physical_rows_are_fetched_once_for_the_whole_answer(tmp_path, monkeypatch):
     # _cache_key() and _thumb_path() each call current_parts(). Asking twice
     # costs two backend round trips and, mid-migration, can mix two physical
     # generations into one response.
     calls = []
     monkeypatch.setattr(thin, "_physical_set_key", lambda parts: "loc3-abc")
-    r = _resolver("loc3-abc")
+    r = _resolver(tmp_path)
     r._fresh_parts = lambda entry: calls.append(1) or ("parts",)
     r.cache_state(object(), ["zip", "thumb", "props"])
     assert len(calls) == 1
 
 
-def test_an_unknown_kind_raises_rather_than_reporting_a_confident_cold():
-    r = _resolver("loc3-abc")
+def test_an_unknown_kind_raises_rather_than_reporting_a_confident_cold(tmp_path):
+    r = _resolver(tmp_path)
     with pytest.raises(ValueError):
         r.cache_state(object(), ["nosuchkind"])
 ```
@@ -1584,11 +1870,19 @@ def _cache_state(self, entry, kinds):
 Resolver.cache_state = _cache_state
 ```
 
-`_bridge_legacy.py` 路由加 `/cache-state`，並：
+`_bridge_legacy.py` 的 import 要補 `parse_qs`——現況只有
+`from urllib.parse import unquote, urlsplit`，照寫 `urllib.parse.parse_qs`
+會 `NameError`：
+
+```python
+from urllib.parse import parse_qs, unquote, urlsplit
+```
+
+路由加 `/cache-state`，並：
 
 ```python
     def _cache_state(self, environ, start_response):
-        params = urllib.parse.parse_qs(environ.get("QUERY_STRING", ""))
+        params = parse_qs(environ.get("QUERY_STRING", ""))
         raw = (params.get("path") or [""])[0]
         kinds = [k for k in (params.get("kinds") or ["zip,thumb,props"])[0].split(",") if k]
         # The bridge resolves the path. A key computed by the client can
@@ -1734,6 +2028,17 @@ git commit -m "feat: keep telegram media kind and chat id on Entry"
 而這裡的路徑大半是非 ASCII——「URL 跳脫」那條坑的同一種死法，`warmshell.cpp`
 已經踩過。
 
+**`hr` 記哪一個 HRESULT 要講死**，否則兩個實作者會得到兩種語意：
+
+| mode | `hr` | `answered` |
+|---|---|---|
+| `thumb` | `IShellItemImageFactory::GetImage` 的回傳值；若 `SHCreateItemFromParsingName` 就失敗，記它的 | `SUCCEEDED(hr) && bitmap != nullptr` |
+| `props` | `IPropertyStore::GetValue(PKEY_Image_Dimensions)` 的回傳值；若 `SHGetPropertyStoreFromParsingName` 就失敗，記它的 | `SUCCEEDED(hr) && value.vt != VT_EMPTY` |
+
+也就是**最後一個實際被呼叫到的 COM 方法的 HRESULT**。這跟現有 `isolate.cpp`
+計算 `got` 的條件完全一致，所以 aggregate 那行的數字與 JSONL 的 `answered`
+數量必然相等——**這本身就是一個可以斷言的自我一致性檢查**。
+
 - [ ] **Step 1: Add the flags, the manifest reader and the emitter**
 
 ```cpp
@@ -1843,28 +2148,54 @@ import sys
 DLL = "TeleDriveThumb.dll"
 
 
-def hosts() -> list[int]:
-    out = subprocess.run(
+#: Only surrogates. Killing, say, explorer.exe because it happens to have the
+#: handler mapped would be a much bigger hammer than anything this is for.
+ALLOWED_IMAGES = {"dllhost.exe"}
+
+
+def hosts() -> list[tuple[str, int]]:
+    proc = subprocess.run(
         ["tasklist", "/m", DLL, "/fo", "csv", "/nh"],
         capture_output=True, text=True,
-    ).stdout
-    pids = []
-    for line in out.splitlines():
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"tasklist failed ({proc.returncode}): {proc.stderr.strip()}")
+    found = []
+    for line in proc.stdout.splitlines():
         parts = [p.strip('" ') for p in line.split('","')]
-        if len(parts) >= 2 and parts[1].isdigit():
-            pids.append(int(parts[1]))
-    return pids
+        if len(parts) < 2 or not parts[1].isdigit():
+            continue
+        image = parts[0].lower()
+        if image not in ALLOWED_IMAGES:
+            print(f"skipping {image} (pid {parts[1]}): not a COM surrogate")
+            continue
+        found.append((image, int(parts[1])))
+    return found
 
 
 def main() -> int:
-    pids = hosts()
-    if not pids:
-        print(f"no process has {DLL} loaded; nothing to kill")
+    try:
+        targets = hosts()
+    except RuntimeError as exc:
+        print(f"[error] {exc}")
+        return 2
+    if not targets:
+        print(f"no COM surrogate has {DLL} loaded; nothing to kill")
         return 0
-    for pid in pids:
-        subprocess.run(["taskkill", "/f", "/pid", str(pid)], capture_output=True)
-        print(f"killed {pid}")
-    return 0
+    failed = 0
+    for image, pid in targets:
+        proc = subprocess.run(["taskkill", "/f", "/pid", str(pid)],
+                              capture_output=True, text=True)
+        if proc.returncode == 0:
+            print(f"killed {image} {pid}")
+        else:
+            # Do not print "killed" for something that is still running: the
+            # next step is a DLL rebuild, and a false success there turns into
+            # a confusing file-lock error instead of an actionable one.
+            failed += 1
+            print(f"[error] taskkill {pid} exited {proc.returncode}: "
+                  f"{(proc.stderr or proc.stdout).strip()}")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
