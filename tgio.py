@@ -233,10 +233,18 @@ def _media_info_location(self, location, peer):
     return _legacy._media_attributes(media)
 
 
+# Captured before the seam below rebinds ``_legacy.read_part`` to the wrapper
+# defined here. Reaching for ``_legacy.read_part`` at call time would find that
+# rebinding and recurse until the stack runs out -- and it is the *legacy* part
+# shape that takes this branch, so every pre-canonical row on the drive would
+# take it.
+_legacy_read_part = _legacy.read_part
+
+
 def read_part(pool, part, offset: int, length: int) -> bytes:
     """Read a legacy or canonical part, failing over only account-local errors."""
     if not isinstance(part, ResolvedRemotePart):
-        return _legacy.read_part(pool, part, offset, length)
+        return _legacy_read_part(pool, part, offset, length)
     last_error = None
     for runtime, peer in pool.read_routes(part.location):
         try:
@@ -519,5 +527,8 @@ tgupload.generate_random_id = generate_random_id
 
 # Classes/functions copied from the original module resolve names in the legacy
 # module globals. Keep the deliberately replaceable seams synchronized.
+#
+# Anything here that the wrapper itself falls back to must be captured above
+# before this runs -- see ``_legacy_read_part``.
 _legacy.read_part = read_part
 _legacy.make_preview = make_preview
