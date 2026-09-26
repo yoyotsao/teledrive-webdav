@@ -131,23 +131,57 @@ def _duplicate(self, entry, *, filename, parent_id):
     else:
         rows = sorted((self._call("GET", f"/files/by-split-group/{entry.split_group_id}") or {}).get("files") or [],
                       key=lambda item: int(item.get("part_index") or 0))
+        deduped = []
+        seen = set()
         for row in rows:
-            parse_file_location(row)
+            location = parse_file_location(row)
+            if isinstance(location, LegacySavedMessagesLocation) or location.telegram_chat_id is None:
+                identity = ("me", location.telegram_user_id, location.telegram_message_id)
+            else:
+                identity = ("channel", location.telegram_chat_id, location.telegram_message_id)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            deduped.append(row)
+        if not deduped:
+            raise ApiError(404, f"split group {entry.split_group_id} has no usable parts")
+        if len(deduped) != len(rows):
+            log.warning("split group %s had %s duplicate physical rows",
+                        entry.split_group_id, len(rows) - len(deduped))
         group_id = uuid.uuid4().hex
-        for ordinal, row in enumerate(rows):
-            index = int(row.get("part_index") if row.get("part_index") is not None else ordinal)
+        for index, row in enumerate(deduped):
             self._call("POST", "/files/register", payload=_alias_payload(
                 entry, row, filename=filename, parent_id=parent_id, part_index=index,
-                total_parts=len(rows), split_group_id=group_id))
+                total_parts=len(deduped), split_group_id=group_id))
     self.invalidate(parent_id)
 
 
-# One auth coordinator for the whole process. Sessions stay thread-local; only
-# the JWT and refresh/login flight are shared.
-_AUTH_CONDITION = threading.Condition(threading.Lock())
-_AUTH_REFRESHING = False
-_AUTH_ERROR = None
-_AUTH_TOKEN = None
+# Auth coordination is shared only by clients that point at the same backend
+# and token file. A single process may host tests/tools with independent cache
+# roots; letting one client's JWT overwrite another's makes an unrelated client
+# skip its own challenge or refresh with the wrong token.
+class _AuthState:
+    def __init__(self):
+        self.condition = threading.Condition(threading.Lock())
+        self.login_lock = threading.Lock()
+        self.refreshing = False
+        self.error = None
+        self.token = None
+
+
+_AUTH_STATES_LOCK = threading.Lock()
+_AUTH_STATES = {}
+
+
+def _auth_state(self):
+    endpoint = getattr(self.cfg, "api_base", None) or getattr(self.cfg, "base_url", None) or ""
+    key = (str(endpoint).rstrip("/"), os.path.abspath(os.fspath(self._token_path)))
+    with _AUTH_STATES_LOCK:
+        state = _AUTH_STATES.get(key)
+        if state is None:
+            state = _AuthState()
+            _AUTH_STATES[key] = state
+        return state
 
 
 def _persist_token_atomic(self, token):
@@ -171,40 +205,52 @@ _original_login = TeleDriveClient.login
 
 
 def _parity_init(self, cfg):
-    global _AUTH_TOKEN
     _original_init(self, cfg)
-    with _AUTH_CONDITION:
-        if _AUTH_TOKEN is None and self._token:
-            _AUTH_TOKEN = self._token
-        elif _AUTH_TOKEN:
-            self._token = _AUTH_TOKEN
+    state = _auth_state(self)
+    with state.condition:
+        if state.token is None:
+            state.token = self._token
+        elif state.token:
+            self._token = state.token
 
 
 def _parity_login(self, force=False, *, _sleep=time.sleep):
-    global _AUTH_TOKEN
-    token = _original_login(self, force=force, _sleep=_sleep)
-    with _AUTH_CONDITION:
-        _AUTH_TOKEN = token
-        self._token = token
-    _persist_token_atomic(self, token)
-    return token
+    state = _auth_state(self)
+    with state.condition:
+        observed = state.token
+        if observed and not force:
+            self._token = observed
+            return observed
+    # _original_login has an instance lock. This second lock extends the
+    # single-flight guarantee across separate clients that share one token file.
+    with state.login_lock:
+        with state.condition:
+            if state.token and (not force or state.token != observed):
+                self._token = state.token
+                return state.token
+        token = _original_login(self, force=force, _sleep=_sleep)
+        with state.condition:
+            state.token = token
+            self._token = token
+        _persist_token_atomic(self, token)
+        return token
 
 
 def _refresh_after_401(self, sent_token):
-    global _AUTH_REFRESHING, _AUTH_ERROR, _AUTH_TOKEN
-    with _AUTH_CONDITION:
-        if _AUTH_TOKEN and _AUTH_TOKEN != sent_token:
-            self._token = _AUTH_TOKEN
-            return _AUTH_TOKEN
-        if _AUTH_REFRESHING:
-            while _AUTH_REFRESHING:
-                _AUTH_CONDITION.wait()
-            if _AUTH_TOKEN and _AUTH_TOKEN != sent_token:
-                self._token = _AUTH_TOKEN
-                return _AUTH_TOKEN
-            if _AUTH_ERROR is not None:
-                raise _AUTH_ERROR
-        _AUTH_REFRESHING, _AUTH_ERROR = True, None
+    state = _auth_state(self)
+    with state.condition:
+        if state.token and state.token != sent_token:
+            self._token = state.token
+            return state.token
+        if state.refreshing:
+            while state.refreshing:
+                state.condition.wait()
+            if state.token and state.token != sent_token:
+                self._token = state.token
+                return state.token
+            if state.error is not None:
+                raise state.error
+        state.refreshing, state.error = True, None
     error = None
     try:
         resp = self._http_session().request("POST", f"{self.cfg.api_base}/auth/refresh",
@@ -213,28 +259,31 @@ def _refresh_after_401(self, sent_token):
             token = str((resp.json() or {}).get("token") or "")
             if not token:
                 raise ApiError(502, "refresh response did not contain a token")
-            with _AUTH_CONDITION:
-                _AUTH_TOKEN = token
-                self._token = token
-            _persist_token_atomic(self, token)
-            return token
-        if resp.status_code in (401, 403):
-            return self.login(force=True)
-        raise ApiError(resp.status_code, resp.text[:300])
+        elif resp.status_code in (401, 403):
+            # login may be replaced by an embedding/test seam. Publish its
+            # returned token here instead of assuming the wrapper did it.
+            token = self.login(force=True)
+        else:
+            raise ApiError(resp.status_code, resp.text[:300])
+        with state.condition:
+            state.token = token
+            self._token = token
+        _persist_token_atomic(self, token)
+        return token
     except BaseException as exc:
         error = exc
         raise
     finally:
-        with _AUTH_CONDITION:
-            _AUTH_ERROR, _AUTH_REFRESHING = error, False
-            _AUTH_CONDITION.notify_all()
+        with state.condition:
+            state.error, state.refreshing = error, False
+            state.condition.notify_all()
 
 
 def _parity_call(self, method, path, *, params=None, payload=None, _auth_retry=True, _conn_retry=True):
-    global _AUTH_TOKEN
-    with _AUTH_CONDITION:
-        if _AUTH_TOKEN:
-            self._token = _AUTH_TOKEN
+    state = _auth_state(self)
+    with state.condition:
+        if state.token:
+            self._token = state.token
     token = self._token or self.login()
     try:
         resp = self._http_session().request(method, f"{self.cfg.api_base}{path}", params=params, json=payload,

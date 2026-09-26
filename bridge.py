@@ -94,7 +94,8 @@ def _thumbs_for(self, entries):
         except OSError:
             data = None
         if data is None:
-            self.note_demand()
+            # Foreground /rpc/thumb already records demand before resolving the
+            # file. A background warm-up must not reset the quiet timer itself.
             part = parts[0]
             data = _read_via_routes(
                 self,

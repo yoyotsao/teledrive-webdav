@@ -12,7 +12,7 @@ import bridge
 import tdapi
 import tgio
 from tdapi import Entry, TeleDriveClient
-from transfer_models import RemotePart
+from transfer_models import FileLocation, RemotePart, ResolvedRemotePart
 
 
 class _Message:
@@ -151,6 +151,14 @@ class _MemoryWorker:
             for part in parts
         }
 
+    def thumbnail_location(self, location, peer):
+        assert peer == "me"
+        return self.thumbs[(location.telegram_message_id, str(location.media_id))]
+
+    def media_info_location(self, location, peer):
+        assert peer == "me"
+        return self.info[(location.telegram_message_id, str(location.media_id))]
+
 
 class _Pool:
     def __init__(self):
@@ -161,6 +169,9 @@ class _Pool:
 
     def for_read(self, account_id):
         return self.runtime(account_id)
+
+    def read_routes(self, location):
+        return ((self.runtime(int(location.telegram_user_id)), "me"),)
 
 
 def test_duplicate_message_ids_do_not_cross_accounts():
@@ -187,6 +198,25 @@ def test_range_crosses_storage_accounts():
     assert pool.runtime(2).worker.calls == [(10, "210", 0, 2)]
 
 
+def _current_parts(entry: Entry):
+    location = FileLocation(
+        telegram_chat_id=None,
+        telegram_user_id=entry.telegram_user_id,
+        telegram_message_id=entry.message_id,
+        media_kind="document",
+        media_id=entry.file_id,
+        media_size=entry.size,
+        photo_variant=None,
+        location_version=1,
+    )
+    return [ResolvedRemotePart(entry.file_id, 0, location)]
+
+
+class _CurrentApi:
+    def current_parts(self, entry):
+        return _current_parts(entry)
+
+
 def _entry(account_id: int, file_id: str = "same") -> Entry:
     return Entry(
         file_id=file_id,
@@ -202,7 +232,7 @@ def _entry(account_id: int, file_id: str = "same") -> Entry:
 
 def test_thumbnail_and_head_disk_caches_do_not_collide_across_accounts(tmp_path):
     cfg = SimpleNamespace(cache_dir=tmp_path)
-    resolver = bridge.Resolver(cfg, SimpleNamespace(), _Pool())
+    resolver = bridge.Resolver(cfg, _CurrentApi(), _Pool())
     first = _entry(1)
     second = _entry(2)
 
@@ -222,7 +252,7 @@ def test_thumbnail_and_property_results_keep_account_identity_in_one_batch(tmp_p
     pool.runtime(2).worker.thumbs[(9, "same")] = b"thumb-2"
     pool.runtime(1).worker.info[(9, "same")] = {"width": 1}
     pool.runtime(2).worker.info[(9, "same")] = {"width": 2}
-    resolver = bridge.Resolver(cfg, SimpleNamespace(), pool)
+    resolver = bridge.Resolver(cfg, _CurrentApi(), pool)
     first = _entry(1)
     second = _entry(2)
 
@@ -234,8 +264,8 @@ def test_thumbnail_and_property_results_keep_account_identity_in_one_batch(tmp_p
         (1, "same"): {"width": 1},
         (2, "same"): {"width": 2},
     }
-    assert resolver._prop_cache.get("1-same") == {"width": 1}
-    assert resolver._prop_cache.get("2-same") == {"width": 2}
+    assert resolver._prop_cache.get(bridge.physical_set_cache_key(_current_parts(first))) == {"width": 1}
+    assert resolver._prop_cache.get(bridge.physical_set_cache_key(_current_parts(second))) == {"width": 2}
 
 
 class _SplitApi(TeleDriveClient):

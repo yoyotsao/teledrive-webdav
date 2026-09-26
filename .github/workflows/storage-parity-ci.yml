@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - feat/current-backend-storage-parity
+      - feat/live-browse-audit
   workflow_dispatch:
 
 jobs:
