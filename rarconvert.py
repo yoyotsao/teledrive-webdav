@@ -80,9 +80,17 @@ class RarConverter:
         children = self.api.children_by_name(game.file_id, fresh=True)
         state = self._load()
         self._cleanup(game.file_id, children, state)
-        for entry in self._pending(children, state):
+        for i, entry in enumerate(self._pending(children, state)):
             if self._stop.is_set():
                 return
+            if i:
+                # Each download takes an hour or more; the previous rar has
+                # usually been converted and uploaded meanwhile. Trash it now
+                # rather than a whole pass (hours) later.
+                children = self.api.children_by_name(game.file_id, fresh=True)
+                self._cleanup(game.file_id, children, state)
+                if entry.name not in children:
+                    continue
             try:
                 if self._download(entry):
                     state[str(entry.file_id)] = {"name": entry.name}

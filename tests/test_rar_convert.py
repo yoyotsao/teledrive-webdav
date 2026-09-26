@@ -205,6 +205,28 @@ def test_the_original_is_trashed_once_its_zip_is_on_the_drive_and_readable(rig):
     assert _state(rig) == {}
 
 
+def test_finished_conversions_are_cleaned_up_between_downloads(rig):
+    """A pass downloads every pending rar; one that finished converting while
+    the next was downloading is trashed then, not a whole pass (hours) later."""
+    rig.blobs["r2"] = b"Rar!" + bytes(50_000)
+    first = _entry("r1", "A.rar", size=len(rig.blobs["r1"]))
+    second = _entry("r2", "B.rar", size=len(rig.blobs["r2"]))
+    t = rig.build([first, second])
+
+    def converted(name):
+        # gamestage extracts, packs and uploads A while B is downloading
+        if name == "A.rar":
+            (rig.cfg.staging_dir / "A.rar").unlink()
+            t.api.children["A.zip"] = _entry("za", "A.zip", size=100)
+
+    t.stager.touch = lambda name: (t.stager.touched.append(name), converted(name))
+
+    t.conv.run()
+
+    assert t.api.trashed == [("r1", "g")]
+    assert _state(rig) == {"r2": {"name": "B.rar"}}
+
+
 def test_the_original_stays_while_the_zip_is_missing_or_unreadable(rig):
     rar = _entry("r1", "Title.rar", size=len(rig.blobs["r1"]))
     t = rig.build([rar])
