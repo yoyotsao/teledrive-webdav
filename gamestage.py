@@ -12,6 +12,10 @@ only that file.
 
 A first-level *file* dropped into /game is uploaded as-is (no zip wrapper): a
 user who already packed their own archive should not get it double-wrapped.
+
+Except a ``.rar``: nothing here can browse one (no central directory to read,
+no Python decoder for compressed members), so it is extracted with 7-Zip and
+packed exactly like a folder, into ``<name>.zip``.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ import hashlib
 import logging
 import os
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -51,6 +56,34 @@ MAX_ATTEMPTS = 5
 # part three times before giving up, so the only retry left at this level is
 # the unit's own, ten minutes later.
 ZIP_MIME = "application/zip"
+
+CONVERT_SUFFIXES = (".rar",)
+
+
+class ArchiveExtractError(RuntimeError):
+    """7-Zip could not extract an archive staged for conversion."""
+
+
+def extract_archive(archive: Path, dest: Path, seven_zip: str) -> None:
+    """Extract ``archive`` into ``dest`` with 7-Zip, or raise ArchiveExtractError.
+
+    stdin is closed so an encrypted archive fails at the password prompt
+    instead of waiting on it forever from a background thread.
+    """
+    exe = seven_zip if Path(seven_zip).exists() else shutil.which(seven_zip)
+    if not exe:
+        raise ArchiveExtractError(f"7-Zip not found at {seven_zip}; set [game] seven_zip")
+    proc = subprocess.run(
+        [exe, "x", "-y", "-bd", "-bso0", "-bsp0", f"-o{_ext(dest)}", _ext(archive)],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if proc.returncode != 0:
+        detail = " ".join((proc.stderr or proc.stdout or "").split())[:300]
+        raise ArchiveExtractError(f"7-Zip exited with {proc.returncode}: {detail}")
 
 
 def sample_hash(path: Path) -> str:
@@ -272,7 +305,13 @@ class GameStager:
             self._upload_and_register(packed, upload_name, archived=archived)
             self._set_state(top, "done")
             log.info("uploaded %s — clearing staging", upload_name)
-            shutil.rmtree(_ext(source), ignore_errors=True)
+            # rmtree on a *file* fails silently under ignore_errors, which left
+            # every top-level file in staging to be adopted and re-uploaded on
+            # the next tick.
+            if source.is_dir():
+                shutil.rmtree(_ext(source), ignore_errors=True)
+            else:
+                source.unlink(missing_ok=True)
             if temporary and packed.exists():
                 packed.unlink()
             with self._lock:
@@ -314,19 +353,51 @@ class GameStager:
         photo in must keep ``image/jpeg`` or lose its preview on both clients.
         """
         if source.is_file():
+            if source.suffix.lower() in CONVERT_SUFFIXES:
+                return self._convert(source)
             # Already a single file — upload verbatim.
             return source, source.name, False, False
 
         target = self.cfg.pack_dir / f"{top}.zip"
-        if target.exists():
-            if zipfile.is_zipfile(target):
-                # A previous attempt already packed this and only the upload
-                # failed transiently (_process keeps the zip in that case,
-                # see the exception handler there) — reuse it instead of
-                # re-zipping a potentially 60 GB tree.
-                log.info("reusing existing pack %s from a previous attempt", target.name)
-                return target, f"{top}.zip", True, True
-            target.unlink()
+        if self._reusable(target):
+            return target, f"{top}.zip", True, True
+        self._write_zip(source, target)
+        return target, f"{top}.zip", True, True
+
+    def _reusable(self, target: Path) -> bool:
+        if not target.exists():
+            return False
+        if zipfile.is_zipfile(target):
+            # A previous attempt already packed this and only the upload
+            # failed transiently (_process keeps the zip in that case,
+            # see the exception handler there) — reuse it instead of
+            # re-zipping a potentially 60 GB tree.
+            log.info("reusing existing pack %s from a previous attempt", target.name)
+            return True
+        target.unlink()
+        return False
+
+    def _convert(self, source: Path):
+        """Extract a staged RAR and pack its contents as ``<stem>.zip``."""
+        stem = source.stem
+        target = self.cfg.pack_dir / f"{stem}.zip"
+        if self._reusable(target):
+            return target, f"{stem}.zip", True, True
+        extracted = self.cfg.pack_dir / f"{stem}.extract"
+        shutil.rmtree(_ext(extracted), ignore_errors=True)
+        extracted.mkdir(parents=True)
+        try:
+            log.info("extracting %s with 7-Zip", source.name)
+            extract_archive(source, extracted, self.cfg.seven_zip)
+            self._write_zip(extracted, target)
+        except BaseException:
+            target.unlink(missing_ok=True)
+            raise
+        finally:
+            shutil.rmtree(_ext(extracted), ignore_errors=True)
+        return target, f"{stem}.zip", True, True
+
+    def _write_zip(self, source: Path, target: Path) -> None:
         root = _ext(source)
         count = 0
         with zipfile.ZipFile(target, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
@@ -347,7 +418,6 @@ class GameStager:
                     except OSError as exc:
                         raise OSError(f"cannot read {full}: {exc}") from exc
         log.info("packed %s files into %s (%.1f GiB)", count, target.name, target.stat().st_size / 2**30)
-        return target, f"{top}.zip", True, True
 
     # -- uploading -------------------------------------------------------- #
 
