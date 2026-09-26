@@ -50,6 +50,7 @@ class Config:
     download_connections: int = 8
     rclone_dir: Path = Path("rclone")
     warmup_auto: bool = True
+    warmup_convert_rar: bool = True
     warmup_interval_minutes: float = 360.0
     accounts_file: Optional[Path] = None
     upload_files: int = 3
@@ -232,5 +233,6 @@ def load_config(path: Optional[Path] = None) -> Config:
         debounce_minutes=float(get("game", "debounce_minutes", "5")),
         seven_zip=get("game", "seven_zip", r"C:\Program Files\7-Zip\7z.exe"),
         warmup_auto=get("warmup", "auto", "true").lower() not in ("0", "false", "no", "off"),
+        warmup_convert_rar=get("warmup", "convert_rar", "true").lower() not in ("0", "false", "no", "off"),
         warmup_interval_minutes=float(get("warmup", "interval_minutes", "360")),
     )
