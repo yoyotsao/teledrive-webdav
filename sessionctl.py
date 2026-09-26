@@ -80,6 +80,12 @@ class WindowsSessionPermissionPolicy:
     _ADMINS = "S-1-5-32-544"
 
     def _run(self, script: str, path: Path) -> None:
+        # `-Command <text> <arg>` does not bind <arg> to $args: PowerShell joins
+        # everything after -Command into one command line, so $args[0] was null
+        # and every ACL call failed. Invoke the script block with the path as a
+        # quoted literal argument instead.
+        quoted = "'" + str(path).replace("'", "''") + "'"
+        command = "& {" + script + "} " + quoted
         try:
             proc = subprocess.run(
                 [
@@ -87,8 +93,7 @@ class WindowsSessionPermissionPolicy:
                     "-NoProfile",
                     "-NonInteractive",
                     "-Command",
-                    script,
-                    str(path),
+                    command,
                 ],
                 capture_output=True,
                 text=True,

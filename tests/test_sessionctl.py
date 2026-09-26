@@ -180,3 +180,20 @@ def test_posix_policy_rejects_existing_broad_directory(tmp_path):
     with pytest.raises(SessionCtlError, match="permissions") as raised:
         PosixSessionPermissionPolicy().prepare_directory(directory)
     assert str(directory) not in str(raised.value)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="PowerShell ACL runner is Windows-only")
+def test_windows_acl_runner_passes_path_to_script(tmp_path):
+    # `powershell -Command <script> <path>` never binds <path> to $args, so
+    # every ACL call used to fail with a null path. The path must arrive
+    # intact, including spaces and single quotes.
+    from sessionctl import WindowsSessionPermissionPolicy
+
+    target = tmp_path / "it's a dir"
+    target.mkdir()
+    policy = WindowsSessionPermissionPolicy()
+    policy._run(
+        "if (-not (Test-Path -LiteralPath $args[0])) { exit 3 }", target
+    )
+    with pytest.raises(SessionCtlError):
+        policy._run("exit 13", target)
