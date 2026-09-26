@@ -19,18 +19,16 @@ if not exist "%PY%" (
   goto :fail
 )
 
-echo [1/3] stopping the bridge...
-:: Matched on the command line rather than the window title, which is only set
-:: when start.bat launched it. This powershell process is not python.exe, so the
-:: filter cannot match itself.
-powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.Name -like 'python*' -and $_.CommandLine -like '*bridge.py*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
-:: warmshell is a child of the warm-up, and its 600s deadline lives in the
-:: parent's subprocess.run -- so killing the bridge leaves it running with
-:: nobody left to time it out. An orphan keeps asking the shell for thumbnails,
-:: which keeps reading files through H:, and competes with the browsing the
-:: restart was meant to fix. It holds no state worth draining.
-taskkill /f /im warmshell.exe >nul 2>&1
-timeout /t 2 /nobreak >nul
+echo [1/3] stopping shell warmers, then the bridge...
+:: The helper closes the process-launch gate, rejects an already orphaned
+:: warmer, and gives live children a bounded shutdown before it touches the
+:: bridge. It holds the gate until the bridge is gone, so no new child can race
+:: into the gap between the process scan and bridge shutdown.
+powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\stop_bridge.ps1" -TimeoutSeconds 5
+if errorlevel 1 (
+  echo [error] restart cancelled; bridge is still running.
+  goto :fail
+)
 
 echo [2/3] starting the bridge...
 start "TeleDrive bridge" /min "%PY%" bridge.py

@@ -72,6 +72,7 @@ class Entry:
     file_hash: Optional[str] = None
     has_thumbnail: bool = False
     telegram_user_id: int = 0
+    parent_id: Optional[str] = None
 
     @property
     def real_size(self) -> Optional[int]:
@@ -180,6 +181,7 @@ def _to_entry(row: dict) -> Entry:
         file_hash=row.get("file_hash"),
         has_thumbnail=bool(row.get("has_thumbnail")),
         telegram_user_id=int(row.get("telegram_user_id") or 0),
+        parent_id=row.get("parent_id"),
     )
 
 
@@ -665,6 +667,24 @@ class TeleDriveClient:
         except OSError as exc:  # pragma: no cover - best effort
             log.warning("could not clear the listing cache on disk: %s", exc)
 
+    def _discard_cached_entry(self, parent_id: Optional[str], file_id: str) -> None:
+        """Remove one deleted row without forcing the next sibling lookup online."""
+        with self._dir_lock:
+            hit = self._dir_cache.get(parent_id)
+            if hit is not None:
+                cached_at, entries = hit
+                self._dir_cache[parent_id] = (
+                    cached_at,
+                    [entry for entry in entries if entry.file_id != file_id],
+                )
+        try:
+            # Keep the filtered memory copy for this process. Dropping the one
+            # disk listing prevents a restart from resurrecting the deleted row
+            # without making every following DELETE re-fetch the same directory.
+            self._dir_disk_path(parent_id).unlink(missing_ok=True)
+        except OSError as exc:  # pragma: no cover - best effort
+            log.warning("could not clear the deleted entry's directory cache: %s", exc)
+
     # -- split parts ------------------------------------------------------ #
 
     def parts_for(self, entry: Entry) -> List[RemotePart]:
@@ -816,13 +836,13 @@ class TeleDriveClient:
         self.invalidate(parent_id)
         return data
 
-    def trash(self, file_id: str) -> None:
+    def trash(self, file_id: str, parent_id: Optional[str]) -> None:
         """Soft-delete: the backend stamps trashed_at on the whole subtree and
         keeps every Telegram message untouched. Listings already exclude
         trashed rows by default, so there is nothing else to filter here.
         """
         self._call("DELETE", f"/files/{file_id}")
-        self.invalidate()
+        self._discard_cached_entry(parent_id, file_id)
 
     def move(self, file_id: str, *, parent_id: Optional[str], filename: str) -> None:
         """Rename/reparent in place — children stay attached, they key off

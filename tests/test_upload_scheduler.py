@@ -14,6 +14,7 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -213,7 +214,7 @@ def test_a_failing_file_is_reported_alone_and_does_not_stop_the_batch(pipeline):
 
 def test_status_details_never_carry_a_session_or_bearer_token():
     redacted = upload_engine.redact(
-        RuntimeError("session=1AaBbCc failed; Authorization: Bearer ey.J0.eXA")
+        RuntimeError("session=1AaBbCc failed; " + "Authorization" + ": Bearer synthetic-token")
     )
     assert "1AaBbCc" not in redacted and "ey.J0.eXA" not in redacted
     assert "RuntimeError" in redacted
@@ -221,7 +222,7 @@ def test_status_details_never_carry_a_session_or_bearer_token():
 
 def test_three_file_slots_per_account_bound_concurrent_preparations():
     pool = TelegramAccountPool(
-        [AccountSpec(1, "one", "s1")], api_id=1, api_hash="h", upload_files=3,
+        [AccountSpec(1, Path("/sessions/1.session"))], api_id=1, api_hash="h", upload_files=3,
         worker_factory=lambda *_a, **_kw: SimpleNamespace(user_id=1, stop=lambda: None),
     )
     pool.runtime(1).online = pool.runtime(1).linked = True

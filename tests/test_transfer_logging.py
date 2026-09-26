@@ -26,17 +26,25 @@ from transfer_models import TransferRequest  # noqa: E402
 TIMING_FIELDS = (
     "protocol=", "bytes=", "parts=", "hash_ms=", "check_ms=", "thumb_ms=",
     "slot_ms=", "upload_ms=", "message_ms=", "register_ms=", "total_ms=",
-    "accounts=", "rate=", "ceiling=",
+    "accounts=", "logical_uploaded_bytes=", "physical_transferred_bytes=",
+    "migration_overhead_bytes=", "migration_count=", "rate=", "ceiling=",
 )
 
 
 class Worker:
     user_id = 5
 
-    def prepare_segment(self, stream, size, name, progress=None, *, force_big=None):
+    def prepare_segment(
+        self, stream, size, name, progress=None, *, force_big=None,
+        observer=None, revoke_handle=None, rpc_timeout=120.0,
+    ):
+        if observer is not None:
+            token = observer.request_started(0, size)
+            observer.request_succeeded(token, size)
+            observer.request_settled(token)
         return {"size": size}
 
-    def prepare_thumbnail(self, preview):
+    def prepare_thumbnail(self, preview, *, observer=None):
         return preview
 
     def send_uploaded_segment(self, handle, size, name, preview=None, *, mime_type=None, message_limiter=None):
@@ -50,15 +58,38 @@ class Limiter:
 
 class Pool:
     def __init__(self):
+        from upload_activity import AccountActivityRegistry, UploadSpeedTracker
+
         self.runtime = SimpleNamespace(
             worker=Worker(), telegram_user_id=Worker.user_id,
             file_slots=threading.BoundedSemaphore(1),
             message_limiter=None, chunk_limiter=Limiter(),
         )
+        self.speed_tracker = UploadSpeedTracker()
+        self.activity = AccountActivityRegistry(speed_tracker=self.speed_tracker)
+        self.activity.add_account(Worker.user_id)
+        self._sequence = 0
 
-    @contextlib.contextmanager
-    def acquire_upload(self, timeout=None):
-        yield self.runtime
+    def acquire_upload_lease(self, work_id=None, timeout=None):
+        self._sequence += 1
+        work_id = work_id or f"test:{self._sequence}"
+        self.runtime.file_slots.acquire()
+        self.activity.begin_job(Worker.user_id, work_id)
+        pool = self
+
+        class Lease:
+            runtime = pool.runtime
+            def __init__(self):
+                self.work_id = work_id
+                self.closed = False
+            def close(self):
+                if self.closed:
+                    return
+                self.closed = True
+                pool.activity.end_job(Worker.user_id, work_id)
+                pool.runtime.file_slots.release()
+
+        return Lease()
 
 
 class Api:
@@ -129,16 +160,15 @@ def test_a_failure_is_logged_once_with_the_error_redacted(rig, caplog):
     secret = "1AaBbCcSession"
 
     def explode(fingerprint):
-        raise RuntimeError(
-            f"session={secret} rejected; Authorization: Bearer eyJhbG.cCI6.Ikp9"
-        )
+        auth = "Authorization" + ": Bearer synthetic-token"
+        raise RuntimeError(f"session={secret} rejected; {auth}")
 
     rig.api.check_hash = explode
     with pytest.raises(RuntimeError):
         rig.engine.transfer(rig.request())
 
     assert secret not in caplog.text
-    assert "eyJhbG.cCI6.Ikp9" not in caplog.text
+    assert "synthetic-token" not in caplog.text
     assert "transfer failed" in caplog.text
     assert "RuntimeError" in caplog.text
 
@@ -170,15 +200,10 @@ def test_the_example_configuration_carries_no_credentials():
     actually read.
     """
     import configparser
-    import json as _json
 
     root = Path(__file__).resolve().parents[1]
 
-    accounts = _json.loads((root / "accounts.example.json").read_text(encoding="utf-8"))
-    assert accounts["accounts"], "the example must still show the shape"
-    for account in accounts["accounts"]:
-        assert account["session"] == ""
-        assert set(account) == {"telegram_user_id", "label", "session"}
+    assert not (root / "accounts.example.json").exists()
 
     secrets = {"session", "api_hash", "api_id", "token", "password", "jwt"}
     parser = configparser.ConfigParser()

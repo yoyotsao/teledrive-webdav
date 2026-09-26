@@ -184,12 +184,10 @@ def test_big_upload_releases_completed_payloads_instead_of_retaining_all_parts()
 
     class Sender:
         def __init__(self):
-            self.first_done = asyncio.Event()
             self.release_second = asyncio.Event()
 
         async def send(self, request):
             if request.index == 0:
-                self.first_done.set()
                 return
             await self.release_second.wait()
 
@@ -197,6 +195,11 @@ def test_big_upload_releases_completed_payloads_instead_of_retaining_all_parts()
     limiter = RecordingLimiter()
     stream = Stream()
     first_ref = weakref.ref(stream.payloads[0])
+    first_completed = asyncio.Event()
+
+    def progress(current, _total):
+        if current >= 1:
+            first_completed.set()
 
     async def scenario():
         async with _PartReader(stream) as reader:
@@ -211,11 +214,14 @@ def test_big_upload_releases_completed_payloads_instead_of_retaining_all_parts()
                         index=index, total=total, data=data
                     ),
                     workers=2,
-                    progress=None,
+                    progress=progress,
                     collect_payloads=False,
                 )
             )
-            await sender.first_done.wait()
+            # The part is only complete after the shielded RPC has settled and
+            # send_one has advanced progress. At that boundary the payload must
+            # no longer be retained by the finished part task.
+            await first_completed.wait()
             stream.payloads[0] = None
             gc.collect()
             released = first_ref() is None
@@ -287,7 +293,7 @@ def test_worker_uses_explicit_small_primitive_instead_of_telethon_shortcut(monke
                 id=81, document=SimpleNamespace(id=91, access_hash=101)
             )
 
-    worker = TelegramWorker(1, "hash", "session")
+    worker = TelegramWorker(1, "hash", 1, Path("unused.session"))
 
     client = Client()
 
@@ -302,4 +308,6 @@ def test_worker_uses_explicit_small_primitive_instead_of_telethon_shortcut(monke
     result = run(worker._upload_segment(io.BytesIO(b"x"), 1, "x.bin", None))
 
     assert result == {"message_id": 81, "file_id": "91", "access_hash": "101", "size": 1}
-    assert calls == [("small", client, limiter, 1, "x.bin", {"progress": None})]
+    assert calls == [("small", client, limiter, 1, "x.bin", {
+        "progress": None, "observer": None, "revoked": None, "rpc_timeout": 120.0,
+    })]

@@ -3,6 +3,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -105,7 +106,7 @@ class Client:
 
 class Worker(TelegramWorker):
     def __init__(self, identity):
-        super().__init__(1, "hash", "offline")
+        super().__init__(1, "hash", identity, Path("unused.session"))
         self._me = SimpleNamespace(id=identity)
         self.set_upload_limiter(Limiter())
         self.client = Client(self)
@@ -125,8 +126,8 @@ def rig(tmp_path, monkeypatch):
     def build(accounts=1):
         workers = {i: Worker(i) for i in range(1, accounts + 1)}
         pool = TelegramAccountPool(
-            [AccountSpec(i, str(i), str(i)) for i in workers], api_id=1, api_hash="hash", upload_files=1,
-            worker_factory=lambda _a, _b, session, *_args, **_kwargs: workers[int(session)],
+            [AccountSpec(i, Path(f"/sessions/{i}.session")) for i in workers], api_id=1, api_hash="hash", upload_files=1,
+            worker_factory=lambda _a, _b, user_id, _path, *_args, **_kwargs: workers[user_id],
             message_limiter_factory=Bucket,
         )
         for identity, worker in workers.items():
@@ -362,7 +363,10 @@ def test_album_default_timeout_is_sixty_seconds(rig, monkeypatch):
 
     monkeypatch.setattr("tgio.asyncio.wait_for", wait_for)
     r.engine.transfer_batch([r.request(0)])
-    assert deadlines == [60]
+    # Part RPCs now have their own 120-second wrapper deadline; the album send
+    # still owns the final, independent 60-second default deadline.
+    assert deadlines[-1] == 60
+    assert all(timeout == 120.0 for timeout in deadlines[:-1])
 
 
 def test_worker_rejects_mixed_accounts_before_sending(rig):

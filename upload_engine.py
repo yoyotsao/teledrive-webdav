@@ -17,9 +17,10 @@ from uuid import uuid4
 
 from config import ext_path
 from tgio import SegmentReader
-from tgupload import SMALL_FILE_MAX, decide_protocol
-from transfer_models import QueueStage, TransferRequest, TransferResult, UploadedPart
+from tgupload import AttemptRevoked, SMALL_FILE_MAX, decide_protocol
+from transfer_models import AttemptLease, QueueStage, TransferRequest, TransferResult, UploadedPart, UploadRpcToken
 from upload_limiter import MessageTokenBucket
+from segment_scheduler import SchedulerExecutionError, SegmentDescriptor, SegmentScheduler
 
 
 log = logging.getLogger("upload_engine")
@@ -52,6 +53,10 @@ class TransferMetrics:
     register_ms: float = 0.0
     total_ms: float = 0.0
     account_ids: tuple = ()
+    logical_uploaded_bytes: int = 0
+    physical_transferred_bytes: int = 0
+    migration_overhead_bytes: int = 0
+    migration_count: int = 0
     rate: float = 0.0
     ceiling: Optional[float] = None
     started: float = field(default_factory=time.monotonic)
@@ -346,6 +351,86 @@ class AlbumQueue:
                 future.set_result([part])
 
 
+class AccountUploadObserver:
+    """Account-wide telemetry for byte uploads that are not migration candidates."""
+
+    def __init__(self, pool, account_id: int, task_id: str):
+        self.pool = pool
+        self.lease = AttemptLease(str(task_id), 1, int(account_id))
+        self._sequence = 0
+        self._lock = Lock()
+
+    def request_started(self, part_index: int, nbytes: int) -> UploadRpcToken:
+        with self._lock:
+            self._sequence += 1
+            token = UploadRpcToken(
+                self.lease.task_id, self.lease.attempt_id, self.lease.account_id,
+                int(part_index), self._sequence,
+            )
+        self.pool.activity.request_started(token)
+        return token
+
+    def request_succeeded(self, token: UploadRpcToken, nbytes: int) -> None:
+        self.pool.speed_tracker.record_physical(token, nbytes)
+        self.pool.speed_tracker.record_effective(self.lease, token.part_index, nbytes)
+
+    def premium_flood(self, seconds: float, pacer_snapshot) -> None:
+        self.pool.speed_tracker.close_premium_flood_cycle(self.lease, seconds)
+
+    def request_settled(self, token: UploadRpcToken) -> None:
+        self.pool.activity.request_settled(token)
+
+    def late_request_succeeded(self, token: UploadRpcToken, nbytes: int) -> None:
+        self.pool.speed_tracker.record_physical(token, nbytes)
+
+
+class _LegacyUploadLease:
+    """Adapt the pre-owned-lease pool API for non-production test doubles.
+
+    Real ``AccountPool`` instances always expose owned leases plus activity
+    telemetry.  A few integration rigs intentionally keep the older
+    ``acquire_upload()`` context-manager contract; preserving that contract
+    keeps those end-to-end tests focused on WebDAV behavior without weakening
+    the production scheduler invariants.
+    """
+
+    def __init__(self, runtime, work_id: str, context_manager):
+        self.runtime = runtime
+        self.work_id = str(work_id)
+        self._context_manager = context_manager
+        self._closed = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._context_manager.__exit__(None, None, None)
+
+
+class SchedulerUploadObserver:
+    """Bind worker-level part telemetry to one immutable scheduler attempt."""
+
+    def __init__(self, scheduler: SegmentScheduler, lease: AttemptLease):
+        self.scheduler = scheduler
+        self.lease = lease
+
+    def request_started(self, part_index: int, nbytes: int) -> UploadRpcToken:
+        return self.scheduler.begin_request(self.lease, part_index)
+
+    def request_succeeded(self, token: UploadRpcToken, nbytes: int) -> None:
+        self.scheduler.physical_success(token, nbytes)
+        self.scheduler.part_succeeded(self.lease, token.part_index, nbytes)
+
+    def premium_flood(self, seconds: float, pacer_snapshot) -> None:
+        self.scheduler.notify_premium_flood(self.lease, seconds, pacer_snapshot)
+
+    def request_settled(self, token: UploadRpcToken) -> None:
+        self.scheduler.request_settled(token)
+
+    def late_request_succeeded(self, token: UploadRpcToken, nbytes: int) -> None:
+        self.scheduler.physical_success(token, nbytes)
+
+
 class UploadEngine:
     """Transfer files; callers register results before deleting sources.
 
@@ -357,7 +442,7 @@ class UploadEngine:
         self, api, pool, *, claims=None, register_concurrency=8,
         segment_concurrency=32, ffmpeg=None, message_rate=3.0, message_burst=6,
         hash_concurrency=2, hash_check_concurrency=8,
-        album_batch=10, album_timeout=60.0,
+        album_batch=10, album_timeout=60.0, scheduler_clock=time.monotonic,
     ):
         self.api = api
         self.pool = pool
@@ -370,6 +455,7 @@ class UploadEngine:
         self._check_concurrency = max(1, int(hash_check_concurrency))
         self._album_batch = max(1, int(album_batch))
         self._album_timeout = float(album_timeout)
+        self._scheduler_clock = scheduler_clock
         self._bucket_lock = Lock()
         self._message_rate = message_rate
         self._message_burst = message_burst
@@ -377,6 +463,42 @@ class UploadEngine:
         # it gets attached to, so a caller that never registers cannot grow it.
         self._metrics: Dict[int, TransferMetrics] = {}
         self._metrics_lock = Lock()
+        self._active_schedulers: Dict[int, SegmentScheduler] = {}
+        self._scheduler_state_lock = Lock()
+
+    def _supports_failover_scheduler(self) -> bool:
+        required = (
+            "runtime", "acquire_upload_lease", "acquire_exact_upload_lease",
+            "try_reserve_idle", "activate_reservation", "release_reservation",
+        )
+        return (
+            hasattr(self.pool, "activity")
+            and hasattr(self.pool, "speed_tracker")
+            and all(callable(getattr(self.pool, name, None)) for name in required)
+        )
+
+    def _acquire_upload_lease(self, work_id: str, timeout=None):
+        acquire = getattr(self.pool, "acquire_upload_lease", None)
+        if callable(acquire):
+            return acquire(work_id=work_id, timeout=timeout)
+        legacy = self.pool.acquire_upload(timeout=timeout)
+        runtime = legacy.__enter__()
+        return _LegacyUploadLease(runtime, work_id, legacy)
+
+    def _acquire_exact_upload_lease(self, account_id: int, work_id: str):
+        acquire = getattr(self.pool, "acquire_exact_upload_lease", None)
+        if callable(acquire):
+            return acquire(account_id, work_id)
+        lease = self._acquire_upload_lease(work_id)
+        if int(lease.runtime.telegram_user_id) != int(account_id):
+            lease.close()
+            return None
+        return lease
+
+    def _account_observer(self, account_id: int, task_id: str):
+        if not (hasattr(self.pool, "activity") and hasattr(self.pool, "speed_tracker")):
+            return None
+        return AccountUploadObserver(self.pool, account_id, task_id)
 
     def transfer(self, request: TransferRequest) -> TransferResult:
         return self.transfer_batch([request])[0]
@@ -625,8 +747,8 @@ class UploadEngine:
         if metrics is not None:
             metrics.protocol = "album"
         with _timed(metrics, "slot_ms"):
-            lease = self.pool.acquire_upload()
-            runtime = lease.__enter__()
+            lease = self._acquire_upload_lease(work_id=f"album:{id(request)}")
+            runtime = lease.runtime
         try:
             if metrics is not None:
                 metrics.observe_limiter(runtime)
@@ -636,22 +758,62 @@ class UploadEngine:
                 preview = preview_cm.__enter__()
             try:
                 with _timed(metrics, "upload_ms"):
+                    album_kwargs = {"message_limiter": bucket}
+                    observer = self._account_observer(
+                        runtime.telegram_user_id, f"{lease.work_id}:main"
+                    )
+                    thumb_observer = (
+                        self._account_observer(
+                            runtime.telegram_user_id, f"{lease.work_id}:thumb"
+                        ) if preview else None
+                    )
+                    if observer is not None:
+                        album_kwargs["observer"] = observer
+                    if thumb_observer is not None:
+                        album_kwargs["thumbnail_observer"] = thumb_observer
                     item = runtime.worker.prepare_album_item(
                         request.source, request.logical_size, request.upload_name,
-                        request.mime_type, preview, message_limiter=bucket,
+                        request.mime_type, preview, **album_kwargs,
                     )
             finally:
                 preview_cm.__exit__(None, None, None)
         finally:
-            lease.__exit__(None, None, None)
+            lease.close()
         return runtime, item
 
     def _album_fallback(self, runtime, item):
-        # Reacquire this exact account; a different account cannot preserve the
-        # prepared item's routing. File admission ends before message admission.
-        with runtime.file_slots:
+        # Reacquire this exact account through the pool. A reservation must block
+        # fallback just like it blocks ordinary work; direct semaphore access
+        # would make a supposedly idle migration target busy behind the scheduler.
+        lease = self._acquire_exact_upload_lease(
+            runtime.telegram_user_id, f"album-fallback:{id(item)}"
+        )
+        if lease is None:
+            raise RuntimeError(
+                f"Telegram account {runtime.telegram_user_id} is reserved or busy"
+            )
+        try:
             with open(ext_path(item.source), "rb") as stream:
-                handle = runtime.worker.prepare_album_fallback(stream, item.size, item.upload_name)
+                observer = self._account_observer(
+                    runtime.telegram_user_id, f"{lease.work_id}:main"
+                )
+                prepare_fallback = getattr(runtime.worker, "prepare_album_fallback", None)
+                if callable(prepare_fallback):
+                    kwargs = {}
+                    if observer is not None:
+                        kwargs["observer"] = observer
+                    handle = prepare_fallback(
+                        stream, item.size, item.upload_name, **kwargs,
+                    )
+                else:
+                    kwargs = {"force_big": False}
+                    if observer is not None:
+                        kwargs["observer"] = observer
+                    handle = runtime.worker.prepare_segment(
+                        stream, item.size, item.upload_name, **kwargs,
+                    )
+        finally:
+            lease.close()
         result = runtime.worker.send_uploaded_segment(
             handle, item.size, item.upload_name, preview=None,
             mime_type=item.mime_type, message_limiter=self._message_bucket(runtime),
@@ -673,28 +835,254 @@ class UploadEngine:
             preview_cm = _preview_file(request.source, request.mime_type, self.ffmpeg)
             preview = preview_cm.__enter__()
         try:
-            with ThreadPoolExecutor(max_workers=min(self._segment_concurrency, len(decision.segments))) as executor:
-                futures = [
-                    executor.submit(
-                        self._upload_segment, request, index, offset, size,
-                        decision.force_big, len(decision.segments) > 1,
-                        preview if index == 0 else None,
-                    )
-                    for index, (offset, size) in enumerate(decision.segments)
-                ]
-                parts = [future.result() for future in as_completed(futures)]
+            if decision.force_big and self._supports_failover_scheduler():
+                parts = self._upload_big_with_scheduler(request, decision, preview)
+            elif decision.force_big:
+                parts = self._upload_big_legacy_compatible(request, decision, preview)
+            else:
+                offset, size = decision.segments[0]
+                parts = [self._upload_segment_once(
+                    request, 0, offset, size, False, False, preview,
+                )]
         finally:
             preview_cm.__exit__(None, None, None)
-        # Check inside the claim so a corrupt result is never cached for aliases.
         assert_parts_cover_file(parts, request.logical_size)
         return parts
 
-    def _upload_segment(self, request, index, offset, size, force_big, split, preview):
+    def _upload_big_legacy_compatible(self, request, decision, preview):
+        """Keep old pool test doubles usable without bypassing production failover.
+
+        Production ``AccountPool`` always advertises the full scheduler contract,
+        so force-big transfers there still take the central scheduler path.
+        """
+        split = len(decision.segments) > 1
+        with ThreadPoolExecutor(
+            max_workers=min(self._segment_concurrency, len(decision.segments))
+        ) as executor:
+            futures = [
+                executor.submit(
+                    self._upload_segment_once, request, index, offset, size,
+                    True, split, preview if index == 0 else None,
+                )
+                for index, (offset, size) in enumerate(decision.segments)
+            ]
+            return [future.result() for future in as_completed(futures)]
+
+    @staticmethod
+    def _log_scheduler_diagnostic(scheduler, kind: str, payload: dict) -> None:
+        if kind == "premium_flood":
+            cycle = payload["cycle"]
+            pacer = payload["pacer"]
+            task = scheduler.task(cycle.lease.task_id)
+            remaining_ratio = (task.size - task.logical_uploaded_bytes) / task.size
+            live_speed = scheduler.speed_tracker.live_speed(cycle.lease)
+            mode = getattr(pacer, "mode", "unknown")
+            penalty = getattr(pacer, "paused_until", getattr(pacer, "penalty_until", 0.0))
+            log.info(
+                "premium flood file_job_id=%s task_id=%s segment_index=%d attempt_id=%d "
+                "account_id=%d wait_seconds=%g penalty_until=%.3f pacer_mode=%s rate=%.2f "
+                "live_speed=%.2f logical_bytes=%d remaining_ratio=%.6f "
+                "account_accepted_parts=%d account_accepted_bytes=%d "
+                "task_accepted_parts=%d task_accepted_bytes=%d",
+                scheduler.file_job_id, cycle.lease.task_id, task.index, cycle.lease.attempt_id,
+                cycle.lease.account_id, cycle.wait_seconds, float(penalty or 0.0), mode,
+                float(getattr(pacer, "rate", 0.0) or 0.0), live_speed,
+                task.logical_uploaded_bytes, remaining_ratio,
+                cycle.account_accepted_parts, cycle.account_accepted_bytes,
+                cycle.task_accepted_parts, cycle.task_accepted_bytes,
+            )
+            return
+        if kind == "migration":
+            commit = payload["commit"]
+            task = scheduler.task(commit.task_id)
+            log.info(
+                "segment migration file_job_id=%s task_id=%s segment_index=%d "
+                "old_attempt_id=%d new_attempt_id=%d from_account_id=%d to_account_id=%d "
+                "snapshot_speed=%.2f snapshot_age=%.2f current_speed=%.2f "
+                "remaining_ratio=%.6f score=%.6f abandoned_bytes=%d migration_count=%d",
+                scheduler.file_job_id, commit.task_id, task.index,
+                commit.old_attempt_id, commit.new_attempt_id, commit.from_account_id,
+                commit.to_account_id, commit.target_snapshot_speed, commit.target_snapshot_age,
+                commit.current_speed, commit.remaining_ratio, commit.score,
+                commit.abandoned_logical_bytes, task.migration_count,
+            )
+
+    def scheduler_status(self) -> list[dict]:
+        with self._scheduler_state_lock:
+            schedulers = list(self._active_schedulers.values())
+        return [
+            {
+                "file_job_id": scheduler.file_job_id,
+                "segments": scheduler.status(),
+                **scheduler.metrics_snapshot(),
+            }
+            for scheduler in schedulers
+        ]
+
+    def _new_segment_scheduler(self, request, descriptors, preview):
+        scheduler = SegmentScheduler(
+            f"upload:{id(request)}",
+            descriptors,
+            pool=self.pool,
+            activity=self.pool.activity,
+            speed_tracker=self.pool.speed_tracker,
+            clock=self._scheduler_clock,
+        )
+        # Execution-only immutable context.  Scheduler state remains authoritative
+        # for ownership/generation; these values merely avoid widening every
+        # SchedulerAction with file-system objects.
+        scheduler.execution_request = request
+        scheduler.execution_preview = preview
+        scheduler._diagnostic_sink = (
+            lambda kind, payload, current=scheduler:
+                self._log_scheduler_diagnostic(current, kind, payload)
+        )
+        return scheduler
+
+    def _upload_big_with_scheduler(self, request, decision, preview):
+        descriptors = [
+            SegmentDescriptor(index=index, offset=offset, size=size)
+            for index, (offset, size) in enumerate(decision.segments)
+        ]
+        scheduler = self._new_segment_scheduler(request, descriptors, preview)
+        with self._scheduler_state_lock:
+            self._active_schedulers[id(request)] = scheduler
+        try:
+            with ThreadPoolExecutor(max_workers=min(self._segment_concurrency, len(descriptors))) as executor:
+                parts = self._run_scheduler_loop(scheduler, executor)
+            assert_parts_cover_file(parts, request.logical_size)
+            snapshot = scheduler.metrics_snapshot()
+            metrics = self._metrics_for(request)
+            if metrics is not None:
+                metrics.logical_uploaded_bytes = snapshot["logical_uploaded_bytes"]
+                metrics.physical_transferred_bytes = snapshot["physical_transferred_bytes"]
+                metrics.migration_overhead_bytes = snapshot["migration_overhead_bytes"]
+                metrics.migration_count = snapshot["migration_count"]
+            return parts
+        finally:
+            with self._scheduler_state_lock:
+                self._active_schedulers.pop(id(request), None)
+
+    def _run_scheduler_loop(self, scheduler: SegmentScheduler, executor) -> list[UploadedPart]:
+        submitted: dict[Future, object] = {}
+
+        def on_done(future, action):
+            category = None
+            try:
+                future.result()
+            except BaseException as exc:  # consume cancellation/programming failures
+                category = type(exc).__name__
+            scheduler.enqueue_executor_completion(future, action, category)
+
+        observed_version = scheduler.version
+        while True:
+            for future, action, category in scheduler.take_executor_completions():
+                submitted.pop(future, None)
+                scheduler.executor_finished(action, category)
+            if scheduler.all_terminal() and not submitted:
+                break
+
+            action = (
+                scheduler.select_next_action()
+                if len(submitted) < self._segment_concurrency
+                else None
+            )
+            if action is not None:
+                try:
+                    future = executor.submit(self._execute_scheduler_action, scheduler, action)
+                except Exception as exc:
+                    scheduler.submission_failed(action, type(exc).__name__)
+                    continue
+                submitted[future] = action
+                future.add_done_callback(
+                    lambda done, claim=action: on_done(done, claim)
+                )
+                continue
+
+            deadline = scheduler.next_deadline()
+            observed_version = scheduler.wait_for_change(observed_version, deadline)
+
+        return scheduler.completed_results_by_index()
+
+    def _execute_scheduler_action(self, scheduler: SegmentScheduler, action) -> None:
+        request = scheduler.execution_request
+        preview = scheduler.execution_preview if action.descriptor.index == 0 else None
+        lease = action.lease
+        runtime = scheduler.borrow_runtime(lease)
+        if runtime is None:
+            return
+        name = (
+            f"{request.upload_name}.part{action.descriptor.index + 1}"
+            if len(scheduler.status()) > 1 else request.upload_name
+        )
+        metrics = self._metrics_for(request)
+        if metrics is not None:
+            metrics.observe_limiter(runtime)
+        self._message_bucket(runtime)
+        revoke_handle = runtime.worker.create_revoke_handle()
+        if not scheduler.bind_revoke_handle(lease, revoke_handle):
+            revoke_handle.revoke()
+            scheduler.attempt_quiesced(lease)
+            return
+        observer = SchedulerUploadObserver(scheduler, lease)
+        reader = SegmentReader(
+            ext_path(request.source),
+            action.descriptor.offset,
+            action.descriptor.size,
+            force_big=True,
+        )
+        try:
+            try:
+                with _timed(metrics, "upload_ms"):
+                    handle = runtime.worker.prepare_segment(
+                        reader, action.descriptor.size, name, force_big=True,
+                        observer=observer, revoke_handle=revoke_handle, rpc_timeout=120.0,
+                    )
+                    uploaded_preview = (
+                        runtime.worker.prepare_thumbnail(
+                            preview,
+                            observer=AccountUploadObserver(
+                                self.pool, runtime.telegram_user_id,
+                                f"{lease.task_id}:{lease.attempt_id}:thumb",
+                            ),
+                        ) if preview else None
+                    )
+                if not scheduler.bytes_prepared(lease):
+                    return
+                if not scheduler.grant_finalize(lease):
+                    return
+                with _timed(metrics, "message_ms"):
+                    result = runtime.worker.send_uploaded_segment(
+                        handle, action.descriptor.size, name, preview=uploaded_preview,
+                        mime_type=request.mime_type, message_limiter=runtime.message_limiter,
+                    )
+                uploaded = UploadedPart(
+                    index=action.descriptor.index,
+                    message_id=int(result["message_id"]),
+                    file_id=str(result["file_id"]),
+                    access_hash=result.get("access_hash"),
+                    size=int(result["size"]),
+                    telegram_user_id=int(runtime.worker.user_id),
+                    has_thumbnail=uploaded_preview is not None,
+                )
+                if not scheduler.complete_attempt(lease, uploaded):
+                    raise RuntimeError("scheduler rejected completed current attempt")
+            except AttemptRevoked:
+                return
+            except (AssertionError, TypeError, AttributeError):
+                raise
+            except Exception as exc:
+                scheduler.fail_attempt(lease, redact(exc))
+        finally:
+            reader.close()
+            scheduler.attempt_quiesced(lease)
+
+    def _upload_segment_once(self, request, index, offset, size, force_big, split, preview):
         name = f"{request.upload_name}.part{index + 1}" if split else request.upload_name
         metrics = self._metrics_for(request)
         with _timed(metrics, "slot_ms"):
-            lease = self.pool.acquire_upload()
-            runtime = lease.__enter__()
+            lease = self._acquire_upload_lease(work_id=f"single:{id(request)}:{index}")
+            runtime = lease.runtime
         try:
             if metrics is not None:
                 metrics.observe_limiter(runtime)
@@ -702,13 +1090,31 @@ class UploadEngine:
             reader = SegmentReader(ext_path(request.source), offset, size, force_big=force_big)
             try:
                 with _timed(metrics, "upload_ms"):
-                    handle = runtime.worker.prepare_segment(reader, size, name, force_big=force_big)
-                    uploaded_preview = runtime.worker.prepare_thumbnail(preview) if preview else None
+                    observer = self._account_observer(
+                        runtime.telegram_user_id, f"{lease.work_id}:main"
+                    )
+                    segment_kwargs = {"force_big": force_big}
+                    if observer is not None:
+                        segment_kwargs["observer"] = observer
+                    handle = runtime.worker.prepare_segment(
+                        reader, size, name, **segment_kwargs,
+                    )
+                    if preview:
+                        thumb_observer = self._account_observer(
+                            runtime.telegram_user_id, f"{lease.work_id}:thumb"
+                        )
+                        thumb_kwargs = {}
+                        if thumb_observer is not None:
+                            thumb_kwargs["observer"] = thumb_observer
+                        uploaded_preview = runtime.worker.prepare_thumbnail(
+                            preview, **thumb_kwargs,
+                        )
+                    else:
+                        uploaded_preview = None
             finally:
                 reader.close()
         finally:
-            lease.__exit__(None, None, None)
-        # A Telegram message and backend registration do not occupy file slots.
+            lease.close()
         with _timed(metrics, "message_ms"):
             result = runtime.worker.send_uploaded_segment(
                 handle, size, name, preview=uploaded_preview,
@@ -720,6 +1126,10 @@ class UploadEngine:
             size=int(result["size"]), telegram_user_id=int(runtime.worker.user_id),
             has_thumbnail=uploaded_preview is not None,
         )
+
+    # Kept for focused legacy tests and internal callers; fresh force-big paths
+    # never use this compatibility spelling.
+    _upload_segment = _upload_segment_once
 
     def register_result(self, result: TransferResult) -> None:
         """Settle every part registration, then say where the time went.
@@ -755,10 +1165,13 @@ class UploadEngine:
         log.info(
             "transfer complete protocol=%s bytes=%d parts=%d hash_ms=%.0f check_ms=%.0f "
             "thumb_ms=%.0f slot_ms=%.0f upload_ms=%.0f message_ms=%.0f register_ms=%.0f "
-            "total_ms=%.0f accounts=%s rate=%.2f ceiling=%s",
+            "total_ms=%.0f accounts=%s logical_uploaded_bytes=%d physical_transferred_bytes=%d "
+            "migration_overhead_bytes=%d migration_count=%d rate=%.2f ceiling=%s",
             metrics.protocol, metrics.bytes, metrics.parts, metrics.hash_ms, metrics.check_ms,
             metrics.thumb_ms, metrics.slot_ms, metrics.upload_ms, metrics.message_ms,
-            metrics.register_ms, metrics.total_ms, metrics.account_ids, metrics.rate,
+            metrics.register_ms, metrics.total_ms, metrics.account_ids,
+            metrics.logical_uploaded_bytes, metrics.physical_transferred_bytes,
+            metrics.migration_overhead_bytes, metrics.migration_count, metrics.rate,
             metrics.ceiling,
         )
 

@@ -65,7 +65,7 @@ class _FakeClient:
 
 
 def _worker():
-    worker = tgio.TelegramWorker(1, "hash", "session")
+    worker = tgio.TelegramWorker(1, "hash", 1, Path("unused.session"))
     return worker
 
 

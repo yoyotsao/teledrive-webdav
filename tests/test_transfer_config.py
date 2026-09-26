@@ -9,12 +9,15 @@ from transfer_models import UploadedPart
 
 
 def write_config(tmp_path: Path, extra: str = "") -> Path:
+    sessions = tmp_path / "sessions"
+    sessions.mkdir(exist_ok=True)
     path = tmp_path / "config.ini"
     path.write_text(
         "[telegram]\n"
         "api_id = 123\n"
         "api_hash = hash\n"
-        "session = session\n"
+        "primary_user_id = 123\n"
+        "session_dir = sessions\n"
         f"{extra}",
         encoding="utf-8",
     )
@@ -53,18 +56,16 @@ def test_uploaded_part_requires_storage_identity():
     assert (part.index, part.telegram_user_id, part.file_id) == (0, 44, "991")
 
 
-def test_config_relative_accounts_path_and_blank_ffmpeg(tmp_path):
-    path = write_config(
-        tmp_path,
-        "accounts_file = secrets/accounts.local.json\n"
-        "\n[upload]\n"
-        "ffmpeg =\n",
-    )
+def test_config_relative_session_path_and_blank_ffmpeg(tmp_path):
+    path = write_config(tmp_path, "\n[upload]\nffmpeg =\n")
     cfg = load_config(path)
-    assert cfg.accounts_file == tmp_path / "secrets" / "accounts.local.json"
+    assert cfg.session_dir == tmp_path / "sessions"
     assert cfg.ffmpeg == ""
 
 
-def test_blank_accounts_file_keeps_legacy_single_account_mode(tmp_path, monkeypatch):
-    cfg = load_minimal_config(tmp_path, monkeypatch)
-    assert cfg.accounts_file is None
+def test_primary_user_id_must_be_positive(tmp_path):
+    path = write_config(tmp_path)
+    text = path.read_text("utf-8").replace("primary_user_id = 123", "primary_user_id = 0")
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ConfigError, match="primary_user_id"):
+        load_config(path)

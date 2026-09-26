@@ -85,14 +85,84 @@ def test_first_flood_and_concurrent_distinct_event_guard(limiter, clock):
     assert not state.escalated
 
 
-def test_premium_wait_only_pauses(limiter, clock):
+def test_premium_flood_freezes_without_lowering_rate(limiter, clock):
     before = limiter.snapshot()
     limiter.flood(17, premium=True)
     after = limiter.snapshot()
     assert (after.rate, after.ceiling, after.floods) == (before.rate, before.ceiling, 0)
+    assert after.mode == "frozen"
     assert after.paused_until == clock.now + 18
-    limiter.success(1)
-    assert limiter.snapshot().rate == 4.5  # Premium does not reset clean-window timing.
+    clock.advance(100)
+    limiter.success(0)
+    assert limiter.snapshot().rate == before.rate
+
+
+def test_clean_window_starts_on_first_post_wait_send(limiter, clock):
+    limiter.flood(10, premium=True)
+    clock.advance(30)
+    assert limiter.snapshot().mode == "frozen"
+    asyncio.run(limiter.pace())
+    clock.advance(120)
+    assert limiter.snapshot().clean_window_start is None
+    limiter.mark_send_started()
+    clock.advance(59.9)
+    limiter.success(0)
+    assert limiter.snapshot().mode == "frozen"
+    clock.advance(0.1)
+    limiter.success(0)
+    assert limiter.snapshot().mode == "cautious"
+
+
+def test_revocation_after_pace_does_not_start_clean_window(limiter, clock):
+    limiter.flood(1, premium=True)
+    asyncio.run(limiter.pace())
+    assert limiter.snapshot().clean_window_start is None
+
+
+def test_any_flood_resets_post_premium_clean_window(limiter, clock):
+    limiter.flood(1, premium=True)
+    asyncio.run(limiter.pace())
+    limiter.mark_send_started()
+    assert limiter.snapshot().clean_window_start is not None
+    limiter.flood(1)
+    assert limiter.snapshot().mode == "frozen"
+    assert limiter.snapshot().clean_window_start is None
+    asyncio.run(limiter.pace())
+    limiter.mark_send_started()
+    clock.advance(60)
+    limiter.success(0)
+    assert limiter.snapshot().mode == "cautious"
+    limiter.flood(1, premium=True)
+    assert limiter.snapshot().mode == "frozen"
+    assert limiter.snapshot().clean_window_start is None
+
+
+def test_cautious_ramps_by_at_most_point_one_every_thirty_seconds(limiter, clock):
+    limiter.flood(1, premium=True)
+    asyncio.run(limiter.pace())
+    limiter.mark_send_started()
+    clock.advance(60)
+    limiter.success(0)
+    assert limiter.snapshot().mode == "cautious"
+    before = limiter.snapshot().rate
+    clock.advance(29.99)
+    limiter.success(0)
+    assert limiter.snapshot().rate == before
+    clock.advance(0.01)
+    limiter.success(0)
+    assert limiter.snapshot().rate == pytest.approx(before + 0.1)
+    clock.advance(30)
+    limiter.success(0)
+    assert limiter.snapshot().rate == pytest.approx(before + 0.2)
+
+
+def test_pacer_mode_is_session_only_when_rate_is_restored(module, clock, tmp_path):
+    first = module.AdaptiveUploadLimiter(account_id=77, cache_dir=tmp_path, clock=clock, sleeper=clock.sleep, wall_clock=clock)
+    first.flood(1, premium=True)
+    first._persist()
+    restored = module.AdaptiveUploadLimiter(account_id=77, cache_dir=tmp_path, clock=clock, sleeper=clock.sleep, wall_clock=clock)
+    assert restored.snapshot().mode == "normal"
+    assert restored.snapshot().clean_window_start is None
 
 
 def test_premium_wait_holds_pacing_through_the_web_guard_second(limiter, clock):

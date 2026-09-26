@@ -11,11 +11,15 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
+import sys
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Callable, List, Literal, Optional, Tuple
+from typing import Callable, List, Literal, Optional, Protocol, Tuple
 
-from upload_limiter import AdaptiveUploadLimiter, LimiterConfig
+from upload_limiter import AdaptiveUploadLimiter, LimiterConfig, LimiterSnapshot
+from transfer_models import UploadRpcToken
 
 log = logging.getLogger("tgupload")
 
@@ -28,12 +32,6 @@ BIG_FILE_THRESHOLD = SMALL_FILE_MAX
 MESSAGE_MAX = MAX_PARTS_PER_MESSAGE * BIG_PART_SIZE
 
 PART_RETRIES = 3
-MAX_FLOOD_RETRIES = 10
-
-# An upload is a multi-hour batch job: waiting out a long FLOOD_WAIT beats
-# orphaning hundreds of already-accepted parts. Deliberately not tgio's
-# MAX_FLOOD_WAIT (120s); that one guards interactive reads.
-UPLOAD_MAX_FLOOD_WAIT = 600
 
 _WEB_LIMITER = LimiterConfig.web_defaults()
 DECREASE_FACTOR = _WEB_LIMITER.decrease_factor
@@ -113,14 +111,14 @@ class UploadGate(AdaptiveUploadLimiter):
 
 
 def _flood_wait(exc: BaseException) -> Optional[tuple[float, bool]]:
-    """Classify premium waits before Telethon reduces them to generic errors."""
+    """Return Telegram's requested upload wait, without imposing a local cap."""
     try:
         from telethon.errors import FloodPremiumWaitError, FloodWaitError
 
         premium = isinstance(exc, FloodPremiumWaitError)
         if isinstance(exc, (FloodWaitError, FloodPremiumWaitError)):
             seconds = float(exc.seconds)
-            if seconds <= UPLOAD_MAX_FLOOD_WAIT:
+            if math.isfinite(seconds) and seconds >= 0:
                 return seconds, premium
     except Exception:  # pragma: no cover
         pass
@@ -142,6 +140,124 @@ def _flood_seconds(exc: BaseException) -> Optional[float]:
     return None if flood is None else flood[0]
 
 
+class AttemptRevoked(RuntimeError):
+    """The scheduler revoked this upload attempt before the next RPC committed."""
+
+
+class UploadObserver(Protocol):
+    def request_started(self, part_index: int, nbytes: int) -> UploadRpcToken:
+        ...
+
+    def request_succeeded(self, token: UploadRpcToken, nbytes: int) -> None:
+        ...
+
+    def premium_flood(self, seconds: float, pacer_snapshot: LimiterSnapshot) -> None:
+        ...
+
+    def request_settled(self, token: UploadRpcToken) -> None:
+        ...
+
+    def late_request_succeeded(self, token: UploadRpcToken, nbytes: int) -> None:
+        ...
+
+
+class RevokeHandle:
+    def __init__(self, loop: asyncio.AbstractEventLoop, event: asyncio.Event):
+        self._loop = loop
+        self.worker_event = event
+
+    @classmethod
+    def create_on_worker_loop(cls) -> "RevokeHandle":
+        return cls(asyncio.get_running_loop(), asyncio.Event())
+
+    def revoke(self) -> None:
+        try:
+            self._loop.call_soon_threadsafe(self.worker_event.set)
+        except RuntimeError:
+            # Test/during-shutdown loops may already be closed. At that point
+            # there is no loop-owned callback left to wake, but setting the
+            # flag keeps cleanup idempotent and must not replace the real error.
+            self.worker_event.set()
+
+
+async def _await_cleanup(awaitable):
+    cleanup = asyncio.ensure_future(awaitable)
+    interrupted = False
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            interrupted = True
+    return cleanup.result(), interrupted
+
+
+async def _wait_or_revoke(awaitable, revoked: Optional[asyncio.Event]):
+    if revoked is None:
+        return await awaitable
+    work = asyncio.ensure_future(awaitable)
+    cancellation = asyncio.create_task(revoked.wait())
+    interrupted = False
+    try:
+        await asyncio.wait({work, cancellation}, return_when=asyncio.FIRST_COMPLETED)
+        if work.done():
+            return work.result()
+        work.cancel()
+        _, interrupted = await _await_cleanup(asyncio.gather(work, return_exceptions=True))
+        if not work.cancelled() and work.exception() is None:
+            return work.result()
+        raise AttemptRevoked()
+    finally:
+        cancellation.cancel()
+        if not work.done():
+            work.cancel()
+        _, cleanup_interrupted = await _await_cleanup(
+            asyncio.gather(work, cancellation, return_exceptions=True)
+        )
+        if interrupted or cleanup_interrupted:
+            raise asyncio.CancelledError()
+
+
+@asynccontextmanager
+async def _cancelable_context(cm, revoked: Optional[asyncio.Event]):
+    enter = asyncio.ensure_future(cm.__aenter__())
+    entered = False
+    interrupted = False
+    try:
+        value = await _wait_or_revoke(enter, revoked)
+        entered = True
+        if revoked is not None and revoked.is_set():
+            raise AttemptRevoked()
+        yield value
+    finally:
+        exit_args = sys.exc_info()
+        if not enter.done():
+            enter.cancel()
+        _, interrupted = await _await_cleanup(asyncio.gather(enter, return_exceptions=True))
+        if not entered and not enter.cancelled() and enter.exception() is None:
+            entered = True
+        if entered:
+            _, exit_interrupted = await _await_cleanup(cm.__aexit__(*exit_args))
+            interrupted = interrupted or exit_interrupted
+        if interrupted:
+            raise asyncio.CancelledError()
+
+
+def _observe_late_rpc(rpc, observer, token, nbytes: int) -> None:
+    if rpc is None:
+        return
+
+    def settled(future) -> None:
+        if (
+            not future.cancelled()
+            and future.exception() is None
+            and observer is not None
+            and token is not None
+        ):
+            observer.late_request_succeeded(token, nbytes)
+
+    rpc.add_done_callback(settled)
+
+
 def _sender_of(sender_or_client):
     return sender_or_client if hasattr(sender_or_client, "send") else getattr(sender_or_client, "_sender", None)
 
@@ -154,35 +270,80 @@ async def _sleep(limiter, seconds: float) -> None:
         await sleeper(seconds)
 
 
-async def send_part(sender_of: Callable[[], object], request, gate, label: str) -> None:
-    """Paced, flood-aware single part send.
-
-    Bypasses Telethon's ``client.__call__``/``client._call`` so part RPCs use
-    the account limiter and classify ``FLOOD_PREMIUM_WAIT`` before Telethon's
-    generic request handling can erase the wire name.
-    """
-    flood_retries = 0
+async def send_part(
+    sender_of: Callable[[], object],
+    request,
+    gate,
+    label: str,
+    *,
+    part_index: int = 0,
+    nbytes: int = 0,
+    observer: Optional[UploadObserver] = None,
+    revoked: Optional[asyncio.Event] = None,
+    rpc_timeout: float = 120.0,
+) -> None:
+    """Paced, flood-aware single part send with a revoke-safe commit boundary."""
     while True:
-        sender = sender_of()
-        if sender is None:
-            raise RuntimeError(f"{label}: upload client has no MTProto sender")
-        start = gate.now()
-        try:
-            async with gate.acquire():
-                await sender.send(request)
-        except ConnectionError:
-            raise
-        except Exception as exc:
-            flood = _flood_wait(exc)
-            if flood is None:
+        # New account limiters split admission into a capacity slot plus pacing so
+        # revocation can abort between those phases.  Older injected/test limiters
+        # expose one acquire() context that already owns both responsibilities.
+        # Keep both contracts valid while preserving the same commit boundary:
+        # once request_started() succeeds, the RPC is sent even if revoke races in.
+        slot = getattr(gate, "slot", None)
+        pace = getattr(gate, "pace", None)
+        if callable(slot) and callable(pace):
+            admission = slot()
+            legacy_admission = False
+        else:
+            acquire = getattr(gate, "acquire", None)
+            if not callable(acquire):
+                raise AttributeError("upload limiter has no admission context")
+            admission = acquire()
+            legacy_admission = True
+            start = gate.now()
+
+        async with _cancelable_context(admission, revoked):
+            if not legacy_admission:
+                start = gate.now()
+                await _wait_or_revoke(pace(), revoked)
+            if revoked is not None and revoked.is_set():
+                raise AttemptRevoked()
+            sender = sender_of()
+            if sender is None:
+                raise RuntimeError(f"{label}: upload client has no MTProto sender")
+            token = observer.request_started(part_index, nbytes) if observer else None
+            rpc = None
+            try:
+                # Successful request_started() is the point of no return. Do not
+                # re-check revoke between this token and invoking sender.send().
+                rpc = asyncio.ensure_future(sender.send(request))
+                marker = getattr(gate, "mark_send_started", None)
+                if marker is not None:
+                    marker()
+                await asyncio.wait_for(asyncio.shield(rpc), timeout=rpc_timeout)
+                if observer is not None:
+                    observer.request_succeeded(token, nbytes)
+            except asyncio.TimeoutError:
+                _observe_late_rpc(rpc, observer, token, nbytes)
                 raise
-            seconds, premium = flood
-            flood_retries += 1
-            if flood_retries > MAX_FLOOD_RETRIES:
+            except asyncio.CancelledError:
+                _observe_late_rpc(rpc, observer, token, nbytes)
                 raise
-            log.warning("%s hit FLOOD_WAIT", label)
-            gate.flood(seconds, premium=premium)
-            continue
+            except Exception as exc:
+                flood = _flood_wait(exc)
+                if flood is None:
+                    raise
+                seconds, premium = flood
+                log.warning("%s hit FLOOD_WAIT; retrying after %.1fs", label, seconds)
+                gate.flood(seconds, premium=premium)
+                if premium and observer is not None:
+                    snapshot = getattr(gate, "snapshot", None)
+                    if callable(snapshot):
+                        observer.premium_flood(seconds, snapshot())
+                continue
+            finally:
+                if observer is not None and token is not None:
+                    observer.request_settled(token)
         gate.success(gate.now() - start)
         return
 
@@ -226,6 +387,9 @@ async def _upload_parts(
     workers: int,
     progress,
     collect_payloads: bool = False,
+    observer: Optional[UploadObserver] = None,
+    revoked: Optional[asyncio.Event] = None,
+    rpc_timeout: float = 120.0,
 ):
     """Upload one complete MTProto message under worker and account limits."""
     from telethon import helpers
@@ -239,7 +403,7 @@ async def _upload_parts(
 
     async def send_one(index: int, offset: int, nbytes: int) -> None:
         nonlocal sent
-        async with worker_slots:
+        async with _cancelable_context(worker_slots, revoked):
             data = await reader.read_at(offset, nbytes)
             if payloads is not None:
                 payloads[index] = data
@@ -250,6 +414,11 @@ async def _upload_parts(
                         request_factory(file_id, index, total, data),
                         limiter,
                         f"part {index}/{total}",
+                        part_index=index,
+                        nbytes=nbytes,
+                        observer=observer,
+                        revoked=revoked,
+                        rpc_timeout=rpc_timeout,
                     )
                     break
                 except Exception as exc:
@@ -257,7 +426,7 @@ async def _upload_parts(
                         raise
                     if attempt + 1 >= PART_RETRIES:
                         raise
-                    await _sleep(limiter, 2 ** attempt)
+                    await _wait_or_revoke(_sleep(limiter, 2 ** attempt), revoked)
         async with sent_lock:
             sent += len(data)
             current = min(sent, size)
@@ -271,10 +440,14 @@ async def _upload_parts(
     try:
         await asyncio.gather(*tasks)
     except BaseException:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        if revoked is not None:
+            revoked.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        else:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
         raise
     return file_id, total, payloads
 
@@ -288,6 +461,9 @@ async def upload_small_file_parts(
     *,
     workers: int = 4,
     progress: Optional[Callable[[int, int], None]] = None,
+    observer: Optional[UploadObserver] = None,
+    revoked: Optional[asyncio.Event] = None,
+    rpc_timeout: float = 120.0,
 ):
     """Use 128 KiB SaveFilePart requests with an MD5 in the InputFile handle."""
     if not 0 < size <= SMALL_FILE_MAX:
@@ -308,6 +484,9 @@ async def upload_small_file_parts(
         workers=workers,
         progress=progress,
         collect_payloads=True,
+        observer=observer,
+        revoked=revoked,
+        rpc_timeout=rpc_timeout,
     )
     return InputFile(
         file_id, total, file_name, hashlib.md5(b"".join(payloads)).hexdigest()
@@ -324,6 +503,9 @@ async def upload_big_file_parts(
     force_big: bool = True,
     workers: int = 12,
     progress: Optional[Callable[[int, int], None]] = None,
+    observer: Optional[UploadObserver] = None,
+    revoked: Optional[asyncio.Event] = None,
+    rpc_timeout: float = 120.0,
 ):
     """Use 512 KiB SaveBigFilePart requests, including a small split tail."""
     if not 0 < size <= MESSAGE_MAX:
@@ -343,6 +525,9 @@ async def upload_big_file_parts(
         workers=workers,
         progress=progress,
         collect_payloads=False,
+        observer=observer,
+        revoked=revoked,
+        rpc_timeout=rpc_timeout,
     )
     return InputFileBig(file_id, total, file_name)
 

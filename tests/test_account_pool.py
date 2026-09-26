@@ -2,29 +2,15 @@ from __future__ import annotations
 
 import json
 import traceback
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from config import ConfigError
+from telegram_accounts import AccountUnavailableError, TelegramAccountPool
 from tgio import TelegramWorker
 from transfer_models import AccountSpec
-
-
-def write_accounts(tmp_path, rows):
-    path = tmp_path / "accounts.json"
-    path.write_text(
-        json.dumps(
-            {
-                "accounts": [
-                    {"telegram_user_id": user_id, "label": label, "session": session}
-                    for user_id, label, session in rows
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-    return path
 
 
 class FakeWorker:
@@ -34,6 +20,7 @@ class FakeWorker:
         self.started = 0
         self.stopped = 0
         self.dms = []
+        self.bound_limiter = None
 
     def start(self):
         self.started += 1
@@ -46,15 +33,23 @@ class FakeWorker:
     def send_dm(self, username, text):
         self.dms.append((username, text))
 
+    def set_upload_limiter(self, limiter):
+        self.bound_limiter = limiter
+
 
 class WorkerFactory:
     def __init__(self, workers):
         self.workers = workers
         self.calls = []
 
-    def __call__(self, api_id, api_hash, session, connections, *, upload_parts):
-        self.calls.append((api_id, api_hash, session, connections, upload_parts))
-        return self.workers[session]
+    def __call__(
+        self, api_id, api_hash, expected_user_id, session_path, connections, *, upload_parts
+    ):
+        path = Path(session_path)
+        self.calls.append(
+            (api_id, api_hash, expected_user_id, path, connections, upload_parts)
+        )
+        return self.workers[expected_user_id]
 
 
 class FakeApi:
@@ -77,9 +72,11 @@ class FakeApi:
         return set(self.linked)
 
 
-def make_pool(specs, workers, *, linked, upload_files=3):
-    from telegram_accounts import TelegramAccountPool
+def spec(user_id: int) -> AccountSpec:
+    return AccountSpec(user_id, Path(f"/outside/sessions/{user_id}.session"))
 
+
+def make_pool(specs, workers, *, linked, upload_files=3):
     pool = TelegramAccountPool(
         specs,
         api_id=123,
@@ -96,11 +93,7 @@ def make_pool(specs, workers, *, linked, upload_files=3):
 
 @pytest.fixture
 def pool():
-    pool, _ = make_pool(
-        [AccountSpec(1, "primary", "primary-secret")],
-        {"primary-secret": FakeWorker(1)},
-        linked={1},
-    )
+    pool, _ = make_pool([spec(1)], {1: FakeWorker(1)}, linked={1})
     try:
         yield pool
     finally:
@@ -112,23 +105,24 @@ def test_zero_routes_to_primary(pool):
 
 
 def test_nonzero_never_falls_back(pool):
-    from telegram_accounts import AccountUnavailableError
-
     with pytest.raises(AccountUnavailableError, match="99"):
         pool.for_read(99)
 
 
-def test_duplicate_configured_ids_are_rejected(tmp_path):
-    from telegram_accounts import load_account_specs
-
-    path = write_accounts(tmp_path, [(7, "a", "s1"), (7, "b", "s2")])
+def test_duplicate_configured_ids_are_rejected():
     with pytest.raises(ConfigError, match="duplicate.*7"):
-        load_account_specs(path)
+        TelegramAccountPool(
+            [spec(7), AccountSpec(7, Path("/other/7.session"))],
+            api_id=1,
+            api_hash="hash",
+            worker_factory=WorkerFactory({7: FakeWorker(7)}),
+        )
 
 
 def test_round_robin_skips_a_busy_account():
-    specs = [AccountSpec(1, "one", "s1"), AccountSpec(2, "two", "s2")]
-    pool, _ = make_pool(specs, {"s1": FakeWorker(1), "s2": FakeWorker(2)}, linked={1, 2})
+    pool, _ = make_pool(
+        [spec(1), spec(2)], {1: FakeWorker(1), 2: FakeWorker(2)}, linked={1, 2}
+    )
     try:
         for _ in range(3):
             assert pool.runtime(1).file_slots.acquire(blocking=False)
@@ -139,13 +133,7 @@ def test_round_robin_skips_a_busy_account():
 
 
 def test_upload_lease_returns_its_file_slot_on_context_exit():
-    specs = [AccountSpec(1, "primary", "s1")]
-    pool, _ = make_pool(
-        specs,
-        {"s1": FakeWorker(1)},
-        linked={1},
-        upload_files=1,
-    )
+    pool, _ = make_pool([spec(1)], {1: FakeWorker(1)}, linked={1}, upload_files=1)
     try:
         with pool.acquire_upload(timeout=0.1) as runtime:
             assert runtime.telegram_user_id == 1
@@ -156,15 +144,16 @@ def test_upload_lease_returns_its_file_slot_on_context_exit():
 
 
 def test_session_user_id_mismatch_disables_only_that_account():
-    specs = [AccountSpec(1, "primary", "secret-1"), AccountSpec(2, "wrong-id", "secret-2")]
     bad = FakeWorker(22)
-    pool, api = make_pool(specs, {"secret-1": FakeWorker(1), "secret-2": bad}, linked={1, 2})
+    pool, api = make_pool(
+        [spec(1), spec(2)], {1: FakeWorker(1), 2: bad}, linked={1, 2}
+    )
     try:
         assert pool.eligible_upload_ids == (1,)
-        with pytest.raises(Exception, match="2.*wrong-id"):
+        with pytest.raises(AccountUnavailableError, match="account 2"):
             pool.for_read(2)
         rendered = json.dumps(pool.status())
-        assert "secret-1" not in rendered and "secret-2" not in rendered
+        assert "/outside/sessions" not in rendered
         assert "expected 2" in rendered and "got 22" in rendered
         assert bad.stopped == 1
         assert api.logins == 1
@@ -172,63 +161,51 @@ def test_session_user_id_mismatch_disables_only_that_account():
         pool.stop()
 
 
-def test_primary_auth_failure_stops_workers_and_redacts_primary_session():
-    from telegram_accounts import AccountUnavailableError, TelegramAccountPool
-
-    specs = [
-        AccountSpec(1, "primary", "primary-secret"),
-        AccountSpec(2, "secondary", "secondary-secret"),
-    ]
+def test_primary_auth_failure_stops_workers_and_never_renders_session_path():
     primary = FakeWorker(1)
     secondary = FakeWorker(2)
     pool = TelegramAccountPool(
-        specs,
+        [spec(1), spec(2)],
         api_id=123,
         api_hash="hash",
-        worker_factory=WorkerFactory({
-            "primary-secret": primary,
-            "secondary-secret": secondary,
-        }),
+        worker_factory=WorkerFactory({1: primary, 2: secondary}),
     )
     api = FakeApi({1, 2})
-    api.login = lambda: (_ for _ in ()).throw(RuntimeError("backend rejected primary-secret"))
+    api.login = lambda: (_ for _ in ()).throw(
+        RuntimeError("backend rejected /outside/sessions/1.session")
+    )
 
     with pytest.raises(AccountUnavailableError) as raised:
         pool.start(api)
 
     message = str(raised.value)
-    assert "account 1 (primary)" in message
-    assert "primary-secret" not in message
     rendered_traceback = "".join(traceback.format_exception(raised.value))
-    assert "primary-secret" not in rendered_traceback
+    assert "account 1" in message
+    assert "/outside/sessions" not in message + rendered_traceback
     assert primary.stopped == secondary.stopped == 1
 
 
 def test_one_account_startup_failure_is_isolated():
-    specs = [
-        AccountSpec(1, "primary", "s1"),
-        AccountSpec(2, "broken", "do-not-print"),
-        AccountSpec(3, "healthy", "s3"),
-    ]
-    broken = FakeWorker(2, failure=RuntimeError("failed with do-not-print"))
+    broken = FakeWorker(2, failure=RuntimeError("failed at /outside/sessions/2.session"))
     pool, _ = make_pool(
-        specs,
-        {"s1": FakeWorker(1), "do-not-print": broken, "s3": FakeWorker(3)},
+        [spec(1), spec(2), spec(3)],
+        {1: FakeWorker(1), 2: broken, 3: FakeWorker(3)},
         linked={1, 2, 3},
     )
     try:
         assert pool.eligible_upload_ids == (1, 3)
         assert pool.for_read(3).online
         rendered = json.dumps(pool.status())
-        assert "broken" in rendered and "do-not-print" not in rendered
+        assert "/outside/sessions" not in rendered
         assert broken.stopped == 1
     finally:
         pool.stop()
 
 
 def test_unlinked_account_is_readable_but_not_upload_eligible():
-    specs = [AccountSpec(1, "primary", "s1"), AccountSpec(2, "historical", "s2")]
-    pool, api = make_pool(specs, {"s1": FakeWorker(1), "s2": FakeWorker(2)}, linked={1})
+    pool, api = make_pool(
+        [spec(1), spec(2)], {1: FakeWorker(1), 2: FakeWorker(2)}, linked={1}
+    )
     try:
         assert pool.eligible_upload_ids == (1,)
         assert pool.for_read(2).telegram_user_id == 2
@@ -240,89 +217,72 @@ def test_unlinked_account_is_readable_but_not_upload_eligible():
         pool.stop()
 
 
-def test_from_config_keeps_legacy_single_session_mode(tmp_path):
-    from telegram_accounts import TelegramAccountPool
-
+def test_pool_uses_configured_primary_and_discovered_numeric_order(tmp_path):
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    for user_id in (20, 3, 10):
+        (session_dir / f"{user_id}.session").write_bytes(b"sqlite")
     cfg = SimpleNamespace(
-        accounts_file=None,
-        session="legacy-secret",
+        primary_user_id=20,
+        session_dir=session_dir,
         api_id=123,
         api_hash="hash",
         download_connections=8,
         upload_files=3,
         upload_parts=12,
+        cache_dir=tmp_path / "meta",
     )
-    factory = WorkerFactory({"legacy-secret": FakeWorker(42)})
+    workers = {20: FakeWorker(20), 3: FakeWorker(3), 10: FakeWorker(10)}
+    factory = WorkerFactory(workers)
     pool = TelegramAccountPool.from_config(cfg, worker_factory=factory)
-    api = FakeApi({42})
-    pool.start(api)
-    try:
-        assert pool.primary.telegram_user_id == 42
-        assert pool.for_read(42) is pool.primary
-        assert pool.eligible_upload_ids == (42,)
-    finally:
-        pool.stop()
+    pool.start(FakeApi({20, 3, 10}))
+    assert pool.primary.spec.telegram_user_id == 20
+    assert pool.for_read(0) is pool.primary
+    assert [runtime.spec.telegram_user_id for runtime in pool._runtimes] == [20, 3, 10]
+    assert [call[2] for call in factory.calls] == [20, 3, 10]
+    assert [call[3] for call in factory.calls] == [
+        (session_dir / "20.session").resolve(),
+        (session_dir / "3.session").resolve(),
+        (session_dir / "10.session").resolve(),
+    ]
 
 
 def test_runtime_limiters_are_independent_and_injectable():
-    from telegram_accounts import TelegramAccountPool
-
-    specs = [AccountSpec(1, "one", "s1"), AccountSpec(2, "two", "s2")]
-    workers = {"s1": FakeWorker(1), "s2": FakeWorker(2)}
+    workers = {1: FakeWorker(1), 2: FakeWorker(2)}
     pool = TelegramAccountPool(
-        specs,
+        [spec(1), spec(2)],
         api_id=1,
         api_hash="hash",
         worker_factory=WorkerFactory(workers),
         chunk_limiter_factory=object,
         message_limiter_factory=object,
     )
-
     assert pool.runtime(1).chunk_limiter is not pool.runtime(2).chunk_limiter
     assert pool.runtime(1).message_limiter is not pool.runtime(2).message_limiter
 
 
 def test_runtime_binds_its_injected_chunk_limiter_to_its_worker():
-    from telegram_accounts import TelegramAccountPool
-
-    class BindingWorker(FakeWorker):
-        def __init__(self, user_id):
-            super().__init__(user_id)
-            self.bound_limiter = None
-
-        def set_upload_limiter(self, limiter):
-            self.bound_limiter = limiter
-
-    workers = {"s1": BindingWorker(1), "s2": BindingWorker(2)}
+    workers = {1: FakeWorker(1), 2: FakeWorker(2)}
     pool = TelegramAccountPool(
-        [AccountSpec(1, "one", "s1"), AccountSpec(2, "two", "s2")],
+        [spec(1), spec(2)],
         api_id=1,
         api_hash="hash",
         worker_factory=WorkerFactory(workers),
         chunk_limiter_factory=object,
     )
-
-    assert workers["s1"].bound_limiter is pool.runtime(1).chunk_limiter
-    assert workers["s2"].bound_limiter is pool.runtime(2).chunk_limiter
+    assert workers[1].bound_limiter is pool.runtime(1).chunk_limiter
+    assert workers[2].bound_limiter is pool.runtime(2).chunk_limiter
 
 
 def test_from_config_builds_and_binds_one_persisted_limiter_per_account(tmp_path):
-    """The production pool path, not only injected-test callers, owns it."""
-    from telegram_accounts import TelegramAccountPool
     from upload_limiter import AdaptiveUploadLimiter
 
-    class BindingWorker(FakeWorker):
-        def __init__(self, user_id):
-            super().__init__(user_id)
-            self.bound_limiter = None
-
-        def set_upload_limiter(self, limiter):
-            self.bound_limiter = limiter
-
-    accounts = write_accounts(tmp_path, [(42, "primary", "session-42")])
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    (session_dir / "42.session").write_bytes(b"sqlite")
     cfg = SimpleNamespace(
-        accounts_file=accounts,
-        session="legacy-secret",
+        primary_user_id=42,
+        session_dir=session_dir,
         api_id=123,
         api_hash="hash",
         download_connections=8,
@@ -330,11 +290,10 @@ def test_from_config_builds_and_binds_one_persisted_limiter_per_account(tmp_path
         upload_parts=99,
         cache_dir=tmp_path / "meta",
     )
-    worker = BindingWorker(42)
+    worker = FakeWorker(42)
     pool = TelegramAccountPool.from_config(
-        cfg, worker_factory=WorkerFactory({"session-42": worker})
+        cfg, worker_factory=WorkerFactory({42: worker})
     )
-
     limiter = pool.runtime(42).chunk_limiter
     assert isinstance(limiter, AdaptiveUploadLimiter)
     assert limiter.account_id == 42
@@ -342,13 +301,29 @@ def test_from_config_builds_and_binds_one_persisted_limiter_per_account(tmp_path
     assert worker.bound_limiter is limiter
 
 
+def test_status_has_primary_flag_but_no_label_or_path():
+    pool, _ = make_pool(
+        [spec(1), spec(2)], {1: FakeWorker(1), 2: FakeWorker(2)}, linked={1, 2}
+    )
+    try:
+        status = pool.status()
+        assert status["accounts"][0]["primary"] is True
+        assert status["accounts"][1]["primary"] is False
+        rendered = json.dumps(status)
+        assert "label" not in rendered
+        assert ".session" not in rendered
+        assert "/outside/sessions" not in rendered
+    finally:
+        pool.stop()
+
+
 def test_worker_can_start_again_after_connection_failure():
     class RetryWorker(TelegramWorker):
         def __init__(self):
-            super().__init__(1, "hash", "secret")
+            super().__init__(1, "hash", 7, Path("unused.session"))
             self.connect_attempts = 0
 
-        async def _connect(self):
+        async def _connect_and_validate_control(self):
             self.connect_attempts += 1
             if self.connect_attempts == 1:
                 raise RuntimeError("connection failed")

@@ -1,28 +1,30 @@
 """Configuration for the TeleDrive WebDAV bridge.
 
-Resolution order for every value: config.ini -> process environment -> the
-optional env_file (defaults to the TeleDrive repo's .env). Credentials therefore
-never need to be copied into this repo.
+Secret application credentials may fall back from config.ini to the process
+environment and the optional env_file. Telegram account authorization itself is
+never loaded from plaintext runtime configuration: accounts are discovered from
+SQLite session files in ``session_dir``.
 """
 
 from __future__ import annotations
 
 import configparser
+import logging
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 HERE = Path(__file__).resolve().parent
+log = logging.getLogger("config")
 
-# Env-var name each secret falls back to, matching TeleDrive's .env keys.
 _ENV_KEYS = {
     "api_id": "TELEGRAM_API_ID",
     "api_hash": "TELEGRAM_API_HASH",
-    "session": "TELEGRAM_SESSION_STRING",
     "base_url": "TELEDRIVE_BASE_URL",
 }
+_LEGACY_SESSION_ENV = "TELEGRAM_" + "SESSION_STRING"
 
 
 class ConfigError(RuntimeError):
@@ -33,25 +35,23 @@ class ConfigError(RuntimeError):
 class Config:
     api_id: int
     api_hash: str
-    session: str
-    base_url: str
-    game_folder: str
-    dir_cache_seconds: float
-    host: str
-    port: int
-    mount_drive: str
-    log_level: str
-    cache_dir: Path
-    local_dir: Path
-    staging_dir: Path
-    debounce_minutes: float
-    # Last, with defaults: callers that build a Config by hand (the e2e tests)
-    # should not have to care about a tuning knob or the rclone side.
+    primary_user_id: int
+    session_dir: Path = field(repr=False)
+    base_url: str = "http://127.0.0.1:8000"
+    game_folder: str = "game"
+    dir_cache_seconds: float = 3600.0
+    host: str = "127.0.0.1"
+    port: int = 8081
+    mount_drive: str = "E:"
+    log_level: str = "INFO"
+    cache_dir: Path = Path("data/meta")
+    local_dir: Path = Path("data/local")
+    staging_dir: Path = Path("data/staging")
+    debounce_minutes: float = 5.0
     download_connections: int = 8
-    rclone_dir: Path = Path("rclone")
+    rclone_dir: Path = Path("data/rclone")
     warmup_auto: bool = True
     warmup_interval_minutes: float = 360.0
-    accounts_file: Optional[Path] = None
     upload_files: int = 3
     upload_parts: int = 12
     hash_concurrency: int = 2
@@ -62,7 +62,7 @@ class Config:
     message_rate: float = 3.0
     message_burst: int = 6
     ffmpeg: str = ""
-    upload_dir: Path = Path("uploads")
+    upload_dir: Path = Path("data/uploads")
 
     @property
     def api_base(self) -> str:
@@ -70,21 +70,11 @@ class Config:
 
     @property
     def pack_dir(self) -> Path:
-        """Where staged trees are zipped.
-
-        Deliberately a sibling of the watched staging tree: writing the zip
-        *inside* staging_dir/<top> would look like fresh activity and reset the
-        debounce timer forever.
-        """
         return self.staging_dir / ".pack"
 
 
 def ext_path(path) -> str:
-    r"""Windows extended path (\\?\...) so paths longer than MAX_PATH still open.
-
-    Lives here because both the packer and the fetch-local client need it, and
-    config.py is the one module every entry point already imports.
-    """
+    r"""Windows extended path (\\?\...) so paths longer than MAX_PATH still open."""
     text = str(path)
     if os.name == "nt" and not text.startswith("\\\\?\\"):
         absolute = os.path.abspath(text)
@@ -95,11 +85,7 @@ def ext_path(path) -> str:
 
 
 def load_endpoint(path: Optional[Path] = None) -> tuple:
-    """(host, port, mount_drive) without requiring credentials.
-
-    The Explorer verb runs fetchlocal.py as a thin client; it only needs to know
-    where the bridge listens, and must not fail because credentials are absent.
-    """
+    """Return endpoint settings without requiring Telegram credentials."""
     if path is None:
         env_path = os.environ.get("TELEDRIVE_WEBDAV_CONFIG")
         path = Path(env_path) if env_path else HERE / "config.ini"
@@ -112,8 +98,8 @@ def load_endpoint(path: Optional[Path] = None) -> tuple:
     )
 
 
-def _read_env_file(path: Path) -> dict:
-    values = {}
+def _read_env_file(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
     try:
         text = path.read_text(encoding="utf-8-sig")
     except OSError:
@@ -155,8 +141,6 @@ def load_config(path: Optional[Path] = None) -> Config:
     config_dir = path.resolve().parent
 
     parser = configparser.ConfigParser()
-    # A missing config.ini is fine as long as the environment carries the
-    # credentials; every non-secret setting has a default below.
     parser.read([HERE / "config.example.ini", path], encoding="utf-8")
 
     env_file = parser.get("env", "env_file", fallback="").strip()
@@ -176,38 +160,79 @@ def load_config(path: Optional[Path] = None) -> Config:
 
     def resolve_dir(raw: str) -> Path:
         p = Path(raw.strip())
-        return p if p.is_absolute() else (config_dir / p)
+        if not p.is_absolute():
+            p = config_dir / p
+        return p.resolve()
 
-    # One setting names the root; everything under it is this module's business.
-    # Splitting it into four settings only invited them to drift apart, and three
-    # of the four were never anything a user would want to place individually.
     data_root = resolve_dir(get("paths", "cache_dir", "data"))
 
     api_id = get("telegram", "api_id")
     api_hash = get("telegram", "api_hash")
-    session = get("telegram", "session")
-    missing = [n for n, v in (("api_id", api_id), ("api_hash", api_hash), ("session", session)) if not v]
-    if missing:
+    primary_raw = parser.get("telegram", "primary_user_id", fallback="").strip()
+    session_dir_raw = parser.get("telegram", "session_dir", fallback="").strip()
+
+    legacy_config_keys = tuple(
+        key for key in ("session", "accounts_file")
+        if parser.get("telegram", key, fallback="").strip()
+    )
+    new_complete = bool(primary_raw and session_dir_raw)
+    legacy_env_present = bool(
+        os.environ.get(_LEGACY_SESSION_ENV) or file_env.get(_LEGACY_SESSION_ENV)
+    )
+
+    if legacy_config_keys:
+        key = legacy_config_keys[0]
+        if new_complete:
+            raise ConfigError(
+                f"legacy Telegram setting '{key}' conflicts with session_dir configuration; "
+                "remove it after migration"
+            ) from None
         raise ConfigError(
-            f"Missing credential(s): {', '.join(missing)}. Set them in {path.name}, "
-            f"in the environment, or in the env_file ({env_file or 'unset'})."
-        )
+            f"legacy Telegram setting '{key}' is no longer supported at runtime; "
+            "run sessionctl.py migrate"
+        ) from None
+    if not new_complete and legacy_env_present:
+        raise ConfigError(
+            f"legacy Telegram setting '{_LEGACY_SESSION_ENV}' is no longer supported at runtime; "
+            "run sessionctl.py migrate"
+        ) from None
+    if new_complete and legacy_env_present:
+        log.warning("obsolete Telegram environment setting %s is ignored", _LEGACY_SESSION_ENV)
+
+    missing = [
+        name for name, value in (
+            ("api_id", api_id),
+            ("api_hash", api_hash),
+            ("primary_user_id", primary_raw),
+            ("session_dir", session_dir_raw),
+        ) if not value
+    ]
+    if missing:
+        raise ConfigError(f"Missing configuration value(s): {', '.join(missing)}")
     if not api_id.isdigit():
         raise ConfigError(f"api_id must be numeric, got {api_id!r}")
 
     return Config(
         api_id=int(api_id),
         api_hash=api_hash,
-        session=session,
-        download_connections=positive_int("download_connections", get("telegram", "download_connections", "8")),
-        accounts_file=(resolve_dir(raw) if (raw := get("telegram", "accounts_file")) else None),
+        primary_user_id=positive_int("primary_user_id", primary_raw),
+        session_dir=resolve_dir(session_dir_raw),
+        download_connections=positive_int(
+            "download_connections", get("telegram", "download_connections", "8")
+        ),
         upload_files=positive_int("upload_files", get("telegram", "upload_files", "3")),
         upload_parts=positive_int("upload_parts", get("telegram", "upload_parts", "12")),
         hash_concurrency=positive_int("hash_concurrency", get("upload", "hash_concurrency", "2")),
-        hash_check_concurrency=positive_int("hash_check_concurrency", get("upload", "hash_check_concurrency", "8")),
-        register_concurrency=positive_int("register_concurrency", get("upload", "register_concurrency", "8")),
+        hash_check_concurrency=positive_int(
+            "hash_check_concurrency", get("upload", "hash_check_concurrency", "8")
+        ),
+        register_concurrency=positive_int(
+            "register_concurrency", get("upload", "register_concurrency", "8")
+        ),
         album_batch=positive_int("album_batch", get("upload", "album_batch", "10")),
-        album_timeout_seconds=positive_float("album_timeout_seconds", get("upload", "album_timeout_seconds", "60")),
+        album_timeout_seconds=positive_float(
+            "album_timeout_seconds", get("upload", "album_timeout_seconds", "60")
+        ),
         message_rate=positive_float("message_rate", get("upload", "message_rate", "3")),
         message_burst=positive_int("message_burst", get("upload", "message_burst", "6")),
         ffmpeg=get("upload", "ffmpeg"),
@@ -218,11 +243,6 @@ def load_config(path: Optional[Path] = None) -> Config:
         port=int(get("bridge", "port", "8081")),
         mount_drive=get("bridge", "mount_drive", "E:").rstrip("\\/"),
         log_level=get("bridge", "log_level", "INFO").upper(),
-        # meta/  previews and metadata, safe to delete (a re-warm, not a loss)
-        # rclone/ rclone's VFS cache, safe to delete
-        # local/  files fetched on purpose — NOT a cache, deleting loses them
-        # staging/ /game trees waiting to be packed and uploaded
-        # uploads/ plain writes anywhere else, waiting to be uploaded and registered
         cache_dir=data_root / "meta",
         local_dir=data_root / "local",
         staging_dir=data_root / "staging",

@@ -17,7 +17,6 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tgupload import (  # noqa: E402
-    MAX_FLOOD_RETRIES,
     MAX_PARTS_PER_MESSAGE,
     PART_RETRIES,
     PART_SIZE,
@@ -249,24 +248,61 @@ def test_send_part_classifies_premium_flood_before_retrying():
     assert limiter.floods == [(17.0, True)]
 
 
-def test_send_part_gives_up_after_max_flood_retries():
+def test_send_part_honors_premium_flood_wait_longer_than_old_cap():
+    from telethon.errors import FloodPremiumWaitError
+
+    class Limiter:
+        def __init__(self):
+            self.floods = []
+
+        @asynccontextmanager
+        async def acquire(self):
+            yield
+
+        def now(self):
+            return 0.0
+
+        def success(self, _duration):
+            pass
+
+        def flood(self, seconds, *, premium=False):
+            self.floods.append((seconds, premium))
+
+    request = make_request()
+    limiter = Limiter()
+    attempts = {"n": 0}
+
+    class PremiumThenSuccess:
+        async def send(self, req):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise FloodPremiumWaitError(req, capture=601)
+
+    run(send_part(lambda: PremiumThenSuccess(), request, limiter, "part"))
+
+    assert attempts["n"] == 2
+    assert limiter.floods == [(601.0, True)]
+
+
+def test_send_part_keeps_waiting_through_more_than_the_old_flood_retry_limit():
     from telethon.errors import FloodWaitError
 
     gate = fast_gate()
     request = make_request()
     attempts = {"n": 0}
 
-    class AlwaysFloods:
+    class FloodsThenSucceeds:
         async def send(self, req):
             attempts["n"] += 1
-            raise FloodWaitError(req, capture=1)
+            if attempts["n"] <= 12:
+                raise FloodWaitError(req, capture=1)
 
-    sender = AlwaysFloods()
+    sender = FloodsThenSucceeds()
 
-    with pytest.raises(FloodWaitError):
-        run(send_part(lambda: sender, request, gate, "part"))
+    run(send_part(lambda: sender, request, gate, "part"))
 
-    assert attempts["n"] == MAX_FLOOD_RETRIES + 1
+    assert attempts["n"] == 13
+    assert gate.stats()["floods"] == 12
 
 
 def test_send_part_leaves_non_flood_failures_for_the_three_attempt_primitive_retry():
@@ -329,7 +365,7 @@ def test_big_primitive_retries_a_non_flood_failure_three_times_with_web_backoff(
     assert limiter.sleeps == [1, 2]
 
 
-def test_big_primitive_does_not_wrap_final_flood_wait_in_non_flood_retry():
+def test_big_primitive_keeps_waiting_through_repeated_floods():
     from telethon.errors import FloodWaitError
 
     class Limiter:
@@ -353,24 +389,24 @@ def test_big_primitive_does_not_wrap_final_flood_wait_in_non_flood_retry():
         async def sleep(self, seconds):
             self.sleeps.append(seconds)
 
-    class AlwaysFloods:
+    class FloodsThenSucceeds:
         def __init__(self):
             self.attempts = 0
 
         async def send(self, request):
             self.attempts += 1
-            raise FloodWaitError(request, capture=1)
+            if self.attempts <= 12:
+                raise FloodWaitError(request, capture=1)
 
     async def scenario():
-        sender, limiter = AlwaysFloods(), Limiter()
+        sender, limiter = FloodsThenSucceeds(), Limiter()
         async with _PartReader(io.BytesIO(b"x")) as reader:
-            with pytest.raises(FloodWaitError):
-                await upload_big_file_parts(sender, limiter, reader, 1, "tail", force_big=True)
+            await upload_big_file_parts(sender, limiter, reader, 1, "tail", force_big=True)
         return sender, limiter
 
     sender, limiter = run(scenario())
-    assert sender.attempts == MAX_FLOOD_RETRIES + 1
-    assert len(limiter.floods) == MAX_FLOOD_RETRIES
+    assert sender.attempts == 13
+    assert len(limiter.floods) == 12
     assert limiter.sleeps == []
 
 

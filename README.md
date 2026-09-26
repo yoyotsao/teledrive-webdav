@@ -5,10 +5,11 @@
 - **瀏覽**：像本機資料夾一樣看，有縮圖、有圖片尺寸、影片可以直接點開播
 - **看**：檔案不會整份下載，只讀你實際用到的部分
 - **存遊戲**：把遊戲資料夾丟進 `H:\game\`，它會自己打包上傳；之後在 `H:` 上仍然看得到裡面每個檔案
+- **整理**：一般檔案與資料夾可直接新增、覆寫、刪除；刪除會移到 TeleDrive 網頁的垃圾桶
 - **取回**：右鍵「儲存在本地 (TeleDrive)」把東西抓回硬碟
 
-> 這台磁碟**唯讀**（只有 `H:\game\` 可以寫）。要上傳照片、影片請用 TeleDrive 網頁，
-> 那邊有縮圖、去重和相簿分組。
+> `H:\game\` 裡已打包 ZIP 所呈現的內部檔案是虛擬節點，不能單獨修改或刪除；
+> 一般路徑上的真實檔案與資料夾則可寫入與刪除。
 
 ---
 
@@ -35,16 +36,7 @@ winget install WinFsp.WinFsp
 
 裝完**關掉 PowerShell 再開一個新的**（讓 PATH 生效）。
 
-### 2. 產生 Telegram 登入憑證
-
-```powershell
-cd D:\python\teledrive
-python generate_session.py
-```
-
-會問你手機號碼，然後 Telegram App 會收到驗證碼。輸入完成後憑證就寫好了，之後不用再做。
-
-### 3. 建立 config.ini
+### 2. 建立 config.ini 與私有 session 目錄
 
 ```powershell
 cd D:\python\teledrive-webdav
@@ -52,7 +44,17 @@ copy config.example.ini config.ini
 notepad config.ini
 ```
 
-大部分不用改。通常只會動這幾個：
+Telegram 最小設定如下；`session_dir` 必須是 **repo 外**的既有私有目錄：
+
+```ini
+[telegram]
+api_id = 123456
+api_hash = your_api_hash
+primary_user_id = 123456789
+session_dir = D:\TeleDriveSessions
+```
+
+第一次還不知道 `primary_user_id` 時可以先留空，下一步登入成功後把輸出的 user ID 填回來。一般還會調整：
 
 | 設定 | 預設 | 意思 |
 |---|---|---|
@@ -60,8 +62,43 @@ notepad config.ini
 | `mount_drive` | `H:` | 要掛成哪個磁碟機代號。**改了的話 `start.bat` 裡的 `MOUNT=` 也要一起改。** |
 | `debounce_minutes` | `5` | 丟進 `H:\game\` 的資料夾靜置多久算「搬完了」，然後開始打包 |
 
-帳號密碼三個欄位（`api_id` / `api_hash` / `session`）**留空就好** —— 它會自己去讀
-步驟 2 產生的檔案，憑證只存在一個地方。
+### 3. 建立 Telegram SQLite session
+
+```powershell
+python sessionctl.py login --config config.ini --session-dir D:\TeleDriveSessions
+```
+
+它會互動式詢問手機、驗證碼與 2FA；成功後只留下 `<telegram_user_id>.session`。要加入次要帳號就重跑一次，所有帳號都放同一個目錄，新增後重啟 bridge 即可。第一個／主要帳號不是看檔名順序，而是由 `primary_user_id` 明確指定。
+
+`.session` 是**未加密的 bearer credential**：拿到檔案的人等同拿到登入權限。不要放進 repo、同步碟或備份公開區。若舊的 StringSession 已經外洩，應先在 Telegram 撤銷該登入再用 `sessionctl login` 建新 session；不要把已外洩憑證遷移過來。只有確認舊 plaintext 從未外洩時，才可用：
+
+```powershell
+python sessionctl.py migrate --config config.ini --session-dir D:\TeleDriveSessions
+```
+
+### 大檔 premium flood 自動接手
+
+所有 `force_big=True` 的大型 segment 由中央 `SegmentScheduler` 派工。只有目前 attempt
+已跑至少 **30 秒**、最近 **30 秒**內出現 `FLOOD_PREMIUM_WAIT`、尚未完成且從未
+migration 的 segment 才會成為候選。接手帳號必須 `online + linked`、完全沒有 byte-upload
+job / in-flight upload RPC / reservation，並且有 **5 分鐘內**的 idle effective-speed snapshot。
+只有 `(接手速度 / 目前速度) × 剩餘比例 > 2` 才會搬移；等於 2 不搬。每個 segment
+最多搬一次，接手者一定用新的 Telegram `file_id` 從 part 0 重傳。
+
+Migration 提交時舊 attempt 立刻失去 finalize 權；已經 commit 的 MTProto RPC 不硬取消，
+只 drain 該 attempt 自己的 RPC（wrapper 上限 120 秒），不等舊帳號的其他工作。舊 attempt
+晚到的明確成功只增加 physical traffic，不會恢復 logical progress 或建立第二則 Telegram
+message。UI/status 的有效進度只有在 migration generation 改變時可以回退。
+
+`/rpc/status` 的帳號資料會顯示 `idle`、`active_byte_upload_jobs`、
+`in_flight_upload_rpcs`、`reserved_task_id`、`idle_speed_bytes_per_second` 與 limiter `mode`；
+正在跑的大檔則在 `uploads.schedulers` 顯示 segment state/attempt/migration/logical bytes 與
+`physical_transferred_bytes`、`migration_overhead_bytes`。這些欄位不包含 session 路徑、
+auth key、JWT 或其他 credential。
+
+Premium flood 會把 chunk limiter 切到 `frozen`，不降低當下 rate、也禁止 success ramp。
+Telegram wait 結束後，直到第一個真正的 `sender.send()` 才開始 60 秒 clean window；滿 60 秒
+無任何 flood 後進入 `cautious`，之後最多每 30 秒增加 0.1 parts/s。
 
 ### 4. 第一次啟動
 

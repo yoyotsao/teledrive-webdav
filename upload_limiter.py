@@ -17,6 +17,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from enum import Enum
 from typing import Awaitable, Callable, Optional
 
 log = logging.getLogger(__name__)
@@ -48,10 +49,17 @@ class LimiterConfig:
     escalated_ceiling_factor: float = 0.9
     escalated_clean_window: float = 60.0
     escalation_reset: float = 600.0
+    premium_clean_window: float = 60.0
 
     @classmethod
     def web_defaults(cls) -> LimiterConfig:
         return cls()
+
+
+class PacerMode(str, Enum):
+    NORMAL = "normal"
+    FROZEN = "frozen"
+    CAUTIOUS = "cautious"
 
 
 @dataclass(frozen=True)
@@ -64,6 +72,8 @@ class LimiterSnapshot:
     escalated: bool
     probe_started_at: Optional[float]
     probe_cooldown: float
+    mode: str = PacerMode.NORMAL.value
+    clean_window_start: Optional[float] = None
 
 
 def _finite_number(value) -> bool:
@@ -164,6 +174,8 @@ class AdaptiveUploadLimiter:
         self._probe_started_at: Optional[float] = None
         self._probe_cooldown = self.config.probe_cooldown
         self._last_probe_ended_at = self.now()
+        self._mode = PacerMode.NORMAL
+        self._clean_window_start: Optional[float] = None
         self._store = None if cache_dir is None else _RateStore(cache_dir, self.account_id, wall_clock)
         if self._store is not None:
             restored = self._store.load(self.config)
@@ -206,9 +218,16 @@ class AdaptiveUploadLimiter:
     def flood(self, seconds: Optional[float], *, premium: bool = False) -> None:
         now, cfg = self.now(), self.config
         wait = _wait_seconds(seconds)
-        if not premium:
+        if premium:
+            self._mode = PacerMode.FROZEN
+            self._clean_window_start = None
+            self._last_flood_at = now
+        else:
             self._floods += 1
             self._last_flood_at = now
+            if self._mode is not PacerMode.NORMAL:
+                self._mode = PacerMode.FROZEN
+                self._clean_window_start = None
             if now >= self._penalty_until:
                 previous = self._rate
                 self._flood_events.append(now)
@@ -238,9 +257,37 @@ class AdaptiveUploadLimiter:
         self._penalty_until = max(self._penalty_until, now + wait + 1.0)
         self._next_slot_at = max(self._next_slot_at, self._penalty_until)
 
+    def mark_send_started(self) -> None:
+        now = self.now()
+        if (
+            self._mode is PacerMode.FROZEN
+            and now >= self._penalty_until
+            and self._clean_window_start is None
+        ):
+            self._clean_window_start = now
+
     def success(self, duration: float) -> None:
         # duration is accepted for uploader compatibility; Web pacing ignores RTT.
         now, cfg = self.now(), self.config
+        if self._mode is PacerMode.FROZEN:
+            if (
+                self._clean_window_start is None
+                or now - self._clean_window_start < cfg.premium_clean_window
+            ):
+                return
+            self._mode = PacerMode.CAUTIOUS
+            self._last_increase_at = now
+            return
+        if self._mode is PacerMode.CAUTIOUS:
+            if now - self._last_increase_at < cfg.slow_interval:
+                return
+            cap = cfg.maximum if self._ceiling is None else min(cfg.maximum, self._ceiling)
+            if self._rate >= cap:
+                return
+            self._last_increase_at = now
+            self._rate = min(cap, self._rate + cfg.slow_step)
+            self._persist()
+            return
         clean = cfg.escalated_clean_window if now < self._escalated_until else cfg.clean_window
         if self._last_flood_at is not None and now - self._last_flood_at < clean:
             return
@@ -282,6 +329,7 @@ class AdaptiveUploadLimiter:
         return LimiterSnapshot(
             self._rate, self._ceiling, self._floods, self._window, self._penalty_until,
             self.now() < self._escalated_until, self._probe_started_at, self._probe_cooldown,
+            self._mode.value, self._clean_window_start,
         )
 
     def stats(self) -> dict:

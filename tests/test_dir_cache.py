@@ -32,10 +32,11 @@ import tdapi  # noqa: E402
 from tdapi import TeleDriveClient  # noqa: E402
 
 
-def row(file_id, name, is_dir=False, message_id=None, telegram_user_id=0):
+def row(file_id, name, is_dir=False, message_id=None, telegram_user_id=0, parent_id=None):
     return {
         "file_id": file_id,
         "filename": name,
+        "parent_id": parent_id,
         "isDir": is_dir,
         "filesize": 1024,
         "created_at": "2026-08-22T14:29:07Z",
@@ -93,8 +94,11 @@ def client(tmp_path, backend, **cfg):
 
 TREE = {
     None: [row("pixiv", "pixiv", is_dir=True)],
-    "pixiv": [row("u1", "user-955496", is_dir=True), row("f1", "cover.jpg", message_id=5)],
-    "u1": [row("f2", "142759167_p0.jpg", message_id=7)],
+    "pixiv": [
+        row("u1", "user-955496", is_dir=True, parent_id="pixiv"),
+        row("f1", "cover.jpg", message_id=5, parent_id="pixiv"),
+    ],
+    "u1": [row("f2", "142759167_p0.jpg", message_id=7, parent_id="u1")],
 }
 
 
@@ -235,6 +239,20 @@ def test_invalidate_one_folder_leaves_the_others(tmp_path):
     api.list_dir(None)
 
     assert backend.calls == []  # the root was not forgotten
+
+
+def test_trash_removes_the_entry_without_refetching_any_directory(tmp_path):
+    backend = Backend(TREE)
+    api = client(tmp_path, backend)
+    api.list_dir(None)
+    entry = api.resolve(["pixiv", "cover.jpg"])
+
+    api.trash(entry.file_id, entry.parent_id)
+    backend.calls.clear()
+
+    assert [item.name for item in api.list_dir(None)] == ["pixiv"]
+    assert [item.name for item in api.list_dir("pixiv")] == ["user-955496"]
+    assert backend.calls == []
 
 
 def test_the_root_and_odd_ids_get_usable_filenames(tmp_path):

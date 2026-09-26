@@ -63,8 +63,12 @@ class Api:
 
 @pytest.fixture
 def cfg(tmp_path):
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    (session_dir / "1.session").write_bytes(b"sqlite")
     built = Config(
-        api_id=1, api_hash="hash", session="", base_url="http://backend",
+        api_id=1, api_hash="hash", primary_user_id=1, session_dir=session_dir,
+        base_url="http://backend",
         game_folder="game", dir_cache_seconds=60.0, host="127.0.0.1", port=0,
         mount_drive="E:", log_level="WARNING",
         cache_dir=tmp_path / "cache", local_dir=tmp_path / "local",
@@ -160,7 +164,10 @@ class Limiter:
         self.session = "1AaBbCcSecretSessionString"
 
     def stats(self):
-        return {"rate": 4.0, "ceiling": None, "window": 2, "floods": 0}
+        return {
+            "rate": 4.0, "ceiling": None, "window": 2, "floods": 0,
+            "mode": "normal", "clean_window_start": None,
+        }
 
 
 def _rpc_status(app) -> dict:
@@ -183,9 +190,9 @@ def rpc(cfg):
         2: SimpleNamespace(user_id=2, stop=lambda: None),
     }
     pool = TelegramAccountPool(
-        [AccountSpec(1, "one", "session-one"), AccountSpec(2, "two", "session-two")],
+        [AccountSpec(1, Path("/sessions/1.session")), AccountSpec(2, Path("/sessions/2.session"))],
         api_id=1, api_hash="hash",
-        worker_factory=lambda _a, _b, session, *_args, **_kwargs: workers[int(session[-3:] == "two") + 1],
+        worker_factory=lambda _a, _b, user_id, _path, *_args, **_kwargs: workers[user_id],
         chunk_limiter_factory=Limiter,
     )
     for identity in (1, 2):
@@ -204,10 +211,12 @@ def rpc(cfg):
 def test_status_reports_every_account_and_its_limiter(rpc):
     body = _rpc_status(rpc.app)
     assert [account["telegram_user_id"] for account in body["accounts"]] == [1, 2]
-    assert {"rate", "ceiling", "window", "floods"} <= set(body["accounts"][0]["limiter"])
+    assert {"rate", "ceiling", "window", "floods", "mode"} <= set(body["accounts"][0]["limiter"])
+    assert {"idle", "active_byte_upload_jobs", "in_flight_upload_rpcs"} <= set(body["accounts"][0])
     assert body["eligible_upload_ids"] == [1, 2]
     # The two queues stay distinguishable: /game packs, everything else does not.
     assert "units" in body and "pending" in body["uploads"]
+    assert "schedulers" in body["uploads"]
 
 
 def test_status_never_renders_a_credential(rpc):
@@ -224,17 +233,17 @@ def test_status_never_renders_a_credential(rpc):
 def test_only_the_primary_answers_the_bot_challenge(cfg):
     started = []
     workers = {
-        session: SimpleNamespace(
+        identity: SimpleNamespace(
             user_id=identity, stop=lambda: None,
-            start=lambda s=session: started.append(s),
-            send_dm=lambda username, text, s=session: None,
+            start=lambda i=identity: started.append(i),
+            send_dm=lambda username, text, i=identity: None,
         )
-        for session, identity in (("one", 1), ("two", 2))
+        for identity in (1, 2)
     }
     pool = TelegramAccountPool(
-        [AccountSpec(1, "one", "one"), AccountSpec(2, "two", "two")],
+        [AccountSpec(1, Path("/sessions/1.session")), AccountSpec(2, Path("/sessions/2.session"))],
         api_id=1, api_hash="hash",
-        worker_factory=lambda _a, _b, session, *_args, **_kwargs: workers[session],
+        worker_factory=lambda _a, _b, user_id, _path, *_args, **_kwargs: workers[user_id],
     )
     senders = []
     api = SimpleNamespace(
@@ -243,33 +252,33 @@ def test_only_the_primary_answers_the_bot_challenge(cfg):
         linked_account_ids=lambda: {1, 2},
     )
     pool.start(api)
-    assert started == ["one", "two"]
+    assert started == [1, 2]
     # One DM sender, and it is the primary's: the challenge proves the drive
     # owner's identity, not whichever account happens to store a segment.
-    assert senders == [workers["one"].send_dm]
+    assert senders == [workers[1].send_dm]
 
 
 def test_stopping_the_pool_stops_every_account(cfg):
     stopped = []
     workers = {
-        session: SimpleNamespace(
+        identity: SimpleNamespace(
             user_id=identity, start=lambda: None,
-            stop=lambda s=session: stopped.append(s),
+            stop=lambda i=identity: stopped.append(i),
             send_dm=lambda *_a: None,
         )
-        for session, identity in (("one", 1), ("two", 2))
+        for identity in (1, 2)
     }
     pool = TelegramAccountPool(
-        [AccountSpec(1, "one", "one"), AccountSpec(2, "two", "two")],
+        [AccountSpec(1, Path("/sessions/1.session")), AccountSpec(2, Path("/sessions/2.session"))],
         api_id=1, api_hash="hash",
-        worker_factory=lambda _a, _b, session, *_args, **_kwargs: workers[session],
+        worker_factory=lambda _a, _b, user_id, _path, *_args, **_kwargs: workers[user_id],
     )
     pool.start(SimpleNamespace(
         set_dm_sender=lambda _s: None, login=lambda: None,
         linked_account_ids=lambda: {1, 2},
     ))
     pool.stop()
-    assert sorted(stopped) == ["one", "two"]
+    assert sorted(stopped) == [1, 2]
 
 
 def test_warmup_reads_previews_and_properties_through_the_owning_account(cfg):
@@ -291,9 +300,9 @@ def test_warmup_reads_previews_and_properties_through_the_owning_account(cfg):
 
     workers = {1: worker(1), 2: worker(2)}
     pool = TelegramAccountPool(
-        [AccountSpec(1, "one", "1"), AccountSpec(2, "two", "2")],
+        [AccountSpec(1, Path("/sessions/1.session")), AccountSpec(2, Path("/sessions/2.session"))],
         api_id=1, api_hash="hash",
-        worker_factory=lambda _a, _b, session, *_args, **_kwargs: workers[int(session)],
+        worker_factory=lambda _a, _b, user_id, _path, *_args, **_kwargs: workers[user_id],
     )
     for identity in (1, 2):
         pool.runtime(identity).online = pool.runtime(identity).linked = True
@@ -327,7 +336,7 @@ def test_warmup_reads_previews_and_properties_through_the_owning_account(cfg):
 def test_a_row_with_no_account_still_reads_from_the_primary(cfg):
     primary = SimpleNamespace(user_id=7, stop=lambda: None)
     pool = TelegramAccountPool(
-        [AccountSpec(0, "primary", "legacy")], api_id=1, api_hash="hash",
+        [AccountSpec(7, Path("/sessions/7.session"))], api_id=1, api_hash="hash",
         worker_factory=lambda *_a, **_kw: primary,
     )
     pool.primary.online = pool.primary.linked = True
