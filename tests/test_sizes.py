@@ -288,3 +288,47 @@ def test_a_sharded_store_leaves_no_temp_file_behind(tmp_path):
 
     assert list((tmp_path / "zips").glob("*.tmp")) == []
     assert store.get("a") == {"v": 2}
+
+
+def test_json_store_put_during_flush_neither_crashes_nor_drops(tmp_path, monkeypatch):
+    """A put from another worker thread while flush() is mid-write.
+
+    flush() used to hand the live dict to json.dump outside the lock, so a
+    concurrent put raised "dictionary changed size during iteration" and
+    /rpc/props answered 500 -- which the shell treats like "no properties" and
+    reads the whole file instead. A put landing between the snapshot and the
+    merge was also dropped from memory for good.
+    """
+    from tdapi import JsonStore
+
+    path = tmp_path / "props.json"
+    store = JsonStore(path)
+    store.put("a", 1)
+
+    real_read = Path.read_text
+
+    def read_then_race(self, *args, **kwargs):
+        text = real_read(self, *args, **kwargs)
+        if self == path:
+            store._data["during-merge"] = 2  # what a racing put() leaves behind
+            store._dirty = True
+        return text
+
+    real_dump = tdapi.json.dump
+
+    def dump_then_race(obj, fh, *args, **kwargs):
+        store.put("during-dump", 3, defer=True)
+        return real_dump(obj, fh, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_then_race)
+    monkeypatch.setattr(tdapi.json, "dump", dump_then_race)
+    store.put("b", 4)  # flushes
+
+    assert store.get("during-merge") == 2
+    assert store.get("during-dump") == 3
+    monkeypatch.undo()
+    store.flush()
+    reloaded = JsonStore(path)
+    assert {k: reloaded.get(k) for k in ("a", "b", "during-merge", "during-dump")} == {
+        "a": 1, "b": 4, "during-merge": 2, "during-dump": 3,
+    }

@@ -241,7 +241,14 @@ class JsonStore:
         merged.update(mine)
 
         with self._lock:
+            # Puts that landed since `mine` was taken are only in self._data;
+            # replacing it with `merged` alone would drop them. And the dict
+            # that json.dump walks must not be the live one: another worker's
+            # put() mid-dump raised "dictionary changed size during iteration",
+            # which surfaced as a 500 from /rpc/props.
+            merged.update(self._data)
             self._data = merged
+            merged = dict(merged)
 
         # A temp name per writer, not a fixed ".tmp". wsgidav answers a listing
         # on sixteen worker threads and each one that fills a zip directory

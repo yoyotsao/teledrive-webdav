@@ -771,6 +771,22 @@ GET /files    0.52s ┘
   現在 `Loc(ZIPDIR, node=None)` 表示「封存本身」，樹留到真的有人往裡面看才讀
   （`Loc.zip_node()`）。實測 **15 分鐘 → 0.042 秒**。
   這條之前之所以沒炸，純粹是因為上面那 127 筆瞬間失敗 —— 快而錯，不是對。
+- **網頁上傳的封存是 deflate，每開一次成員就重讀一次 central directory。**
+  bridge 自己打包的是 `ZIP_STORED`，走 `SlicedReader` 直接切位移；但網頁上傳的 zip
+  是 `ZIP_DEFLATED`，`ZipView.open` 以前對這種成員每次都 `zipfile.ZipFile(新串流)`，
+  **每一次 backward seek 又再開一個** —— 每次都從 Telegram 重讀 end record 與 central
+  directory，而每個新串流的 block 快取都是冷的。實測 2026-09-26：log 上同一個 offset
+  一分鐘被抓約 220 次，16 條 cheroot worker 有 12 條卡在 `get_document`，於是連
+  `PROPFIND /game/` 都排不到 thread，**超過 5 分鐘沒回**（使用者看到的是「開 game 裡的
+  資料夾轉半天」）。樹裡本來就記著 `header_offset` / `compress_size`，現在 deflate 成員
+  直接從資料位移用 `zlib`（raw，`wbits=-15`）解（`_InflateReader`），backward seek
+  只重開這個成員。修完 `/game/` 0.05 秒、zip 資料夾瞬間、讀成員 1–3 秒。
+  其他壓縮法（bzip2/lzma）少見，仍走 `zipfile`。
+- **`JsonStore.flush` 不能把活的 dict 交給 `json.dump`。** merge 完 `self._data = merged`
+  之後在鎖外 dump 同一個物件，另一條 worker 的 `put()` 就會
+  `dictionary changed size during iteration` → `/rpc/props` 500 → DLL 退回去讀整檔。
+  同一段還會把「snapshot 之後、merge 之前」進來的 put 從記憶體裡丟掉。
+
 - **`zip_dirs.json` 一份共用的 JSON 會變成每讀一個封存重寫幾十 MB。**
   一個 central directory 可以是好幾 MB，這個 drive 上 276 個封存讓那份檔案長到
   **132 MB**，而 `JsonStore.put` 是整份重寫 —— 列一次 `/game` 等於寫約 18 GB。

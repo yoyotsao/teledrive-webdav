@@ -224,6 +224,63 @@ def test_deflated_member_still_readable(tmp_path):
         assert fh.read(5) == blob[10:15]
 
 
+def test_deflated_member_does_not_reparse_the_central_directory(tmp_path, monkeypatch):
+    """Opening a compressed member must not re-read the archive's directory.
+
+    Archives uploaded from the browser are ZIP_DEFLATED. Opening a member used
+    to build a fresh ``zipfile.ZipFile`` every time, and every backward seek
+    opened another one: each re-read the end record and central directory over
+    Telegram. On the live drive the same offset was fetched ~220 times a minute
+    and all 16 worker threads sat waiting on it, so even ``PROPFIND /game/``
+    queued for minutes. The tree already knows where the member is.
+    """
+    path = tmp_path / "compressed.zip"
+    blobs = {f"dir/f{i}.txt": (f"member {i} ".encode() * 4000) for i in range(3)}
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, blob in blobs.items():
+            zf.writestr(name, blob)
+    data = path.read_bytes()
+    stats = {"read": 0, "opens": 0}
+
+    def opener():
+        stats["opens"] += 1
+        return CountingStream(data, stats)
+
+    zv = zipfs.ZipView(opener, name="compressed")
+    zv.root  # directory parsed once, as for browsing
+
+    def no_zipfile(*_a, **_k):
+        raise AssertionError("central directory re-parsed")
+
+    monkeypatch.setattr(zipfs.zipfile, "ZipFile", no_zipfile)
+    for name, blob in blobs.items():
+        node = zv.lookup(name.split("/"))
+        assert not node.stored
+        with zv.open(node) as fh:
+            assert fh.read(100) == blob[:100]
+            fh.seek(7)  # backward: restarts the member, not the archive
+            assert fh.read(50) == blob[7:57]
+            fh.seek(len(blob) - 20)
+            assert fh.read() == blob[-20:]
+        stats["read"] = 0
+        with zv.open(node) as fh:
+            fh.read(10)
+        assert stats["read"] < node.compress_size + 4096
+
+
+def test_truncated_deflated_member_raises_instead_of_returning_short_data(tmp_path):
+    path = tmp_path / "compressed.zip"
+    blob = bytes(range(256)) * 400
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("x.bin", blob)
+    data = path.read_bytes()
+    zv = zipfs.ZipView(lambda: CountingStream(data, {"read": 0}), name="c")
+    node = zv.lookup(["x.bin"])
+    node.compress_size //= 2
+    with zv.open(node) as fh, pytest.raises(OSError):
+        fh.read()
+
+
 def test_zip_name_helpers():
     assert zipfs.is_zip_name("MyGame.zip") and zipfs.is_zip_name("A.ZIP")
     assert not zipfs.is_zip_name("MyGame.rar")
