@@ -73,7 +73,7 @@ class FakeWorker:
         self.messages[self._next_id] = blob
         return self._next_id
 
-    def read(self, message_id: int, expected_file_id: str, offset: int, length: int) -> bytes:
+    def read(self, message_id: int, expected_file_id: str, offset: int, length: int, expected_size=None) -> bytes:
         self.reads.append((message_id, offset, length))
         blob = self.messages[message_id]
         return blob[offset : offset + length]
@@ -1105,9 +1105,9 @@ def test_browsing_a_zip_does_not_download_it(rig):
     read = {"bytes": 0}
     original = rig.worker.read
 
-    def counting(message_id, expected_file_id, offset, length):
+    def counting(message_id, expected_file_id, offset, length, expected_size=None):
         read["bytes"] += length
-        return original(message_id, expected_file_id, offset, length)
+        return original(message_id, expected_file_id, offset, length, expected_size)
 
     rig.worker.read = counting
     rig.resolver._zips.clear()  # force a fresh central-directory parse

@@ -165,7 +165,7 @@ class FakeReader:
     def worker(self):
         return self
 
-    def read(self, message_id, expected_file_id, offset, length):
+    def read(self, message_id, expected_file_id, offset, length, expected_size=None):
         assert expected_file_id == str(message_id)
         self.calls.append((message_id, offset, length))
         return self.parts[message_id][offset : offset + length]

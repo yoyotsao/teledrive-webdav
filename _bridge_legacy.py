@@ -377,7 +377,8 @@ class Resolver:
             try:
                 part = self._remote_part(entry)
                 data = self.pool.for_read(part.telegram_user_id).worker.read(
-                    part.message_id, part.file_id, 0, HEAD_SIZE
+                    part.message_id, part.file_id, 0, HEAD_SIZE,
+                    expected_size=part.size,
                 )
                 if not data:
                     return False

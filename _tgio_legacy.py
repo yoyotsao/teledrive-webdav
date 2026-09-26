@@ -144,7 +144,28 @@ class RemoteIdentityError(RuntimeError):
     """Telegram returned media other than the immutable file we expected."""
 
 
-def _assert_media_id(media, expected_file_id: str) -> None:
+def _size_confirms(media, recorded_size: Optional[int]) -> bool:
+    """Whether a part's recorded size identifies ``media`` when its id cannot.
+
+    The browser registers ``SaveBigFilePart`` uploads (>= 10 MiB, and every
+    split segment) under the client-generated InputFileBig id rather than the
+    document id Telegram assigns (TeleDrive ``frontend/src/lib/gramjs.ts``), so
+    for those rows the id comparison fails on the right file. Measured on the
+    live drive: 16 consecutive messages whose name and size matched the backend
+    byte for byte, none whose id did, and 3,672 files that had stopped reading.
+
+    The recorded size is either exact or padded up to whole 512 KiB upload
+    parts (see ``Entry.real_size``), never smaller than the real file.
+    """
+    actual = _media_size(media)
+    if actual is None or recorded_size is None or recorded_size <= 0:
+        return False
+    return 0 <= recorded_size - actual < REQUEST_SIZE
+
+
+def _assert_media_id(
+    media, expected_file_id: str, expected_size: Optional[int] = None
+) -> None:
     """Refuse media that is not the file the metadata named.
 
     Only a Telegram document/photo id can be checked, and only some rows carry
@@ -164,7 +185,7 @@ def _assert_media_id(media, expected_file_id: str) -> None:
     if not expected.isdigit():
         return
     actual = str(getattr(media, "id", ""))
-    if actual != expected:
+    if actual != expected and not _size_confirms(media, expected_size):
         raise RemoteIdentityError(
             f"Telegram file mismatch: expected {expected_file_id}, got {actual}"
         )
@@ -173,7 +194,7 @@ def _assert_media_id(media, expected_file_id: str) -> None:
 def read_part(pool, part: RemotePart, offset: int, length: int) -> bytes:
     """Read one routed part without weakening a nonzero account identity."""
     return pool.for_read(part.telegram_user_id).worker.read(
-        part.message_id, part.file_id, offset, length
+        part.message_id, part.file_id, offset, length, expected_size=part.size
     )
 
 
@@ -465,16 +486,28 @@ class TelegramWorker:
 
     # -- documents -------------------------------------------------------- #
 
-    def get_document(self, message_id: int, expected_file_id: str, refresh: bool = False):
+    def get_document(
+        self,
+        message_id: int,
+        expected_file_id: str,
+        refresh: bool = False,
+        expected_size: Optional[int] = None,
+    ):
         """Resolve a message id to its Document, with a TTL cache.
 
         ``file_reference`` inside the Document expires after a few hours, so both
         the TTL and the explicit ``refresh`` path exist to re-fetch it.
         """
-        return self.run(self._document(message_id, expected_file_id, refresh))
+        return self.run(
+            self._document(message_id, expected_file_id, refresh, expected_size)
+        )
 
     async def _document(
-        self, message_id: int, expected_file_id: str, refresh: bool = False
+        self,
+        message_id: int,
+        expected_file_id: str,
+        refresh: bool = False,
+        expected_size: Optional[int] = None,
     ):
         """Async half of get_document, so batch paths can await it directly.
 
@@ -490,7 +523,7 @@ class TelegramWorker:
             if hit and now - hit[1] < DOC_CACHE_TTL:
                 return hit[0]
         doc = await self._fetch_document(message_id)
-        _assert_media_id(doc, expected_file_id)
+        _assert_media_id(doc, expected_file_id, expected_size)
         with self._docs_lock:
             self._docs[key] = (doc, now)
         return doc
@@ -542,7 +575,9 @@ class TelegramWorker:
         async def one(part: RemotePart):
             key = (part.message_id, str(part.file_id))
             try:
-                doc = await self._document(part.message_id, part.file_id)
+                doc = await self._document(
+                    part.message_id, part.file_id, expected_size=part.size
+                )
                 async with gate:
                     return key, await self._thumbnail_bytes(doc)
             except Exception as exc:
@@ -572,7 +607,9 @@ class TelegramWorker:
         for part in parts:
             key = (part.message_id, str(part.file_id))
             try:
-                doc = await self._document(part.message_id, part.file_id)
+                doc = await self._document(
+                    part.message_id, part.file_id, expected_size=part.size
+                )
             except Exception as exc:
                 log.warning("media info for message %s failed: %s", part.message_id, exc)
                 continue
@@ -612,7 +649,7 @@ class TelegramWorker:
                     if media is None:
                         continue
                     try:
-                        _assert_media_id(media, part.file_id)
+                        _assert_media_id(media, part.file_id, part.size)
                     except RemoteIdentityError:
                         continue
                     self._docs[(part.message_id, str(part.file_id))] = (media, now)
@@ -687,19 +724,26 @@ class TelegramWorker:
     # -- reading ---------------------------------------------------------- #
 
     def read(
-        self, message_id: int, expected_file_id: str, offset: int, length: int
+        self,
+        message_id: int,
+        expected_file_id: str,
+        offset: int,
+        length: int,
+        expected_size: Optional[int] = None,
     ) -> bytes:
         """Read ``length`` bytes at ``offset`` from one message's document."""
         if length <= 0:
             return b""
-        doc = self.get_document(message_id, expected_file_id)
+        doc = self.get_document(message_id, expected_file_id, expected_size=expected_size)
         try:
             return self.run(self._read(doc, offset, length))
         except Exception as exc:
             if not _is_file_reference_error(exc):
                 raise
             log.warning("file_reference expired for message %s — refetching", message_id)
-            doc = self.get_document(message_id, expected_file_id, refresh=True)
+            doc = self.get_document(
+                message_id, expected_file_id, refresh=True, expected_size=expected_size
+            )
             return self.run(self._read(doc, offset, length))
 
     async def _read(self, doc, offset: int, length: int) -> bytes:

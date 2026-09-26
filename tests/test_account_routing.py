@@ -108,10 +108,55 @@ def test_document_cache_key_includes_expected_file_id():
     assert (5, "701") not in worker._docs
 
 
+def _sized(message_id: int, file_id: str, size: int) -> _Message:
+    message = _Message(message_id, file_id)
+    message.document.size = size
+    return message
+
+
+def test_web_big_upload_id_is_verified_by_size_instead():
+    """The browser registers big uploads under the upload's random file id.
+
+    ``SaveBigFilePart`` uploads (>= 10 MiB, and every split segment) are
+    registered with the client-generated InputFileBig id, not the document id
+    Telegram assigns (frontend ``gramjs.ts``). Checked on the live drive: 16
+    consecutive messages matched the backend's name and size byte for byte and
+    none matched its file_id; 3,672 files had stopped reading. When the id
+    cannot confirm the file, the recorded size of that part still can.
+    """
+    worker = _worker({5: _sized(5, "700", 12_066_260)})
+    worker._thumb_gate = None
+
+    assert worker.get_document(5, "9001", expected_size=12_066_260).id == 700
+    assert worker.read(5, "9001", 0, 1, expected_size=12_066_260) == b"x"
+    part = RemotePart(5, 12_066_260, 0, "9001")
+    asyncio.run(worker._prefetch_documents([part]))
+    assert (5, "9001") in worker._docs
+
+
+def test_size_fallback_tolerates_the_backends_512k_padding():
+    real = 3 * 512 * 1024 + 17
+    padded = 4 * 512 * 1024
+    worker = _worker({5: _sized(5, "700", real)})
+
+    assert worker.get_document(5, "9001", expected_size=padded).id == 700
+
+
+def test_a_different_file_is_still_refused_when_the_size_disagrees():
+    worker = _worker({5: _sized(5, "700", 1_000_000)})
+
+    for recorded in (999_999, 1_000_000 + 512 * 1024):
+        with pytest.raises(RuntimeError, match="expected 9001.*got 700"):
+            worker.get_document(5, "9001", expected_size=recorded)
+    with pytest.raises(RuntimeError, match="expected 9001.*got 700"):
+        worker.read(5, "9001", 0, 1, expected_size=1_000_000 + 512 * 1024)
+    assert worker._client.getfile_calls == []
+
+
 def test_thumbnail_identity_is_checked_before_getfile():
     worker = _worker({5: _Message(5, "700")})
     worker._thumb_gate = None
-    part = RemotePart(5, 1, 0, "701")
+    part = RemotePart(5, 2 * 512 * 1024, 0, "701")
 
     assert asyncio.run(worker._thumbnails([part])) == {}
     assert worker._client.getfile_calls == []
@@ -135,7 +180,7 @@ class _MemoryWorker:
     def put(self, message_id, file_id, data):
         self.files[(message_id, str(file_id))] = data
 
-    def read(self, message_id, expected_file_id, offset, length):
+    def read(self, message_id, expected_file_id, offset, length, expected_size=None):
         self.calls.append((message_id, str(expected_file_id), offset, length))
         return self.files[(message_id, str(expected_file_id))][offset : offset + length]
 
@@ -336,3 +381,19 @@ def test_legacy_split_cache_without_file_ids_is_refetched(tmp_path):
         [10, 3, 1, "110"],
         [11, 2, 2, "211"],
     ]
+
+
+def test_legacy_location_passes_its_media_size_to_the_identity_check():
+    from transfer_models import LegacySavedMessagesLocation
+
+    worker = _worker({5: _sized(5, "700", 12_066_260)})
+    location = LegacySavedMessagesLocation(0, 5, "9001", 12_066_260)
+
+    assert worker.read_location(location, None, 0, 1) == b"x"
+    worker.media_info_location(location, None)
+
+    fresh = _worker({5: _sized(5, "700", 12_066_260)})
+    wrong = LegacySavedMessagesLocation(0, 5, "9001", 1_000)
+    with pytest.raises(RuntimeError, match="expected 9001.*got 700"):
+        fresh.read_location(wrong, None, 0, 1)
+    assert fresh._client.getfile_calls == []

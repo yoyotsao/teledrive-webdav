@@ -754,6 +754,16 @@ GET /files    0.52s ┘
   實測這個 drive 的 `/game` **143 筆裡有 127 筆**帶著它，全部讀不到，連 `H:` 都打不開。
   修法是**只驗證看起來是 document id（純數字）的值**：不是 id 的東西不帶身分資訊，
   沒有東西可以驗，退回加上這個檢查之前的行為（信任 message_id）。真的有 id 的照驗。
+- **網頁上傳的大檔，`file_id` 是上傳 id 不是 document id —— 純數字也一樣驗不了。**
+  網頁端（TeleDrive `frontend/src/lib/gramjs.ts`）小檔登記的是 `msg.media.document.id`，
+  但走 `SaveBigFilePart` 的（≥ 10 MiB、以及每一個 split segment）登記的是客戶端自己
+  隨機產生的 InputFileBig id。兩者都是 64-bit 純數字，從值本身分不出來，所以上一條的
+  「只驗純數字」擋不住：實測 2026-09-26，`Okayu/Posts` 連續 16 則訊息檔名與大小跟
+  backend 逐位元組相同、**id 一則都不同**，一天內 3,672 個檔案的讀取／縮圖／屬性全被
+  `Telegram file mismatch` 擋掉，DLL 於是 `delegating` 去讀整張原圖（又一種「看起來
+  只是冷資料夾慢」）。現在 id 對不上時改用那個 part 記錄的大小驗證（`_size_confirms`：
+  完全相等，或是 backend 的 512 KiB 補齊範圍內），大小也不合才拒絕。
+
 - **列 `/game` 不可以打開每一個封存。** 解析 `/game/<name>` 曾經呼叫
   `view.lookup([])` 只為了回答「這是不是目錄」—— 而那個答案 `.zip` 這個副檔名就給了。
   PROPFIND `Depth: 1` 會解析每一個子項，所以 143 個封存就是 143 次 Telegram 往返、

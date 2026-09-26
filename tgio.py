@@ -199,7 +199,13 @@ def _get_location_media(self, location: FileLocation, peer, refresh: bool = Fals
 
 def _read_location(self, location, peer, offset: int, length: int) -> bytes:
     if isinstance(location, LegacySavedMessagesLocation):
-        return self.read(location.telegram_message_id, location.file_id, offset, length)
+        return self.read(
+            location.telegram_message_id,
+            location.file_id,
+            offset,
+            length,
+            expected_size=location.media_size,
+        )
     if length <= 0:
         return b""
     media = self.get_location_media(location, peer)
@@ -227,7 +233,11 @@ def _thumbnail_location(self, location, peer):
 
 def _media_info_location(self, location, peer):
     if isinstance(location, LegacySavedMessagesLocation):
-        media = self.get_document(location.telegram_message_id, location.file_id)
+        media = self.get_document(
+            location.telegram_message_id,
+            location.file_id,
+            expected_size=location.media_size,
+        )
     else:
         media = self.get_location_media(location, peer)
     return _legacy._media_attributes(media)
