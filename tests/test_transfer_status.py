@@ -25,7 +25,7 @@ import upload_engine  # noqa: E402
 import warmup  # noqa: E402
 from config import Config  # noqa: E402
 from telegram_accounts import AccountUnavailableError, TelegramAccountPool  # noqa: E402
-from transfer_models import AccountSpec, TransferResult, UploadedPart  # noqa: E402
+from transfer_models import AccountSpec, FileLocation, ResolvedRemotePart, TransferResult, UploadedPart  # noqa: E402
 
 
 class RecordingEngine:
@@ -279,13 +279,11 @@ def test_warmup_reads_previews_and_properties_through_the_owning_account(cfg):
     def worker(identity):
         return SimpleNamespace(
             user_id=identity, stop=lambda: None,
-            thumbnails=lambda parts, i=identity: (
-                asked[i].append([p.message_id for p in parts])
-                or {(p.message_id, str(p.file_id)): b"\xff\xd8jpeg" for p in parts}
+            thumbnail_location=lambda location, peer, i=identity: (
+                asked[i].append([location.telegram_message_id]) or b"\xff\xd8jpeg"
             ),
-            media_info=lambda parts, i=identity: (
-                asked[i].append([p.message_id for p in parts])
-                or {(p.message_id, str(p.file_id)): {"width": 4, "height": 2} for p in parts}
+            media_info_location=lambda location, peer, i=identity: (
+                asked[i].append([location.telegram_message_id]) or {"width": 4, "height": 2}
             ),
         )
 
@@ -307,9 +305,17 @@ def test_warmup_reads_previews_and_properties_through_the_owning_account(cfg):
               message_id=22, has_thumbnail=True, telegram_user_id=2),
     ]
     api = SimpleNamespace(
-        parts_for=lambda entry: [SimpleNamespace(
-            message_id=entry.message_id, size=entry.size,
-            telegram_user_id=entry.telegram_user_id, file_id=entry.file_id,
+        current_parts=lambda entry: [ResolvedRemotePart(
+            entry.file_id, 0, FileLocation(
+                telegram_chat_id=None,
+                telegram_user_id=entry.telegram_user_id,
+                telegram_message_id=entry.message_id,
+                media_kind="document",
+                media_id=entry.file_id,
+                media_size=entry.size,
+                photo_variant=None,
+                location_version=1,
+            ),
         )],
         invalidate=lambda *_a: None,
     )

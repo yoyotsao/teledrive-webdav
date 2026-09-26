@@ -62,6 +62,7 @@ class Config:
     message_rate: float = 3.0
     message_burst: int = 6
     ffmpeg: str = ""
+    seven_zip: str = r"C:\Program Files\7-Zip\7z.exe"
     upload_dir: Path = Path("uploads")
 
     @property
@@ -229,6 +230,7 @@ def load_config(path: Optional[Path] = None) -> Config:
         rclone_dir=data_root / "rclone",
         upload_dir=data_root / "uploads",
         debounce_minutes=float(get("game", "debounce_minutes", "5")),
+        seven_zip=get("game", "seven_zip", r"C:\Program Files\7-Zip\7z.exe"),
         warmup_auto=get("warmup", "auto", "true").lower() not in ("0", "false", "no", "off"),
         warmup_interval_minutes=float(get("warmup", "interval_minutes", "360")),
     )

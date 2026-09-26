@@ -754,6 +754,16 @@ GET /files    0.52s ┘
   實測這個 drive 的 `/game` **143 筆裡有 127 筆**帶著它，全部讀不到，連 `H:` 都打不開。
   修法是**只驗證看起來是 document id（純數字）的值**：不是 id 的東西不帶身分資訊，
   沒有東西可以驗，退回加上這個檢查之前的行為（信任 message_id）。真的有 id 的照驗。
+- **網頁上傳的大檔，`file_id` 是上傳 id 不是 document id —— 純數字也一樣驗不了。**
+  網頁端（TeleDrive `frontend/src/lib/gramjs.ts`）小檔登記的是 `msg.media.document.id`，
+  但走 `SaveBigFilePart` 的（≥ 10 MiB、以及每一個 split segment）登記的是客戶端自己
+  隨機產生的 InputFileBig id。兩者都是 64-bit 純數字，從值本身分不出來，所以上一條的
+  「只驗純數字」擋不住：實測 2026-09-26，`Okayu/Posts` 連續 16 則訊息檔名與大小跟
+  backend 逐位元組相同、**id 一則都不同**，一天內 3,672 個檔案的讀取／縮圖／屬性全被
+  `Telegram file mismatch` 擋掉，DLL 於是 `delegating` 去讀整張原圖（又一種「看起來
+  只是冷資料夾慢」）。現在 id 對不上時改用那個 part 記錄的大小驗證（`_size_confirms`：
+  完全相等，或是 backend 的 512 KiB 補齊範圍內），大小也不合才拒絕。
+
 - **列 `/game` 不可以打開每一個封存。** 解析 `/game/<name>` 曾經呼叫
   `view.lookup([])` 只為了回答「這是不是目錄」—— 而那個答案 `.zip` 這個副檔名就給了。
   PROPFIND `Depth: 1` 會解析每一個子項，所以 143 個封存就是 143 次 Telegram 往返、
@@ -761,6 +771,22 @@ GET /files    0.52s ┘
   現在 `Loc(ZIPDIR, node=None)` 表示「封存本身」，樹留到真的有人往裡面看才讀
   （`Loc.zip_node()`）。實測 **15 分鐘 → 0.042 秒**。
   這條之前之所以沒炸，純粹是因為上面那 127 筆瞬間失敗 —— 快而錯，不是對。
+- **網頁上傳的封存是 deflate，每開一次成員就重讀一次 central directory。**
+  bridge 自己打包的是 `ZIP_STORED`，走 `SlicedReader` 直接切位移；但網頁上傳的 zip
+  是 `ZIP_DEFLATED`，`ZipView.open` 以前對這種成員每次都 `zipfile.ZipFile(新串流)`，
+  **每一次 backward seek 又再開一個** —— 每次都從 Telegram 重讀 end record 與 central
+  directory，而每個新串流的 block 快取都是冷的。實測 2026-09-26：log 上同一個 offset
+  一分鐘被抓約 220 次，16 條 cheroot worker 有 12 條卡在 `get_document`，於是連
+  `PROPFIND /game/` 都排不到 thread，**超過 5 分鐘沒回**（使用者看到的是「開 game 裡的
+  資料夾轉半天」）。樹裡本來就記著 `header_offset` / `compress_size`，現在 deflate 成員
+  直接從資料位移用 `zlib`（raw，`wbits=-15`）解（`_InflateReader`），backward seek
+  只重開這個成員。修完 `/game/` 0.05 秒、zip 資料夾瞬間、讀成員 1–3 秒。
+  其他壓縮法（bzip2/lzma）少見，仍走 `zipfile`。
+- **`JsonStore.flush` 不能把活的 dict 交給 `json.dump`。** merge 完 `self._data = merged`
+  之後在鎖外 dump 同一個物件，另一條 worker 的 `put()` 就會
+  `dictionary changed size during iteration` → `/rpc/props` 500 → DLL 退回去讀整檔。
+  同一段還會把「snapshot 之後、merge 之前」進來的 put 從記憶體裡丟掉。
+
 - **`zip_dirs.json` 一份共用的 JSON 會變成每讀一個封存重寫幾十 MB。**
   一個 central directory 可以是好幾 MB，這個 drive 上 276 個封存讓那份檔案長到
   **132 MB**，而 `JsonStore.put` 是整份重寫 —— 列一次 `/game` 等於寫約 18 GB。

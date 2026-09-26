@@ -73,7 +73,7 @@ class FakeWorker:
         self.messages[self._next_id] = blob
         return self._next_id
 
-    def read(self, message_id: int, expected_file_id: str, offset: int, length: int) -> bytes:
+    def read(self, message_id: int, expected_file_id: str, offset: int, length: int, expected_size=None) -> bytes:
         self.reads.append((message_id, offset, length))
         blob = self.messages[message_id]
         return blob[offset : offset + length]
@@ -101,6 +101,25 @@ class FakeWorker:
             (part.message_id, str(part.file_id)): self.media.get(part.message_id, {})
             for part in parts if part.message_id in self.messages
         }
+
+    # Canonical reads are routed by physical location now. Keep the old batch
+    # methods above because upload/legacy tests still exercise them directly.
+    def read_location(self, location, peer, offset, length):
+        assert peer == "me"
+        expected = getattr(location, "media_id", None) or getattr(location, "file_id", "")
+        return self.read(location.telegram_message_id, str(expected), offset, length)
+
+    def thumbnail_location(self, location, peer):
+        assert peer == "me"
+        self.thumb_batches = getattr(self, "thumb_batches", [])
+        self.thumb_batches.append([location])
+        return self.thumbs.get(location.telegram_message_id)
+
+    def media_info_location(self, location, peer):
+        assert peer == "me"
+        self.media_batches = getattr(self, "media_batches", [])
+        self.media_batches.append([location])
+        return self.media.get(location.telegram_message_id, {})
 
     def upload_segment(self, stream, size, file_name, progress=None, preview=None):
         data = bytearray()
@@ -317,6 +336,9 @@ class FakeBackend:
             return self._list(params, want_dir=True)
         if path == "/files" and method == "GET":
             return self._list(params, want_dir=False)
+        if path.startswith("/files/") and path.endswith("/download") and method == "GET":
+            file_id = path.split("/")[-2]
+            return dict(next(r for r in self.rows if r["file_id"] == file_id and not r.get("trashed_at")))
         if path == "/folders" and method == "POST":
             return self.add_folder(payload["name"], payload.get("parent_id"))
         if path.startswith("/files/by-split-group/"):
@@ -545,6 +567,11 @@ def rig(tmp_path):
         def for_read(self, account_id):
             assert account_id in (0, self.primary.telegram_user_id)
             return self.primary
+
+        def read_routes(self, location):
+            account_id = int(getattr(location, "telegram_user_id", 0) or 0)
+            assert account_id in (0, self.primary.telegram_user_id)
+            return ((self.primary, "me"),)
 
         @contextlib.contextmanager
         def acquire_upload(self, timeout=None):
@@ -1078,9 +1105,9 @@ def test_browsing_a_zip_does_not_download_it(rig):
     read = {"bytes": 0}
     original = rig.worker.read
 
-    def counting(message_id, expected_file_id, offset, length):
+    def counting(message_id, expected_file_id, offset, length, expected_size=None):
         read["bytes"] += length
-        return original(message_id, expected_file_id, offset, length)
+        return original(message_id, expected_file_id, offset, length, expected_size)
 
     rig.worker.read = counting
     rig.resolver._zips.clear()  # force a fresh central-directory parse

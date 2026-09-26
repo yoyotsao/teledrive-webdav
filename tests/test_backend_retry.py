@@ -104,8 +104,9 @@ def test_a_write_is_retried_too(tmp_path):
 def test_the_401_relogin_still_works_alongside_it(tmp_path):
     api, _ = client(tmp_path, [
         Reply(401, text="Authentication required"),
+        Reply(401, text="refresh grace rejected"),                                # refresh
         Reply(200, {"nonce": "n", "bot_username": "b", "expires_in": 120}),  # challenge
-        Reply(200, {"token": "JWT2"}),                                       # verify
+        Reply(200, {"token": "JWT2"}),                                          # verify
         Reply(200, {"items": []}),
     ])
     api.set_dm_sender(lambda u, t: None)
@@ -121,11 +122,11 @@ def test_a_real_http_error_is_not_retried(tmp_path):
 
 
 def test_a_dropped_socket_does_not_spend_the_relogin_budget(tmp_path):
-    """The two retries are independent. A fresh socket that then answers 401 --
-    which is exactly what a restarted backend does -- still gets its re-login."""
+    """The connection retry, refresh and challenge budgets are independent."""
     api, _ = client(tmp_path, [
         dropped(),                                                            # dead pooled socket
         Reply(401, text="Authentication required"),                           # fresh socket, stale JWT
+        Reply(401, text="refresh grace rejected"),                           # refresh
         Reply(200, {"nonce": "n", "bot_username": "b", "expires_in": 120}),
         Reply(200, {"token": "JWT2"}),
         Reply(200, {"items": ["ok"]}),
@@ -135,10 +136,10 @@ def test_a_dropped_socket_does_not_spend_the_relogin_budget(tmp_path):
 
 
 def test_a_relogin_does_not_spend_the_connection_budget(tmp_path):
-    """And the other way round: re-authenticating must not leave the retried
-    request one dropped socket away from a 500."""
+    """Re-authenticating must not consume the independent socket retry."""
     api, _ = client(tmp_path, [
         Reply(401, text="Authentication required"),
+        Reply(401, text="refresh grace rejected"),
         Reply(200, {"nonce": "n", "bot_username": "b", "expires_in": 120}),
         Reply(200, {"token": "JWT2"}),
         dropped(),                        # the pool handed out another dead one

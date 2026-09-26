@@ -12,7 +12,7 @@ import bridge
 import tdapi
 import tgio
 from tdapi import Entry, TeleDriveClient
-from transfer_models import RemotePart
+from transfer_models import FileLocation, RemotePart, ResolvedRemotePart
 
 
 class _Message:
@@ -108,10 +108,55 @@ def test_document_cache_key_includes_expected_file_id():
     assert (5, "701") not in worker._docs
 
 
+def _sized(message_id: int, file_id: str, size: int) -> _Message:
+    message = _Message(message_id, file_id)
+    message.document.size = size
+    return message
+
+
+def test_web_big_upload_id_is_verified_by_size_instead():
+    """The browser registers big uploads under the upload's random file id.
+
+    ``SaveBigFilePart`` uploads (>= 10 MiB, and every split segment) are
+    registered with the client-generated InputFileBig id, not the document id
+    Telegram assigns (frontend ``gramjs.ts``). Checked on the live drive: 16
+    consecutive messages matched the backend's name and size byte for byte and
+    none matched its file_id; 3,672 files had stopped reading. When the id
+    cannot confirm the file, the recorded size of that part still can.
+    """
+    worker = _worker({5: _sized(5, "700", 12_066_260)})
+    worker._thumb_gate = None
+
+    assert worker.get_document(5, "9001", expected_size=12_066_260).id == 700
+    assert worker.read(5, "9001", 0, 1, expected_size=12_066_260) == b"x"
+    part = RemotePart(5, 12_066_260, 0, "9001")
+    asyncio.run(worker._prefetch_documents([part]))
+    assert (5, "9001") in worker._docs
+
+
+def test_size_fallback_tolerates_the_backends_512k_padding():
+    real = 3 * 512 * 1024 + 17
+    padded = 4 * 512 * 1024
+    worker = _worker({5: _sized(5, "700", real)})
+
+    assert worker.get_document(5, "9001", expected_size=padded).id == 700
+
+
+def test_a_different_file_is_still_refused_when_the_size_disagrees():
+    worker = _worker({5: _sized(5, "700", 1_000_000)})
+
+    for recorded in (999_999, 1_000_000 + 512 * 1024):
+        with pytest.raises(RuntimeError, match="expected 9001.*got 700"):
+            worker.get_document(5, "9001", expected_size=recorded)
+    with pytest.raises(RuntimeError, match="expected 9001.*got 700"):
+        worker.read(5, "9001", 0, 1, expected_size=1_000_000 + 512 * 1024)
+    assert worker._client.getfile_calls == []
+
+
 def test_thumbnail_identity_is_checked_before_getfile():
     worker = _worker({5: _Message(5, "700")})
     worker._thumb_gate = None
-    part = RemotePart(5, 1, 0, "701")
+    part = RemotePart(5, 2 * 512 * 1024, 0, "701")
 
     assert asyncio.run(worker._thumbnails([part])) == {}
     assert worker._client.getfile_calls == []
@@ -135,7 +180,7 @@ class _MemoryWorker:
     def put(self, message_id, file_id, data):
         self.files[(message_id, str(file_id))] = data
 
-    def read(self, message_id, expected_file_id, offset, length):
+    def read(self, message_id, expected_file_id, offset, length, expected_size=None):
         self.calls.append((message_id, str(expected_file_id), offset, length))
         return self.files[(message_id, str(expected_file_id))][offset : offset + length]
 
@@ -151,6 +196,14 @@ class _MemoryWorker:
             for part in parts
         }
 
+    def thumbnail_location(self, location, peer):
+        assert peer == "me"
+        return self.thumbs[(location.telegram_message_id, str(location.media_id))]
+
+    def media_info_location(self, location, peer):
+        assert peer == "me"
+        return self.info[(location.telegram_message_id, str(location.media_id))]
+
 
 class _Pool:
     def __init__(self):
@@ -161,6 +214,9 @@ class _Pool:
 
     def for_read(self, account_id):
         return self.runtime(account_id)
+
+    def read_routes(self, location):
+        return ((self.runtime(int(location.telegram_user_id)), "me"),)
 
 
 def test_duplicate_message_ids_do_not_cross_accounts():
@@ -187,6 +243,25 @@ def test_range_crosses_storage_accounts():
     assert pool.runtime(2).worker.calls == [(10, "210", 0, 2)]
 
 
+def _current_parts(entry: Entry):
+    location = FileLocation(
+        telegram_chat_id=None,
+        telegram_user_id=entry.telegram_user_id,
+        telegram_message_id=entry.message_id,
+        media_kind="document",
+        media_id=entry.file_id,
+        media_size=entry.size,
+        photo_variant=None,
+        location_version=1,
+    )
+    return [ResolvedRemotePart(entry.file_id, 0, location)]
+
+
+class _CurrentApi:
+    def current_parts(self, entry):
+        return _current_parts(entry)
+
+
 def _entry(account_id: int, file_id: str = "same") -> Entry:
     return Entry(
         file_id=file_id,
@@ -202,7 +277,7 @@ def _entry(account_id: int, file_id: str = "same") -> Entry:
 
 def test_thumbnail_and_head_disk_caches_do_not_collide_across_accounts(tmp_path):
     cfg = SimpleNamespace(cache_dir=tmp_path)
-    resolver = bridge.Resolver(cfg, SimpleNamespace(), _Pool())
+    resolver = bridge.Resolver(cfg, _CurrentApi(), _Pool())
     first = _entry(1)
     second = _entry(2)
 
@@ -222,7 +297,7 @@ def test_thumbnail_and_property_results_keep_account_identity_in_one_batch(tmp_p
     pool.runtime(2).worker.thumbs[(9, "same")] = b"thumb-2"
     pool.runtime(1).worker.info[(9, "same")] = {"width": 1}
     pool.runtime(2).worker.info[(9, "same")] = {"width": 2}
-    resolver = bridge.Resolver(cfg, SimpleNamespace(), pool)
+    resolver = bridge.Resolver(cfg, _CurrentApi(), pool)
     first = _entry(1)
     second = _entry(2)
 
@@ -234,8 +309,8 @@ def test_thumbnail_and_property_results_keep_account_identity_in_one_batch(tmp_p
         (1, "same"): {"width": 1},
         (2, "same"): {"width": 2},
     }
-    assert resolver._prop_cache.get("1-same") == {"width": 1}
-    assert resolver._prop_cache.get("2-same") == {"width": 2}
+    assert resolver._prop_cache.get(bridge.physical_set_cache_key(_current_parts(first))) == {"width": 1}
+    assert resolver._prop_cache.get(bridge.physical_set_cache_key(_current_parts(second))) == {"width": 2}
 
 
 class _SplitApi(TeleDriveClient):
@@ -306,3 +381,19 @@ def test_legacy_split_cache_without_file_ids_is_refetched(tmp_path):
         [10, 3, 1, "110"],
         [11, 2, 2, "211"],
     ]
+
+
+def test_legacy_location_passes_its_media_size_to_the_identity_check():
+    from transfer_models import LegacySavedMessagesLocation
+
+    worker = _worker({5: _sized(5, "700", 12_066_260)})
+    location = LegacySavedMessagesLocation(0, 5, "9001", 12_066_260)
+
+    assert worker.read_location(location, None, 0, 1) == b"x"
+    worker.media_info_location(location, None)
+
+    fresh = _worker({5: _sized(5, "700", 12_066_260)})
+    wrong = LegacySavedMessagesLocation(0, 5, "9001", 1_000)
+    with pytest.raises(RuntimeError, match="expected 9001.*got 700"):
+        fresh.read_location(wrong, None, 0, 1)
+    assert fresh._client.getfile_calls == []

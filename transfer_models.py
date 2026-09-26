@@ -14,8 +14,198 @@ class QueueStage(str, Enum):
     UPLOADING = "uploading"
     SENDING = "sending"
     REGISTERING = "registering"
+    RECOVERING = "recovering"
+    UNCERTAIN = "uncertain"
     FAILED = "failed"
     ABANDONED = "abandoned"
+
+
+@dataclass(frozen=True)
+class FileLocation:
+    """Canonical physical Telegram location for a backend file row."""
+
+    telegram_chat_id: Optional[str]
+    telegram_user_id: Optional[int]
+    telegram_message_id: int
+    media_kind: str
+    media_id: str
+    media_size: int
+    photo_variant: Optional[str]
+    location_version: int
+
+
+@dataclass(frozen=True)
+class LegacySavedMessagesLocation:
+    """Explicit pre-canonical Saved Messages routing identity."""
+
+    telegram_user_id: int
+    telegram_message_id: int
+    file_id: str
+    media_size: int
+
+
+PhysicalLocation = FileLocation | LegacySavedMessagesLocation
+
+
+@dataclass(frozen=True)
+class ResolvedRemotePart:
+    """One logical part bound to the physical location used for byte reads."""
+
+    file_id: str
+    part_index: int
+    location: PhysicalLocation
+
+    @property
+    def size(self) -> int:
+        return self.location.media_size
+
+    @property
+    def message_id(self) -> int:
+        """Compatibility view used by the unchanged seek/range table."""
+        return self.location.telegram_message_id
+
+    @property
+    def telegram_user_id(self) -> int:
+        """Legacy display identity only; channel routing never trusts this."""
+        return int(self.location.telegram_user_id or 0)
+
+
+def physical_location_key(location: PhysicalLocation) -> tuple[object, ...]:
+    """Return a stable cache identity for bytes at *location*."""
+
+    if isinstance(location, LegacySavedMessagesLocation):
+        return (
+            "legacy_saved_messages",
+            location.telegram_user_id,
+            location.telegram_message_id,
+            location.file_id,
+            location.media_size,
+        )
+
+    if location.telegram_chat_id is None:
+        target = ("saved_messages", location.telegram_user_id)
+    else:
+        target = ("channel", location.telegram_chat_id)
+
+    return (
+        *target,
+        location.telegram_message_id,
+        location.media_kind,
+        location.media_id,
+        location.media_size,
+        location.photo_variant,
+        location.location_version,
+    )
+
+
+@dataclass(frozen=True)
+class FrozenStorageTarget:
+    storage_mode: str
+    channel_id: Optional[str]
+    target_peer_key: str
+    target_version: int
+    accounts_version: int
+    primary_account_id: int
+    linked_account_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class DurableOperationIdentity:
+    operation_id: str
+    random_id: int
+    uploader_id: int
+    rpc_kind: str
+    group_id: Optional[str] = None
+    part_index: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class DurableSendResult:
+    location: FileLocation
+    access_hash: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class DurableTelegramWrite:
+    """Exact Telegram result persisted into the backend operation journal.
+
+    ``random_id`` and ``target_peer_key`` are frozen send identity.  The two
+    derived dictionaries intentionally use the backend wire names so recovery
+    can persist a response/update mapping without translating it a second time.
+    """
+
+    uploader_id: int
+    random_id: int
+    target_peer_key: str
+    destination_message_id: int
+    media_kind: str
+    media_id: str
+    media_size: int
+    access_hash: Optional[str] = None
+    photo_variant: Optional[str] = None
+
+    @property
+    def mapping(self) -> dict:
+        return {
+            "uploader_id": int(self.uploader_id),
+            "random_id": int(self.random_id),
+            "target_peer_key": str(self.target_peer_key),
+            "destination_message_id": int(self.destination_message_id),
+        }
+
+    @property
+    def media_identity(self) -> dict:
+        out = {
+            "destination_media_kind": str(self.media_kind),
+            "destination_media_id": str(self.media_id),
+            "destination_size": int(self.media_size),
+        }
+        if self.access_hash is not None:
+            out["destination_access_hash"] = str(self.access_hash)
+        if self.photo_variant is not None:
+            out["destination_photo_variant"] = str(self.photo_variant)
+        return out
+
+    def location(self, *, location_version: int = 1) -> FileLocation:
+        chat_id = None if str(self.target_peer_key).startswith("me:") else str(self.target_peer_key)
+        return FileLocation(
+            telegram_chat_id=chat_id,
+            telegram_user_id=int(self.uploader_id),
+            telegram_message_id=int(self.destination_message_id),
+            media_kind=str(self.media_kind),
+            media_id=str(self.media_id),
+            media_size=int(self.media_size),
+            photo_variant=self.photo_variant,
+            location_version=int(location_version),
+        )
+
+
+@dataclass(frozen=True)
+class DurableOperationCursor:
+    identity: DurableOperationIdentity
+    target: FrozenStorageTarget
+    operation_version: int
+    state: str
+    result: Optional[DurableSendResult] = None
+    result_version: Optional[int] = None
+    uncertain_reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class StagingIdentity:
+    logical_key: str
+    transfer_id: str
+    staging_generation: int
+    source_path: str
+
+
+@dataclass(frozen=True)
+class GroupSendManifest:
+    group_id: str
+    target: FrozenStorageTarget
+    children: tuple[DurableOperationIdentity, ...]
+    send_armed: bool = False
+    send_started: bool = False
 
 
 @dataclass(frozen=True)
@@ -31,6 +221,7 @@ class RemotePart:
     size: int
     telegram_user_id: int
     file_id: str
+
 
 @dataclass(frozen=True)
 class UploadedPart:

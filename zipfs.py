@@ -15,6 +15,7 @@ import io
 import logging
 import struct
 import time
+import zlib
 import zipfile
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
@@ -180,6 +181,54 @@ def local_data_offset(fp, header_offset: int) -> int:
     return header_offset + _LOCAL_SIZE + name_len + extra_len
 
 
+class _InflateReader(io.RawIOBase):
+    """Forward-only raw-deflate stream over one member's compressed bytes.
+
+    Built from the tree's own offsets, so opening a member costs one read at
+    its data, not a fresh ``zipfile.ZipFile`` that re-reads the end record and
+    the central directory (see ZipView.open).
+    """
+
+    CHUNK = 256 * 1024
+
+    def __init__(self, compressed: io.RawIOBase, size: int):
+        super().__init__()
+        self._src = compressed
+        self._size = size
+        self._inflater = zlib.decompressobj(-15)
+        self._buf = b""
+        self._out = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def _fill(self, want: int) -> None:
+        while len(self._buf) < want and not self._inflater.eof:
+            raw = self._inflater.unconsumed_tail or self._src.read(self.CHUNK)
+            if not raw:
+                raise OSError("zip member data ended before the deflate stream did")
+            self._buf += self._inflater.decompress(raw, max(want - len(self._buf), 1 << 16))
+
+    def read(self, size: int = -1) -> bytes:  # type: ignore[override]
+        remaining = self._size - self._out
+        if size is None or size < 0 or size > remaining:
+            size = remaining
+        if size <= 0:
+            return b""
+        self._fill(size)
+        data, self._buf = self._buf[:size], self._buf[size:]
+        self._out += len(data)
+        if len(data) < size:
+            raise OSError("zip member inflated to fewer bytes than its recorded size")
+        return data
+
+    def close(self) -> None:
+        try:
+            self._src.close()
+        finally:
+            super().close()
+
+
 class _DecompressReader(io.RawIOBase):
     """Seekable adapter over a compressed member.
 
@@ -317,20 +366,39 @@ class ZipView:
         if node.is_dir:
             raise IsADirectoryError(node.name)
         stream = self._open_stream()
-        if not node.stored:
-            # Compressed member: decompress from the archive's own reader.
-            def open_member():
-                zf = zipfile.ZipFile(self._open_stream())
-                return zf.open(node.zip_name)
-
-            stream.close()
-            return _DecompressReader(open_member, node.size, name=node.name)
-
         if node.data_offset is None:
-            node.data_offset = local_data_offset(stream, node.header_offset)
+            try:
+                node.data_offset = local_data_offset(stream, node.header_offset)
+            except BaseException:
+                stream.close()
+                raise
             self._dirty = True
             self.save()
-        return SlicedReader(stream, node.data_offset, node.size, name=node.name)
+        if node.stored:
+            return SlicedReader(stream, node.data_offset, node.size, name=node.name)
+
+        if node.compress_type == zipfile.ZIP_DEFLATED:
+            # Browser-uploaded archives are deflated. Inflate straight from the
+            # member's bytes: building a zipfile.ZipFile per open (and per
+            # backward seek) re-read the central directory over Telegram each
+            # time, which is what kept every worker thread busy under /game.
+            stream.close()
+
+            def open_member():
+                return _InflateReader(
+                    SlicedReader(self._open_stream(), node.data_offset, node.compress_size),
+                    node.size,
+                )
+
+            return _DecompressReader(open_member, node.size, name=node.name)
+
+        # Other codecs (bzip2, lzma, ...) are rare: let zipfile handle them.
+        def open_member():
+            zf = zipfile.ZipFile(self._open_stream())
+            return zf.open(node.zip_name)
+
+        stream.close()
+        return _DecompressReader(open_member, node.size, name=node.name)
 
 
 def is_zip_name(name: str) -> bool:

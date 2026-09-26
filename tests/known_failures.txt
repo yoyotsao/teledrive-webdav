@@ -1,0 +1,5 @@
+# Known offline failures on feat/live-browse-audit
+#
+# None. The former 77-failure parity baseline was closed when PR #1's test
+# doubles were moved to the canonical location/read seams and auth single-flight
+# state was scoped to one backend + token file.
