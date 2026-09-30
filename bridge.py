@@ -1390,13 +1390,16 @@ class RpcApp:
     """Local control plane used by the Explorer verb and for diagnostics."""
 
     def __init__(self, cfg: Config, resolver: Resolver, fetcher, stager, upload_stager=None, game_rpc=None,
-                 running_provider=None):
+                 running_provider=None, session_store=None, process_adapter=None):
         self.cfg = cfg
         self.resolver = resolver
         self.fetcher = fetcher
         self.stager = stager
         self.upload_stager = upload_stager
-        self.game_rpc = game_rpc or GameRpc(cfg, resolver, fetcher, running_provider)
+        self.game_rpc = game_rpc or GameRpc(
+            cfg, resolver, fetcher, running_provider,
+            session_store=session_store, process_adapter=process_adapter,
+        )
 
     def __call__(self, environ, start_response):
         path = environ.get("PATH_INFO", "")
@@ -1566,7 +1569,8 @@ class Dispatcher:
         return self.dav_app(environ, start_response)
 
 
-def build_app(cfg: Config, resolver: Resolver, stager, fetcher, upload_stager=None, running_provider=None):
+def build_app(cfg: Config, resolver: Resolver, stager, fetcher, upload_stager=None, running_provider=None,
+              session_store=None, process_adapter=None):
     provider = TeleDriveProvider(resolver)
     dav_config = {
         "provider_mapping": {"/": provider},
@@ -1592,7 +1596,9 @@ def build_app(cfg: Config, resolver: Resolver, stager, fetcher, upload_stager=No
     dav_app = WsgiDAVApp(dav_config)
     guarded = WriteGuard(dav_app, cfg.game_folder)
     return Dispatcher(guarded, RpcApp(cfg, resolver, fetcher, stager, upload_stager,
-                                      running_provider=running_provider))
+                                      running_provider=running_provider,
+                                      session_store=session_store,
+                                      process_adapter=process_adapter))
 
 
 class ThrottleRepeats(logging.Filter):

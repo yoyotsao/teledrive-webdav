@@ -14,6 +14,7 @@ import pytest
 
 from config import Config, load_config
 import gamestate
+from gamelaunch import GameLauncher, MemorySessionStore, ProcessInfo, ProcessRef
 from gamestate import GameRpc
 
 
@@ -298,3 +299,84 @@ def test_game_rpc_repeated_paths_and_background_fetch_cancel(tmp_path):
     invalid = request(app, authorization=auth, query="paths=game%2F..%2Fsecret")
     assert invalid["status"] == 400
     assert json.loads(invalid["body"])["code"] == "invalid_game_path"
+
+
+def test_game_exe_and_launch_rpc_use_relative_paths_and_return_session_id(tmp_path):
+    cfg = Config(
+        api_id=1, api_hash="hash", primary_user_id=17, session_dir=tmp_path,
+        base_url="https://teledrive.example", reina_allowed_origin=ALLOWED_ORIGIN,
+        reina_server_url="https://teledrive.example", game_folder="game",
+        cache_dir=tmp_path / "cache", local_dir=tmp_path / "local",
+        reina_locale_emulator=str(tmp_path / "LEProc.exe"),
+    )
+    Path(cfg.reina_locale_emulator).write_bytes(b"launcher")
+    root = cfg.local_dir / "GameA"
+    (root / "bin").mkdir(parents=True)
+    (root / ".reina-complete").write_text("ready", encoding="utf-8")
+    (root / "bin" / "game.exe").write_bytes(b"exe")
+    session = Session()
+    api = SimpleNamespace(_http_session=lambda: session)
+    resolver = SimpleNamespace(cfg=cfg, api=api, pool=SimpleNamespace(
+        primary=SimpleNamespace(worker=SimpleNamespace(user_id=17)),
+    ))
+
+    class Fetcher:
+        def destination_for(self, _segments):
+            return root
+
+        def fetch_segments(self, *_args, **_kwargs):
+            return iter(())
+
+    class Adapter:
+        def __init__(self):
+            self.items = []
+
+        def snapshot_all(self):
+            return list(self.items)
+
+        def process_ref(self, pid):
+            return next((item.ref for item in self.items if item.ref.pid == pid), None)
+
+        def is_alive(self, ref):
+            return any(item.ref == ref for item in self.items)
+
+        def exe_path(self, pid):
+            return next((item.exe_path for item in self.items if item.ref.pid == pid), None)
+
+        def parent_pid(self, pid):
+            return next((item.parent_pid for item in self.items if item.ref.pid == pid), None)
+
+        def spawn(self, command, cwd):
+            self.items.append(ProcessInfo(ProcessRef(222, 2000.0), command[-1], 1))
+            return SimpleNamespace(pid=222)
+
+    adapter = Adapter()
+    state = gamestate.GameState(cfg, resolver, Fetcher())
+    launcher = GameLauncher(
+        state, locale_emulator=cfg.reina_locale_emulator,
+        store=MemorySessionStore(), process_adapter=adapter,
+        clock=lambda: 2000.0, start_monitor=False,
+    )
+    app = GameRpc(cfg, resolver, Fetcher(), game_launcher=launcher)
+    auth = f"Bearer {token()}"
+
+    exes = request(app, authorization=auth, path="/rpc/game/exes", query="path=game%2FGameA")
+    assert exes["status"] == 200
+    assert json.loads(exes["body"]) == {"exes": ["bin/game.exe"]}
+
+    launched = request(
+        app, "POST", "/rpc/game/launch", authorization=auth,
+        body=json.dumps({
+            "path": "game/GameA", "exe_relpath": "bin/game.exe",
+            "game_id": 81, "locale_emulator": False,
+        }).encode(),
+    )
+    assert launched["status"] == 200
+    result = json.loads(launched["body"])
+    assert result["session_id"]
+
+    state_response = request(app, authorization=auth, query="paths=game%2FGameA")
+    game = json.loads(state_response["body"])["games"][0]
+    assert game["status"] == "running"
+    assert game["elapsed_seconds"] == 0
+    assert game["capabilities"] == {"locale_emulator": True}

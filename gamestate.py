@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from gamelaunch import GameLauncher, LaunchError
+
 log = logging.getLogger("bridge.game_rpc")
 
 
@@ -116,16 +118,22 @@ class GameState:
         return self.fetcher.destination_for(segments)
 
     def _is_running(self, path: str) -> bool:
-        provider = self.running_provider
-        if provider is None:
-            return False
-        try:
-            if callable(provider):
-                return bool(provider(path))
-            return bool(provider.is_running(path))
-        except Exception:
-            log.exception("running provider failed for a game path")
-            return False
+        providers = [self.running_provider]
+        launcher = getattr(self, "launcher", None)
+        if launcher is not None and launcher is not self.running_provider:
+            providers.append(launcher)
+        for provider in providers:
+            if provider is None:
+                continue
+            try:
+                if callable(provider):
+                    if provider(path):
+                        return True
+                elif provider.is_running(path):
+                    return True
+            except Exception:
+                log.exception("running provider failed for a game path")
+        return False
 
     def _state_for(self, path: str) -> dict:
         segments = self.canonical_game_segments(path)
@@ -144,14 +152,34 @@ class GameState:
                 total = 0
                 elapsed = 0
                 error = job.error if job is not None else None
-        if self._is_running(path):
+        running = self._is_running(path)
+        if running:
             status = "running"
+            elapsed_provider = getattr(getattr(self, "launcher", None), "elapsed_seconds", None)
+            if not callable(elapsed_provider):
+                elapsed_provider = getattr(self.running_provider, "elapsed_seconds", None)
+            if callable(elapsed_provider):
+                try:
+                    elapsed = max(0, int(elapsed_provider(path)))
+                except Exception:
+                    log.exception("running elapsed provider failed for a game path")
+                    elapsed = 0
         elif not job_active and (root / self.COMPLETE_MARKER).is_file():
             status = "ready"
         elif not job_active and root.exists():
             status = "incomplete"
         elif not job_active:
             status = "absent"
+        capability_provider = getattr(self, "launcher", None) or self.running_provider
+        capability = getattr(capability_provider, "locale_emulator_available", None)
+        if capability is None:
+            configured_le = getattr(self.cfg, "reina_locale_emulator", "")
+            try:
+                locale_available = bool(configured_le and Path(configured_le).resolve(strict=True).is_file())
+            except OSError:
+                locale_available = False
+        else:
+            locale_available = bool(capability)
         return {
             "path": path,
             "status": status,
@@ -159,6 +187,7 @@ class GameState:
             "total_bytes": total,
             "elapsed_seconds": elapsed,
             "error": error,
+            "capabilities": {"locale_emulator": locale_available},
         }
 
     def states(self, paths: list[str]) -> list[dict]:
@@ -281,13 +310,24 @@ class GameRpc:
     ALLOWED_METHODS = "GET, POST, DELETE, OPTIONS"
     ALLOWED_HEADERS = "Authorization, Content-Type"
 
-    def __init__(self, cfg, resolver, fetcher=None, running_provider=None):
+    def __init__(self, cfg, resolver, fetcher=None, running_provider=None, game_launcher=None,
+                 session_store=None, process_adapter=None):
         self.cfg = cfg
         self.resolver = resolver
         self.api = resolver.api
         self._token_cache: dict[str, tuple[int, float]] = {}
         self._cache_lock = threading.Lock()
         self.state = GameState(cfg, resolver, fetcher, running_provider) if fetcher is not None else None
+        self.launcher = game_launcher
+        if self.state is not None and self.launcher is None:
+            self.launcher = GameLauncher(
+                self.state,
+                locale_emulator=cfg.reina_locale_emulator,
+                store=session_store,
+                process_adapter=process_adapter,
+            )
+        if self.launcher is not None and self.state is not None:
+            self.state.launcher = self.launcher
 
     def _configured_origin(self) -> str:
         origin = self.cfg.reina_allowed_origin
@@ -435,9 +475,14 @@ class GameRpc:
                 try:
                     if route == "/rpc/game/exes":
                         values = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True).get("path", [])
-                        if method != "GET" or len(values) != 1:
+                        if method != "GET":
+                            raise GameStateError(405, "method_not_allowed", "method not allowed")
+                        if len(values) != 1:
                             raise GameStateError(400, "invalid_query", "exactly one path parameter is required")
                         self.state.canonical_game_segments(values[0])
+                        if self.launcher is None:
+                            return self._response(start_response, 501, {"code": "not_implemented", "error": "game executable listing is not implemented"}, cors)
+                        return self._response(start_response, 200, {"exes": self.launcher.list_exes(values[0])}, cors)
                     else:
                         if method != "POST":
                             raise GameStateError(405, "method_not_allowed", "method not allowed")
@@ -446,6 +491,21 @@ class GameRpc:
                         if not isinstance(payload, dict) or not isinstance(payload.get("path"), str):
                             raise GameStateError(400, "invalid_game_path", "invalid game path")
                         self.state.canonical_game_segments(payload["path"])
+                        if not isinstance(payload.get("exe_relpath"), str):
+                            raise GameStateError(400, "bridge_exe_invalid", "selected executable path is required")
+                        if not isinstance(payload.get("game_id"), int) or isinstance(payload.get("game_id"), bool):
+                            raise GameStateError(400, "invalid_game_id", "game id must be an integer")
+                        if not isinstance(payload.get("locale_emulator", False), bool):
+                            raise GameStateError(400, "invalid_locale_emulator", "locale_emulator must be boolean")
+                        if self.launcher is None:
+                            return self._response(start_response, 501, {"code": "not_implemented", "error": "game launch is not implemented"}, cors)
+                        session = self.launcher.launch(
+                            payload["path"], payload["exe_relpath"], payload["game_id"],
+                            payload.get("locale_emulator", False),
+                        )
+                        return self._response(start_response, 200, {"session_id": session.session_id}, cors)
+                except LaunchError as exc:
+                    return self._response(start_response, exc.status, {"code": exc.code, "error": exc.message}, cors)
                 except GameStateError as exc:
                     return self._response(start_response, exc.status, {"code": exc.code, "error": exc.message}, cors)
                 except (ValueError, TypeError, KeyError, json.JSONDecodeError):
@@ -478,6 +538,7 @@ class GameRpc:
             409: "Conflict",
             501: "Not Implemented",
             503: "Service Unavailable",
+            500: "Internal Server Error",
         }
         payload = b"" if body is None else json.dumps(body).encode("utf-8")
         response_headers = list(headers)
