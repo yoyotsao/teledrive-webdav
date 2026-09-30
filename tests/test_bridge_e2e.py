@@ -1544,7 +1544,8 @@ def test_browser_game_rpc_uses_browser_token_and_keeps_legacy_rpc_open(rig):
         "Origin": rig.cfg.reina_allowed_origin,
         "Authorization": f"Bearer {browser_token}",
     })
-    assert response.status_code == 501
+    assert response.status_code == 200
+    assert response.json() == {"games": []}
     assert response.headers["Access-Control-Allow-Origin"] == rig.cfg.reina_allowed_origin
     assert rig.backend.browser_auth_calls == [f"Bearer {browser_token}"]
 
@@ -1592,11 +1593,61 @@ def _fetch(rig, win_path):
 
 def test_fetch_local_extracts_a_virtual_zip_folder(rig):
     lines = _fetch(rig, r"E:\game\MyGame")
+    assert lines[0] == r"target: E:\game\MyGame"
+    assert any("file(s)," in line and "->" in line for line in lines)
+    assert any(line.startswith("PROGRESS ") for line in lines)
     assert lines[-1].startswith("OK "), lines
     base = rig.cfg.local_dir / "MyGame"
     for name, blob in ZIP_MEMBERS.items():
         assert (base / name).read_bytes() == blob, name
     assert not list(base.rglob("*.part"))
+
+
+def test_game_zip_resolution_prefers_exact_name_then_newest_case_fallback(rig, caplog):
+    game = rig.resolver.game_entry()
+    exact = rig.backend.add_file("Foo.zip", b"exact", rig.worker, parent_id=game.file_id)[0]
+    fallback = rig.backend.add_file("Bar.ZIP", b"old", rig.worker, parent_id=game.file_id)[0]
+    newest = rig.backend.add_file("Bar.Zip", b"new", rig.worker, parent_id=game.file_id)[0]
+    newer_exact_case = rig.backend.add_file("Foo.ZIP", b"newer", rig.worker, parent_id=game.file_id)[0]
+    tied_first = rig.backend.add_file("Tie.ZIP", b"first", rig.worker, parent_id=game.file_id)[0]
+    tied_second = rig.backend.add_file("Tie.zIP", b"second", rig.worker, parent_id=game.file_id)[0]
+    exact["date"] = "2026-01-01T00:00:00"
+    newer_exact_case["date"] = "2026-09-01T00:00:00"
+    fallback["date"] = "2026-01-01T00:00:00"
+    newest["date"] = "2026-08-01T00:00:00"
+    tied_first["date"] = tied_second["date"] = "2026-08-01T00:00:00"
+
+    assert rig.resolver.resolve(["game", "Foo"]).entry.name == "Foo.zip"
+    assert rig.resolver.resolve(["game", "Bar"]).entry.name == "Bar.Zip"
+    with caplog.at_level("WARNING", logger="bridge"):
+        assert rig.resolver.resolve(["game", "Tie"]).entry.name == "Tie.zIP"
+    assert "multiple case-insensitive ZIP candidates" in caplog.text
+
+
+def test_fetcher_destination_matches_real_resolver_plan_roots(rig):
+    fetcher = rig.app.rpc_app.fetcher
+    cases = [
+        ["photos"],
+        ["game", "MyGame"],
+        ["game", "MyGame", "bin"],
+        ["game", "MyGame", "bin", "pak0.pak"],
+    ]
+    game = rig.resolver.game_entry()
+    name = "遊戲, A"
+    zipped = io.BytesIO()
+    with zipfile.ZipFile(zipped, "w") as archive:
+        archive.writestr("data.bin", b"unicode")
+    rig.backend.add_file(name + ".zip", zipped.getvalue(), rig.worker, parent_id=game.file_id)
+    cases.append(["game", name])
+
+    rig.request("MKCOL", "/game/Stage")
+    rig.request("PUT", "/game/Stage/data.bin", data=b"staged")
+    cases.extend([["game", "Stage"], ["game", "Stage", "data.bin"]])
+
+    for segments in cases:
+        loc = rig.resolver.resolve(segments)
+        _items, expected_root = fetcher._plan(loc, segments)
+        assert fetcher.destination_for(segments) == expected_root, segments
 
 
 def test_fetch_local_copies_a_split_file(rig):

@@ -642,7 +642,24 @@ class Resolver:
         children = self.game_children()
 
         # 2. <top>.zip presented as a folder, expanded from its central directory.
+        # 精确名称始终优先；只有缺少 Foo.zip 时才按 mtime 选大小写变体。
         zip_entry = children.get(top + ".zip")
+        if zip_entry is None:
+            candidates = [
+                entry
+                for name, entry in children.items()
+                if not entry.is_dir
+                and name.rpartition(".")[0] == top
+                and name.rpartition(".")[2].casefold() == "zip"
+            ]
+            if candidates:
+                candidates.sort(key=lambda entry: (entry.mtime, entry.name, str(entry.file_id)))
+                if len(candidates) > 1:
+                    log.warning(
+                        "multiple case-insensitive ZIP candidates for %s; selecting newest",
+                        top,
+                    )
+                zip_entry = candidates[-1]
         if zip_entry is not None and not zip_entry.is_dir:
             view = self.zip_view(zip_entry)
             if len(rest) == 1:
@@ -1372,13 +1389,14 @@ class WriteGuard:
 class RpcApp:
     """Local control plane used by the Explorer verb and for diagnostics."""
 
-    def __init__(self, cfg: Config, resolver: Resolver, fetcher, stager, upload_stager=None, game_rpc=None):
+    def __init__(self, cfg: Config, resolver: Resolver, fetcher, stager, upload_stager=None, game_rpc=None,
+                 running_provider=None):
         self.cfg = cfg
         self.resolver = resolver
         self.fetcher = fetcher
         self.stager = stager
         self.upload_stager = upload_stager
-        self.game_rpc = game_rpc or GameRpc(cfg, resolver)
+        self.game_rpc = game_rpc or GameRpc(cfg, resolver, fetcher, running_provider)
 
     def __call__(self, environ, start_response):
         path = environ.get("PATH_INFO", "")
@@ -1548,7 +1566,7 @@ class Dispatcher:
         return self.dav_app(environ, start_response)
 
 
-def build_app(cfg: Config, resolver: Resolver, stager, fetcher, upload_stager=None):
+def build_app(cfg: Config, resolver: Resolver, stager, fetcher, upload_stager=None, running_provider=None):
     provider = TeleDriveProvider(resolver)
     dav_config = {
         "provider_mapping": {"/": provider},
@@ -1573,7 +1591,8 @@ def build_app(cfg: Config, resolver: Resolver, stager, fetcher, upload_stager=No
     }
     dav_app = WsgiDAVApp(dav_config)
     guarded = WriteGuard(dav_app, cfg.game_folder)
-    return Dispatcher(guarded, RpcApp(cfg, resolver, fetcher, stager, upload_stager))
+    return Dispatcher(guarded, RpcApp(cfg, resolver, fetcher, stager, upload_stager,
+                                      running_provider=running_provider))
 
 
 class ThrottleRepeats(logging.Filter):

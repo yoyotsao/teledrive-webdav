@@ -4,6 +4,7 @@ import base64
 import io
 import json
 import logging
+import threading
 import time
 from types import SimpleNamespace
 from pathlib import Path
@@ -235,3 +236,65 @@ def test_config_origin_trailing_slash_is_normalized(tmp_path, monkeypatch):
     assert cfg.reina_allowed_origin == "https://teledrive.example"
     assert cfg.reina_server_url == "https://server.example/"
     assert cfg.reina_locale_emulator == ""
+
+
+def test_game_rpc_repeated_paths_and_background_fetch_cancel(tmp_path):
+    cfg = Config(
+        api_id=1, api_hash="hash", primary_user_id=17, session_dir=tmp_path,
+        base_url="https://teledrive.example", reina_allowed_origin=ALLOWED_ORIGIN,
+        reina_server_url="https://teledrive.example", game_folder="game",
+        cache_dir=tmp_path / "cache", local_dir=tmp_path / "local",
+    )
+    session = Session()
+    api = SimpleNamespace(_http_session=lambda: session)
+    resolver = SimpleNamespace(cfg=cfg, api=api, pool=SimpleNamespace(
+        primary=SimpleNamespace(worker=SimpleNamespace(user_id=17)),
+    ))
+    started = threading.Event()
+    release = threading.Event()
+    root = cfg.local_dir / "A,B"
+
+    class Fetcher:
+        def destination_for(self, _segments):
+            return root
+
+        def fetch_segments(self, _segments, *, skip_existing, cancel):
+            assert skip_existing
+            started.set()
+            yield "PROGRESS 4 9 1/1 progress"
+            release.wait(2)
+            if cancel.is_set():
+                yield "CANCELLED download cancelled"
+            else:
+                root.mkdir(parents=True, exist_ok=True)
+                yield f"OK {root}"
+
+    app = GameRpc(cfg, resolver, Fetcher())
+    auth = f"Bearer {token()}"
+    paths = request(
+        app, authorization=auth,
+        query="paths=game%2FA%2CB&paths=game%2F%E9%81%8A%E6%88%B2",
+    )
+    assert paths["status"] == 200
+    assert [game["path"] for game in json.loads(paths["body"])["games"]] == ["game/A,B", "game/遊戲"]
+
+    started_request = request(
+        app, "POST", "/rpc/game/fetch", authorization=auth,
+        body=json.dumps({"path": "game/A,B"}).encode(),
+    )
+    assert started_request["status"] == 202
+    assert started.wait(2)
+    duplicate = request(
+        app, "POST", "/rpc/game/fetch", authorization=auth,
+        body=json.dumps({"path": "game/A,B"}).encode(),
+    )
+    assert duplicate["status"] == 202
+    assert app.state._jobs["game/A,B"].thread is not None
+    canceled = request(app, "DELETE", "/rpc/game/fetch", authorization=auth, query="path=game%2FA%2CB")
+    assert canceled["status"] == 202
+    release.set()
+    assert app.state._jobs["game/A,B"].finished.wait(2)
+
+    invalid = request(app, authorization=auth, query="paths=game%2F..%2Fsecret")
+    assert invalid["status"] == 400
+    assert json.loads(invalid["body"])["code"] == "invalid_game_path"

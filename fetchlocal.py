@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -119,30 +120,40 @@ class LocalFetcher:
                 size = self.resolver.api.total_size(entry)
                 items.append(Item(lambda e=entry: self.resolver.open_remote(e), size, base / entry.name))
 
-    # -- execution -------------------------------------------------------- #
-
-    def fetch(self, windows_path: str) -> Iterator[str]:
-        """Copy ``windows_path`` into local_dir, yielding progress lines."""
+    def _resolve_plan(self, segments: List[str]):
+        """解析 DAV segments 并返回沿用既有规则產生的複製計畫。"""
         import bridge
 
-        yield f"target: {windows_path}"
-        segments = self.resolver.dav_path_from_windows(windows_path)
-        if segments is None:
-            yield f"ERROR only paths on {self.cfg.mount_drive} can be fetched"
-            return
-        if not segments:
-            yield "ERROR refusing to fetch the whole drive — pick a folder or file"
-            return
+        loc = self.resolver.resolve(segments)
+        if loc.kind == bridge.MISSING:
+            raise FileNotFoundError(f"not found: {'/'.join(segments)}")
+        return self._plan(loc, segments)
 
+    def destination_for(self, segments: List[str]) -> Path:
+        """依與實際下載相同的 resolver 與 plan 推導本機遊戲根目錄。"""
+        _items, root = self._resolve_plan(segments)
+        return root
+
+    # -- execution -------------------------------------------------------- #
+
+    def fetch_segments(
+        self,
+        segments: List[str],
+        *,
+        skip_existing: bool = False,
+        cancel: threading.Event | None = None,
+    ) -> Iterator[str]:
+        """以 DAV segments 執行共用的 resolve、plan、copy 與 progress。"""
         try:
             loc = self.resolver.resolve(segments)
         except Exception as exc:
             yield f"ERROR resolve failed: {exc}"
             return
+        import bridge
+
         if loc.kind == bridge.MISSING:
             yield f"ERROR not found: {'/'.join(segments)}"
             return
-
         try:
             items, root = self._plan(loc, segments)
         except Exception as exc:
@@ -152,6 +163,9 @@ class LocalFetcher:
         total = sum(i.size for i in items)
         yield f"{len(items)} file(s), {human(total)} -> {root}"
         if not items:
+            if cancel is not None and cancel.is_set():
+                yield "CANCELLED download cancelled"
+                return
             root.mkdir(parents=True, exist_ok=True)
             yield f"OK {root}"
             return
@@ -160,10 +174,31 @@ class LocalFetcher:
         last = 0.0
         started = time.monotonic()
         for index, item in enumerate(items, 1):
+            if cancel is not None and cancel.is_set():
+                yield "CANCELLED download cancelled"
+                return
             item.dest.parent.mkdir(parents=True, exist_ok=True)
             tmp = item.dest.with_name(item.dest.name + ".part")
+            if skip_existing:
+                try:
+                    os.unlink(ext_path(tmp))
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    yield f"ERROR {item.dest.name}: cannot remove partial file: {exc}"
+                    return
+                try:
+                    if item.dest.is_file() and item.dest.stat().st_size == item.size:
+                        done += item.size
+                        if cancel is not None and cancel.is_set():
+                            yield "CANCELLED download cancelled"
+                            return
+                        continue
+                except OSError:
+                    pass
             try:
                 source = item.open()
+                item_done = 0
                 try:
                     with open(ext_path(tmp), "wb") as out:
                         while True:
@@ -171,6 +206,7 @@ class LocalFetcher:
                             if not chunk:
                                 break
                             out.write(chunk)
+                            item_done += len(chunk)
                             done += len(chunk)
                             now = time.monotonic()
                             if now - last >= PROGRESS_INTERVAL:
@@ -180,21 +216,54 @@ class LocalFetcher:
                                     f"PROGRESS {done} {total} {index}/{len(items)} "
                                     f"{human(rate)}/s {item.dest.name}"
                                 )
+                            if cancel is not None and cancel.is_set():
+                                yield "CANCELLED download cancelled"
+                                return
                 finally:
                     source.close()
+                if skip_existing and item_done != item.size:
+                    os.unlink(ext_path(tmp))
+                    yield f"ERROR {item.dest.name}: expected {item.size} bytes, received {item_done}"
+                    return
+                if cancel is not None and cancel.is_set():
+                    yield "CANCELLED download cancelled"
+                    return
                 os.replace(ext_path(tmp), ext_path(item.dest))
             except Exception as exc:
                 log.exception("fetch of %s failed", item.dest)
-                try:
-                    os.unlink(ext_path(tmp))
-                except OSError:
-                    pass
+                # 取消時保留 .part，讓下一次工作明確重抓此 item；其他錯誤不留半成品。
+                if cancel is None or not cancel.is_set():
+                    try:
+                        os.unlink(ext_path(tmp))
+                    except OSError:
+                        pass
                 yield f"ERROR {item.dest.name}: {exc}"
                 return
+        if cancel is not None and cancel.is_set():
+            yield "CANCELLED download cancelled"
+            return
         elapsed = time.monotonic() - started
         yield f"PROGRESS {total} {total} {len(items)}/{len(items)} done"
         yield f"done in {elapsed:.0f}s ({human(total / max(elapsed, 0.001))}/s)"
         yield f"OK {root}"
+
+    def fetch(
+        self,
+        windows_path: str,
+        *,
+        skip_existing: bool = False,
+        cancel: threading.Event | None = None,
+    ) -> Iterator[str]:
+        """保留 Explorer Windows path 包裝，實際工作交給 segments 核心。"""
+        yield f"target: {windows_path}"
+        segments = self.resolver.dav_path_from_windows(windows_path)
+        if segments is None:
+            yield f"ERROR only paths on {self.cfg.mount_drive} can be fetched"
+            return
+        if not segments:
+            yield "ERROR refusing to fetch the whole drive — pick a folder or file"
+            return
+        yield from self.fetch_segments(segments, skip_existing=skip_existing, cancel=cancel)
 
 
 # --------------------------------------------------------------------------- #
