@@ -38,6 +38,7 @@ from wsgidav.wsgidav_app import WsgiDAVApp
 
 import zipfs
 from config import Config, ext_path as _ext, load_config
+from gamestate import GameRpc
 from tdapi import ApiError, Entry, JsonStore, ShardedJsonStore, TeleDriveClient
 from telegram_accounts import TelegramAccountPool
 from telegram_sessions import SessionDirectoryLock
@@ -1371,15 +1372,19 @@ class WriteGuard:
 class RpcApp:
     """Local control plane used by the Explorer verb and for diagnostics."""
 
-    def __init__(self, cfg: Config, resolver: Resolver, fetcher, stager, upload_stager=None):
+    def __init__(self, cfg: Config, resolver: Resolver, fetcher, stager, upload_stager=None, game_rpc=None):
         self.cfg = cfg
         self.resolver = resolver
         self.fetcher = fetcher
         self.stager = stager
         self.upload_stager = upload_stager
+        self.game_rpc = game_rpc or GameRpc(cfg, resolver)
 
     def __call__(self, environ, start_response):
-        route = environ.get("PATH_INFO", "")[len("/rpc") :]
+        path = environ.get("PATH_INFO", "")
+        if path == "/rpc/game" or path.startswith("/rpc/game/"):
+            return self.game_rpc.handle(environ, start_response)
+        route = path[len("/rpc") :] if path.startswith("/rpc") else path
         try:
             if route in ("/health", "/health/"):
                 return self._health(start_response)

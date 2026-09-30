@@ -212,7 +212,20 @@ class FakeBackend:
     def __init__(self):
         self.rows = []
         self.dms = []  # (bot_username, nonce) the bridge sent over MTProto
+        self.browser_auth_calls = []
+        self.browser_auth_status = 200
+        self.browser_auth_redirect_to_success = False
+        self.browser_auth_followed_redirects = 0
         self._clock = datetime(2026, 7, 30, 12, 0, 0)
+
+    def validate_browser_token(self, authorization, *, allow_redirects=True):
+        self.browser_auth_calls.append(authorization)
+        if self.browser_auth_redirect_to_success:
+            if allow_redirects:
+                self.browser_auth_followed_redirects += 1
+                return SimpleNamespace(status_code=200, url="https://teledrive.example/login")
+            return SimpleNamespace(status_code=302, url="https://teledrive.example/login")
+        return SimpleNamespace(status_code=self.browser_auth_status)
 
     # -- row helpers ------------------------------------------------------ #
 
@@ -390,6 +403,15 @@ class FakeClient(TeleDriveClient):
     def __init__(self, cfg, backend):
         super().__init__(cfg)
         self.backend = backend
+        self.auth_session = SimpleNamespace(
+            request=lambda method, url, **kwargs: self.backend.validate_browser_token(
+                kwargs.get("headers", {}).get("Authorization"),
+                allow_redirects=kwargs.get("allow_redirects", True),
+            )
+        )
+
+    def _http_session(self):
+        return self.auth_session
 
     def login(self, force=False, **kw):
         # Not stubbed out: the real login() runs, so the challenge handshake is
@@ -423,7 +445,7 @@ BIG = bytes((i * 31) % 256 for i in range(300_000))
 
 
 class Rig:
-    def __init__(self, base, cfg, backend, worker, stager, resolver, upload_stager=None):
+    def __init__(self, base, cfg, backend, worker, stager, resolver, upload_stager=None, app=None):
         self.base = base
         self.cfg = cfg
         self.backend = backend
@@ -431,6 +453,16 @@ class Rig:
         self.stager = stager
         self.resolver = resolver
         self.upload_stager = upload_stager
+        self.app = app
+
+    @staticmethod
+    def browser_token(user_id=4242, exp=None):
+        import base64
+        import json
+
+        payload = json.dumps({"user_id": user_id, "exp": exp or int(time.time()) + 600}).encode()
+        encoded = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+        return f"header.{encoded}.signature"
 
     def request(self, method, path, **kw):
         return requests.request(method, self.base + path, timeout=30, **kw)
@@ -499,6 +531,8 @@ def rig(tmp_path):
         primary_user_id=1,
         session_dir=session_dir,
         base_url="http://backend.invalid",
+        reina_allowed_origin="https://teledrive.example",
+        reina_server_url="https://server.example",
         game_folder="game",
         dir_cache_seconds=0.0,  # every listing is fresh: the fake backend is the truth
         host="127.0.0.1",
@@ -581,7 +615,7 @@ def rig(tmp_path):
     thread.start()
     host, port = server.bind_addr[0], server.bind_addr[1]
     try:
-        yield Rig(f"http://{host}:{port}", cfg, backend, worker, stager, resolver, upload_stager)
+        yield Rig(f"http://{host}:{port}", cfg, backend, worker, stager, resolver, upload_stager, app)
     finally:
         server.stop()
         thread.join(timeout=5)
@@ -1502,6 +1536,35 @@ def test_health(rig):
     assert data["ok"] is True
     assert data["telegram_user_id"] == 4242
     assert data["game_folder"] == "game"
+
+
+def test_browser_game_rpc_uses_browser_token_and_keeps_legacy_rpc_open(rig):
+    browser_token = rig.browser_token()
+    response = rig.request("GET", "/rpc/game/state", headers={
+        "Origin": rig.cfg.reina_allowed_origin,
+        "Authorization": f"Bearer {browser_token}",
+    })
+    assert response.status_code == 501
+    assert response.headers["Access-Control-Allow-Origin"] == rig.cfg.reina_allowed_origin
+    assert rig.backend.browser_auth_calls == [f"Bearer {browser_token}"]
+
+    legacy = rig.request("GET", "/rpc/health")
+    assert legacy.status_code == 200
+    assert "Access-Control-Allow-Origin" not in legacy.headers
+
+
+def test_browser_auth_does_not_trust_redirected_success_page(rig):
+    import hashlib
+
+    rig.backend.browser_auth_redirect_to_success = True
+    browser_token = rig.browser_token()
+    response = rig.request("GET", "/rpc/game/state", headers={
+        "Origin": rig.cfg.reina_allowed_origin,
+        "Authorization": f"Bearer {browser_token}",
+    })
+    assert response.status_code == 503
+    assert rig.backend.browser_auth_followed_redirects == 0
+    assert hashlib.sha256(browser_token.encode()).hexdigest() not in rig.app.rpc_app.game_rpc._token_cache
 
 
 def test_status_lists_staging_units(rig):
