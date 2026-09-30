@@ -886,6 +886,79 @@ GET /files    0.52s ┘
 | `GET /rpc/thumb` | `path=<Windows 路徑>` → Telegram 預覽圖（JPEG）；沒有就 404 讓 DLL 走 fallback |
 | `GET /rpc/props` | `path=<Windows 路徑>` → `{width,height,duration,size}`，不讀檔案內容 |
 
+## 瀏覽器遊戲 RPC 與遊玩時間（ReinaManager 網頁版）
+
+ReinaManager 網頁版（TeleDrive 的 `/game/`）由**瀏覽器直接**呼叫這支 bridge 下載、啟動遊戲；
+遊玩時間由 bridge 記錄後補送給 reina-server。分工：server 存遊戲庫與統計，bridge 只管本機下載、
+進程與計時。程式在 `gamestate.py`（下載狀態 + RPC 骨架）、`gamelaunch.py`（啟動與進程追蹤）、
+`playtime.py`（durable store + 補送佇列）。
+
+### `[reina]` 設定
+
+| 鍵 | 說明 |
+|---|---|
+| `allowed_origin` | 網頁 Origin，**精確比對**（協定/網域/連接埠）；不可含萬用字元、帳密、path/query。 |
+| `server_url` | reina-server 的 base URL；補送遊玩記錄時打 `<server_url>/game/api/sessions`。 |
+| `locale_emulator` | Locale Emulator 執行檔路徑；留空即停用（`capabilities.locale_emulator=false`）。 |
+
+`allowed_origin` 或 `server_url` 任一為空、或 origin 不合法，`/rpc/game/*` 整組回 `503 game_rpc_disabled`。
+改 `config.ini` 後要 `restart.bat`（見上方收尾表，先看 `/rpc/status`）。
+
+### `/rpc/game/*`
+
+一律要求：`Origin` 等於 `allowed_origin`、`Authorization: Bearer <TeleDrive JWT>`。
+bridge 用 `GET <api>/folders` 向 TeleDrive 驗證 token（成功結果最多快取 5 分鐘、只存 token 的 SHA-256），
+再比對 JWT 的 `user_id` 是否等於 bridge 主 Telegram 帳號，不符回 `403 bridge_owner_mismatch`。
+預檢 `OPTIONS` 回 CORS 標頭；帶 `Access-Control-Request-Private-Network: true` 時回 `Access-Control-Allow-Private-Network`
+（Chrome 的 Private Network Access）。
+
+| 端點 | 用途 |
+|---|---|
+| `GET /rpc/game/state?paths=…`（可重複） | 每個 canonical 路徑（`game/…`）的 `status`（`running` / `downloading` / `ready` / `incomplete` / `absent`）、進度位元組、`elapsed_seconds`、`error`、`capabilities` |
+| `POST /rpc/game/fetch` `{path}` | 背景下載（202）；已在下載就回現況。 |
+| `DELETE /rpc/game/fetch?path=…` | 取消下載；沒有進行中的下載回 409 `download_not_active`。 |
+| `GET /rpc/game/exes?path=…` | 已下載遊戲內可選的執行檔（相對路徑）。 |
+| `POST /rpc/game/launch` `{path, exe_relpath, game_id, locale_emulator}` | 啟動並開始計時，回 `session_id`。未下載完成 409 `bridge_game_not_ready`；已在跑 409 `bridge_game_running`。 |
+
+路徑必須是 `<game_folder>/…` 且不含 `.`、`..`。`ready` 的判準是遊戲根目錄下的 `.reina-complete` 標記
+（下載完整成功才寫）；有內容但沒有標記是 `incomplete`，之後重新 fetch 會跳過已存在的檔案續傳。
+下載失敗訊息回給瀏覽器前先經 `upload_engine.redact` 並遮蔽本機絕對路徑與 JWT 形狀字串（`_safe_download_error`）。
+
+### 狀態檔（都在 `cache_dir` 底下）
+
+| 檔案 | 內容 | 注意 |
+|---|---|---|
+| `reina-games.json` | canonical 路徑 → 本機遊戲根目錄的對應（下載完成時寫入，原子替換） | 對應失效或不在 `local/` 之下時，會退回由路徑重新推導；不是快取，別亂刪 |
+| `playtime-running.json` | 執行中會話：`session_id`、`game_id`、裝置、開始時間、根目錄、PID + 建立時間、`last_seen` | 每次變更 fsync + 原子替換 |
+| `playtime-queue.jsonl` | 已結束、待補送的遊玩記錄（每行一筆 `{id, game_id, device, start, end, seconds}`） | 見下 |
+
+會話結束時**先 append 進 queue（fsync）再從 running store 移除**（queue-first），所以任何時刻掛掉都不會丟記錄；
+`id` 就是 `session_id`，server 端以它去重，重送是冪等的。queue 的最後一行若是寫到一半會在載入時修復
+（可解析就補換行，否則截掉）；中間行損壞或整個檔案無法載入時，原檔改名為 `*.corrupt-<時間戳>`
+並從空檔重新開始（不讓 bridge 與 `H:` 起不來），事後要手動處理那份備份。
+
+`PlaytimeSender` 背景執行緒用 bridge 自己的 TeleDrive JWT 送 `POST /game/api/sessions`，200 且 `accepted` 為布林才 ack：
+暫時性失敗（網路、5xx、429…）指數退避 5/10/30/60/300 秒；404 `not_found`（遊戲已刪）擱置該筆 15 分鐘；
+400 擱置 1 小時；403 拉長間隔；401 先強制重登一次，仍 401 暫停 30 分鐘。被擱置的單筆不擋後面的記錄。
+所以「遊玩時間沒出現」通常是 queue 還在排隊，先看 `bridge.log` 的 `playtime send deferred` / `retained`，
+再數 `playtime-queue.jsonl` 行數。
+
+啟動時 `recover_sessions()` 會逐筆檢查 running store：已在 queue 的直接清掉；程序仍活著
+（PID + 建立時間一致，或根目錄底下、開始時間之後建立的程序）就接回繼續計時；都找不到就用 `last_seen` 結算進 queue。
+
+### 重啟前
+
+`/rpc/status` 目前只列上傳/暫存與帳號狀態，**不會顯示執行中的遊戲或 playtime queue**。重啟 bridge 前：
+先看 `/rpc/status`（有無 debounce 中的 staging/uploads），再看 `playtime-running.json` 是否有執行中的會話、
+`/rpc/game/state` 是否有 `downloading`。仍只用 `restart.bat`（不動 rclone）。進行中的下載會在重啟時中斷，
+重啟後該遊戲是 `incomplete`，要在網頁重新按下載。
+
+### 憑證不外洩（redaction）
+
+JWT 與 Telegram session 不得出現在任何日誌、`/rpc/status`、錯誤回應或文件。bridge 只在記憶體使用 JWT；
+token 快取以 SHA-256 為鍵；錯誤訊息一律先 `redact`；`/rpc/game/*` 的 401/403/503 只回固定的 `code`。
+貼 issue 時不要貼 `Authorization` 標頭或 `config.ini`。
+
 ## 測試
 
 ```powershell
