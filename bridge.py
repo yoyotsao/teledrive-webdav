@@ -38,6 +38,7 @@ from wsgidav.wsgidav_app import WsgiDAVApp
 
 import zipfs
 from config import Config, ext_path as _ext, load_config
+from gamestate import GameRpc
 from tdapi import ApiError, Entry, JsonStore, ShardedJsonStore, TeleDriveClient
 from telegram_accounts import TelegramAccountPool
 from telegram_sessions import SessionDirectoryLock
@@ -641,7 +642,24 @@ class Resolver:
         children = self.game_children()
 
         # 2. <top>.zip presented as a folder, expanded from its central directory.
+        # 精确名称始终优先；只有缺少 Foo.zip 时才按 mtime 选大小写变体。
         zip_entry = children.get(top + ".zip")
+        if zip_entry is None:
+            candidates = [
+                entry
+                for name, entry in children.items()
+                if not entry.is_dir
+                and name.rpartition(".")[0] == top
+                and name.rpartition(".")[2].casefold() == "zip"
+            ]
+            if candidates:
+                candidates.sort(key=lambda entry: (entry.mtime, entry.name, str(entry.file_id)))
+                if len(candidates) > 1:
+                    log.warning(
+                        "multiple case-insensitive ZIP candidates for %s; selecting newest",
+                        top,
+                    )
+                zip_entry = candidates[-1]
         if zip_entry is not None and not zip_entry.is_dir:
             view = self.zip_view(zip_entry)
             if len(rest) == 1:
@@ -1371,15 +1389,23 @@ class WriteGuard:
 class RpcApp:
     """Local control plane used by the Explorer verb and for diagnostics."""
 
-    def __init__(self, cfg: Config, resolver: Resolver, fetcher, stager, upload_stager=None):
+    def __init__(self, cfg: Config, resolver: Resolver, fetcher, stager, upload_stager=None, game_rpc=None,
+                 running_provider=None, session_store=None, process_adapter=None):
         self.cfg = cfg
         self.resolver = resolver
         self.fetcher = fetcher
         self.stager = stager
         self.upload_stager = upload_stager
+        self.game_rpc = game_rpc or GameRpc(
+            cfg, resolver, fetcher, running_provider,
+            session_store=session_store, process_adapter=process_adapter,
+        )
 
     def __call__(self, environ, start_response):
-        route = environ.get("PATH_INFO", "")[len("/rpc") :]
+        path = environ.get("PATH_INFO", "")
+        if path == "/rpc/game" or path.startswith("/rpc/game/"):
+            return self.game_rpc.handle(environ, start_response)
+        route = path[len("/rpc") :] if path.startswith("/rpc") else path
         try:
             if route in ("/health", "/health/"):
                 return self._health(start_response)
@@ -1543,7 +1569,8 @@ class Dispatcher:
         return self.dav_app(environ, start_response)
 
 
-def build_app(cfg: Config, resolver: Resolver, stager, fetcher, upload_stager=None):
+def build_app(cfg: Config, resolver: Resolver, stager, fetcher, upload_stager=None, running_provider=None,
+              session_store=None, process_adapter=None):
     provider = TeleDriveProvider(resolver)
     dav_config = {
         "provider_mapping": {"/": provider},
@@ -1568,7 +1595,10 @@ def build_app(cfg: Config, resolver: Resolver, stager, fetcher, upload_stager=No
     }
     dav_app = WsgiDAVApp(dav_config)
     guarded = WriteGuard(dav_app, cfg.game_folder)
-    return Dispatcher(guarded, RpcApp(cfg, resolver, fetcher, stager, upload_stager))
+    return Dispatcher(guarded, RpcApp(cfg, resolver, fetcher, stager, upload_stager,
+                                      running_provider=running_provider,
+                                      session_store=session_store,
+                                      process_adapter=process_adapter))
 
 
 class ThrottleRepeats(logging.Filter):
@@ -1677,6 +1707,16 @@ def main(argv=None) -> int:
         raise
     worker = pool.primary.worker
 
+    # Durable 狀態必須在 launcher、HTTP 與恢復流程啟動前完成載入與 queue repair。
+    from playtime import PlaytimeSender, PlaytimeService, open_playtime_state
+
+    try:
+        running_store, playtime_queue = open_playtime_state(cfg.cache_dir)
+    except Exception:
+        pool.stop()
+        session_lock.release()
+        raise
+
     # One engine for the whole process: fingerprint claims only collapse
     # duplicates that share it, and the per-account limiters it reaches through
     # the pool are what keeps two stagers from doubling up on one account.
@@ -1721,7 +1761,28 @@ def main(argv=None) -> int:
         )
         warmer.start()
 
-    app = build_app(cfg, resolver, stager, fetcher, upload_stager)
+    launcher = None
+    try:
+        app = build_app(cfg, resolver, stager, fetcher, upload_stager, session_store=running_store)
+        launcher = app.rpc_app.game_rpc.launcher
+        playtime_service = PlaytimeService(running_store, playtime_queue, launcher, launcher._adapter())
+        playtime_service.recover_sessions()
+    except Exception:
+        try:
+            if warmer is not None:
+                warmer.stop()
+            stager.stop()
+            upload_stager.stop()
+            if launcher is not None:
+                launcher.stop()
+                launcher.save_all()
+        finally:
+            pool.stop()
+            session_lock.release()
+        raise
+    launcher.on_session_end = lambda session: _finish_playtime_session(playtime_service, launcher, session)
+    sender = PlaytimeSender(api, cfg, playtime_queue)
+    sender.start()
 
     from cheroot import wsgi
 
@@ -1747,14 +1808,29 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         log.info("shutting down")
     finally:
-        server.stop()
-        if warmer is not None:
-            warmer.stop()
-        stager.stop()
-        upload_stager.stop()
-        pool.stop()
-        session_lock.release()
+        try:
+            server.stop()
+        finally:
+            try:
+                if warmer is not None:
+                    warmer.stop()
+                stager.stop()
+                upload_stager.stop()
+            finally:
+                try:
+                    launcher.stop()
+                    sender.stop()
+                    launcher.save_all()
+                finally:
+                    pool.stop()
+                    session_lock.release()
     return 0
+
+
+def _finish_playtime_session(service, launcher, session):
+    service.finish(session)
+    with launcher._lock:
+        launcher.sessions.pop(session.session_id, None)
 
 
 if __name__ == "__main__":

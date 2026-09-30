@@ -65,6 +65,9 @@ class Config:
     ffmpeg: str = ""
     seven_zip: str = r"C:\Program Files\7-Zip\7z.exe"
     upload_dir: Path = Path("data/uploads")
+    reina_allowed_origin: str = ""
+    reina_server_url: str = ""
+    reina_locale_emulator: str = ""
 
     @property
     def api_base(self) -> str:
@@ -144,6 +147,8 @@ def load_config(path: Optional[Path] = None) -> Config:
 
     parser = configparser.ConfigParser()
     parser.read([HERE / "config.example.ini", path], encoding="utf-8")
+    runtime_parser = configparser.ConfigParser()
+    runtime_parser.read(path, encoding="utf-8")
 
     env_file = parser.get("env", "env_file", fallback="").strip()
     env_file_path = Path(env_file)
@@ -255,4 +260,7 @@ def load_config(path: Optional[Path] = None) -> Config:
         warmup_auto=get("warmup", "auto", "true").lower() not in ("0", "false", "no", "off"),
         warmup_convert_rar=get("warmup", "convert_rar", "true").lower() not in ("0", "false", "no", "off"),
         warmup_interval_minutes=float(get("warmup", "interval_minutes", "360")),
+        reina_allowed_origin=runtime_parser.get("reina", "allowed_origin", fallback="").strip().rstrip("/"),
+        reina_server_url=runtime_parser.get("reina", "server_url", fallback="").strip(),
+        reina_locale_emulator=runtime_parser.get("reina", "locale_emulator", fallback="").strip(),
     )

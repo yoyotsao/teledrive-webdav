@@ -212,7 +212,20 @@ class FakeBackend:
     def __init__(self):
         self.rows = []
         self.dms = []  # (bot_username, nonce) the bridge sent over MTProto
+        self.browser_auth_calls = []
+        self.browser_auth_status = 200
+        self.browser_auth_redirect_to_success = False
+        self.browser_auth_followed_redirects = 0
         self._clock = datetime(2026, 7, 30, 12, 0, 0)
+
+    def validate_browser_token(self, authorization, *, allow_redirects=True):
+        self.browser_auth_calls.append(authorization)
+        if self.browser_auth_redirect_to_success:
+            if allow_redirects:
+                self.browser_auth_followed_redirects += 1
+                return SimpleNamespace(status_code=200, url="https://teledrive.example/login")
+            return SimpleNamespace(status_code=302, url="https://teledrive.example/login")
+        return SimpleNamespace(status_code=self.browser_auth_status)
 
     # -- row helpers ------------------------------------------------------ #
 
@@ -390,6 +403,15 @@ class FakeClient(TeleDriveClient):
     def __init__(self, cfg, backend):
         super().__init__(cfg)
         self.backend = backend
+        self.auth_session = SimpleNamespace(
+            request=lambda method, url, **kwargs: self.backend.validate_browser_token(
+                kwargs.get("headers", {}).get("Authorization"),
+                allow_redirects=kwargs.get("allow_redirects", True),
+            )
+        )
+
+    def _http_session(self):
+        return self.auth_session
 
     def login(self, force=False, **kw):
         # Not stubbed out: the real login() runs, so the challenge handshake is
@@ -423,7 +445,7 @@ BIG = bytes((i * 31) % 256 for i in range(300_000))
 
 
 class Rig:
-    def __init__(self, base, cfg, backend, worker, stager, resolver, upload_stager=None):
+    def __init__(self, base, cfg, backend, worker, stager, resolver, upload_stager=None, app=None):
         self.base = base
         self.cfg = cfg
         self.backend = backend
@@ -431,6 +453,16 @@ class Rig:
         self.stager = stager
         self.resolver = resolver
         self.upload_stager = upload_stager
+        self.app = app
+
+    @staticmethod
+    def browser_token(user_id=4242, exp=None):
+        import base64
+        import json
+
+        payload = json.dumps({"user_id": user_id, "exp": exp or int(time.time()) + 600}).encode()
+        encoded = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+        return f"header.{encoded}.signature"
 
     def request(self, method, path, **kw):
         return requests.request(method, self.base + path, timeout=30, **kw)
@@ -499,6 +531,8 @@ def rig(tmp_path):
         primary_user_id=1,
         session_dir=session_dir,
         base_url="http://backend.invalid",
+        reina_allowed_origin="https://teledrive.example",
+        reina_server_url="https://server.example",
         game_folder="game",
         dir_cache_seconds=0.0,  # every listing is fresh: the fake backend is the truth
         host="127.0.0.1",
@@ -581,7 +615,7 @@ def rig(tmp_path):
     thread.start()
     host, port = server.bind_addr[0], server.bind_addr[1]
     try:
-        yield Rig(f"http://{host}:{port}", cfg, backend, worker, stager, resolver, upload_stager)
+        yield Rig(f"http://{host}:{port}", cfg, backend, worker, stager, resolver, upload_stager, app)
     finally:
         server.stop()
         thread.join(timeout=5)
@@ -1504,6 +1538,36 @@ def test_health(rig):
     assert data["game_folder"] == "game"
 
 
+def test_browser_game_rpc_uses_browser_token_and_keeps_legacy_rpc_open(rig):
+    browser_token = rig.browser_token()
+    response = rig.request("GET", "/rpc/game/state", headers={
+        "Origin": rig.cfg.reina_allowed_origin,
+        "Authorization": f"Bearer {browser_token}",
+    })
+    assert response.status_code == 200
+    assert response.json() == {"games": []}
+    assert response.headers["Access-Control-Allow-Origin"] == rig.cfg.reina_allowed_origin
+    assert rig.backend.browser_auth_calls == [f"Bearer {browser_token}"]
+
+    legacy = rig.request("GET", "/rpc/health")
+    assert legacy.status_code == 200
+    assert "Access-Control-Allow-Origin" not in legacy.headers
+
+
+def test_browser_auth_does_not_trust_redirected_success_page(rig):
+    import hashlib
+
+    rig.backend.browser_auth_redirect_to_success = True
+    browser_token = rig.browser_token()
+    response = rig.request("GET", "/rpc/game/state", headers={
+        "Origin": rig.cfg.reina_allowed_origin,
+        "Authorization": f"Bearer {browser_token}",
+    })
+    assert response.status_code == 503
+    assert rig.backend.browser_auth_followed_redirects == 0
+    assert hashlib.sha256(browser_token.encode()).hexdigest() not in rig.app.rpc_app.game_rpc._token_cache
+
+
 def test_status_lists_staging_units(rig):
     rig.request("MKCOL", "/game/Watch")
     rig.request("PUT", "/game/Watch/a.bin", data=b"x")
@@ -1529,11 +1593,61 @@ def _fetch(rig, win_path):
 
 def test_fetch_local_extracts_a_virtual_zip_folder(rig):
     lines = _fetch(rig, r"E:\game\MyGame")
+    assert lines[0] == r"target: E:\game\MyGame"
+    assert any("file(s)," in line and "->" in line for line in lines)
+    assert any(line.startswith("PROGRESS ") for line in lines)
     assert lines[-1].startswith("OK "), lines
     base = rig.cfg.local_dir / "MyGame"
     for name, blob in ZIP_MEMBERS.items():
         assert (base / name).read_bytes() == blob, name
     assert not list(base.rglob("*.part"))
+
+
+def test_game_zip_resolution_prefers_exact_name_then_newest_case_fallback(rig, caplog):
+    game = rig.resolver.game_entry()
+    exact = rig.backend.add_file("Foo.zip", b"exact", rig.worker, parent_id=game.file_id)[0]
+    fallback = rig.backend.add_file("Bar.ZIP", b"old", rig.worker, parent_id=game.file_id)[0]
+    newest = rig.backend.add_file("Bar.Zip", b"new", rig.worker, parent_id=game.file_id)[0]
+    newer_exact_case = rig.backend.add_file("Foo.ZIP", b"newer", rig.worker, parent_id=game.file_id)[0]
+    tied_first = rig.backend.add_file("Tie.ZIP", b"first", rig.worker, parent_id=game.file_id)[0]
+    tied_second = rig.backend.add_file("Tie.zIP", b"second", rig.worker, parent_id=game.file_id)[0]
+    exact["date"] = "2026-01-01T00:00:00"
+    newer_exact_case["date"] = "2026-09-01T00:00:00"
+    fallback["date"] = "2026-01-01T00:00:00"
+    newest["date"] = "2026-08-01T00:00:00"
+    tied_first["date"] = tied_second["date"] = "2026-08-01T00:00:00"
+
+    assert rig.resolver.resolve(["game", "Foo"]).entry.name == "Foo.zip"
+    assert rig.resolver.resolve(["game", "Bar"]).entry.name == "Bar.Zip"
+    with caplog.at_level("WARNING", logger="bridge"):
+        assert rig.resolver.resolve(["game", "Tie"]).entry.name == "Tie.zIP"
+    assert "multiple case-insensitive ZIP candidates" in caplog.text
+
+
+def test_fetcher_destination_matches_real_resolver_plan_roots(rig):
+    fetcher = rig.app.rpc_app.fetcher
+    cases = [
+        ["photos"],
+        ["game", "MyGame"],
+        ["game", "MyGame", "bin"],
+        ["game", "MyGame", "bin", "pak0.pak"],
+    ]
+    game = rig.resolver.game_entry()
+    name = "遊戲, A"
+    zipped = io.BytesIO()
+    with zipfile.ZipFile(zipped, "w") as archive:
+        archive.writestr("data.bin", b"unicode")
+    rig.backend.add_file(name + ".zip", zipped.getvalue(), rig.worker, parent_id=game.file_id)
+    cases.append(["game", name])
+
+    rig.request("MKCOL", "/game/Stage")
+    rig.request("PUT", "/game/Stage/data.bin", data=b"staged")
+    cases.extend([["game", "Stage"], ["game", "Stage", "data.bin"]])
+
+    for segments in cases:
+        loc = rig.resolver.resolve(segments)
+        _items, expected_root = fetcher._plan(loc, segments)
+        assert fetcher.destination_for(segments) == expected_root, segments
 
 
 def test_fetch_local_copies_a_split_file(rig):
