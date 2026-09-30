@@ -1697,7 +1697,22 @@ def main(argv=None) -> int:
     # when a request is waiting, and a second process would just queue behind it.
     warmer = None
     if cfg.warmup_auto:
-        warmer = BackgroundWarmup(resolver, interval_minutes=cfg.warmup_interval_minutes)
+        converter = None
+        if cfg.warmup_convert_rar:
+            import rarconvert
+            import warmup as _warmup
+
+            converter = rarconvert.RarConverter(
+                cfg, api, stager,
+                # Not resolver.open_remote: that records foreground demand, and
+                # a background download counting as demand would wait on itself.
+                open_reader=lambda e: SeekableRemoteFile(pool, api.parts_for(e), name=e.name),
+                zip_has_files=lambda e: bool(resolver.zip_view(e).root.children),
+                wait_quiet=lambda: resolver.wait_for_quiet(_warmup.QUIET),
+            )
+        warmer = BackgroundWarmup(
+            resolver, interval_minutes=cfg.warmup_interval_minutes, converter=converter
+        )
         warmer.start()
 
     app = build_app(cfg, resolver, stager, fetcher, upload_stager)

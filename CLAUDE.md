@@ -165,6 +165,22 @@ DB 確認 0/84），而且自己送的預覽尺寸是確定的 320px。實作上
 那兩個目錄都會被掃成待辦工作。只對「單一 segment 且 mime 是 `image/`」做，
 產不出來一律回 None：**產不出預覽永遠不能讓上傳失敗**。
 
+### `/game` 的 RAR 一律轉成 zip（`gamestage.py` + `rarconvert.py`）
+
+drive 只瀏覽得了 `ZIP_STORED`：RAR 沒有 central directory（每個 header 夾在自己的
+資料前面，列一次幾千個檔就是幾千次 Telegram 往返），壓縮成員也沒有 Python 解碼器。
+與其在 bridge 裡再養一套格式，不如讓 RAR 根本不要以 RAR 的身分留在 drive 上：
+
+- **丟進 `/game` 的 `.rar`**：`gamestage._convert` 在打包時用 7-Zip（`[game] seven_zip`）
+  解到 `.pack/<stem>.extract`，再跟資料夾一樣打包成 `<stem>.zip`。解壓失敗保留 rar、
+  unit 標 failed；stdin 關掉，加密檔會直接失敗而不是在背景執行緒等密碼。
+- **已經在 `/game` 上的 `.rar`**：warmup 每一輪開頭由 `RarConverter` 找出沒有同名 `.zip`
+  的，下載到 `staging/.convert/<file_id>.part`（可續傳、每塊之間 `wait_for_quiet`，
+  不走 `open_remote` —— 那會記成前景 demand，自己等自己），完成後原子搬進 staging 交給
+  上面那條路。`<stem>.zip` 上了 drive **而且**目錄讀得回來、至少一個成員之後，才把原本的
+  rar 軟刪除（進垃圾桶、Telegram 訊息不動）。只刪自己轉的（`meta/rar-convert.json`
+  按 file id 記），已經有別人做的同名 zip 的 rar 不碰。`[warmup] convert_rar` 可關。
+
 ## 多帳號與上傳引擎
 
 **這一層存在的理由是網頁端已經是多帳號的，而 bridge 以前不是。** 網頁把一般檔案

@@ -378,8 +378,12 @@ class BackgroundWarmup:
         *,
         interval_minutes: float = DEFAULT_INTERVAL_MINUTES,
         start_delay: float = START_DELAY,
+        converter=None,
     ):
         self.resolver = resolver
+        # rarconvert.RarConverter: turns RARs already in /game into zips. Run
+        # from here so its downloads yield to browsing like the rest of the sweep.
+        self.converter = converter
         self.interval = max(60.0, interval_minutes * 60.0)
         self.start_delay = start_delay
         self._stop = threading.Event()
@@ -392,6 +396,8 @@ class BackgroundWarmup:
 
     def stop(self) -> None:
         self._stop.set()
+        if self.converter is not None:
+            self.converter.stop()
         if self._thread is not None:
             # Only long enough to leave the current batch; the thread is a daemon
             # and every cache it writes is complete after each batch anyway.
@@ -408,6 +414,13 @@ class BackgroundWarmup:
             self._stop.wait(self.interval)
 
     def _pass(self) -> None:
+        if self.converter is not None:
+            try:
+                self.converter.run()
+            except Exception as exc:  # conversion must never cost the sweep
+                log.warning("rar conversion failed: %s", exc)
+            if self._stop.is_set():
+                return
         warmer = Warmer(self.resolver, stop=self._stop, progress=self._note)
         files, todo = warmer.pending()
         if self._stop.is_set():
