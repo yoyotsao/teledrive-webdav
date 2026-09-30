@@ -1707,6 +1707,16 @@ def main(argv=None) -> int:
         raise
     worker = pool.primary.worker
 
+    # Durable 狀態必須在 launcher、HTTP 與恢復流程啟動前完成載入與 queue repair。
+    from playtime import PlaytimeSender, PlaytimeService, open_playtime_state
+
+    try:
+        running_store, playtime_queue = open_playtime_state(cfg.cache_dir)
+    except Exception:
+        pool.stop()
+        session_lock.release()
+        raise
+
     # One engine for the whole process: fingerprint claims only collapse
     # duplicates that share it, and the per-account limiters it reaches through
     # the pool are what keeps two stagers from doubling up on one account.
@@ -1751,7 +1761,28 @@ def main(argv=None) -> int:
         )
         warmer.start()
 
-    app = build_app(cfg, resolver, stager, fetcher, upload_stager)
+    launcher = None
+    try:
+        app = build_app(cfg, resolver, stager, fetcher, upload_stager, session_store=running_store)
+        launcher = app.rpc_app.game_rpc.launcher
+        playtime_service = PlaytimeService(running_store, playtime_queue, launcher, launcher._adapter())
+        playtime_service.recover_sessions()
+    except Exception:
+        try:
+            if warmer is not None:
+                warmer.stop()
+            stager.stop()
+            upload_stager.stop()
+            if launcher is not None:
+                launcher.stop()
+                launcher.save_all()
+        finally:
+            pool.stop()
+            session_lock.release()
+        raise
+    launcher.on_session_end = lambda session: _finish_playtime_session(playtime_service, launcher, session)
+    sender = PlaytimeSender(api, cfg, playtime_queue)
+    sender.start()
 
     from cheroot import wsgi
 
@@ -1777,14 +1808,29 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         log.info("shutting down")
     finally:
-        server.stop()
-        if warmer is not None:
-            warmer.stop()
-        stager.stop()
-        upload_stager.stop()
-        pool.stop()
-        session_lock.release()
+        try:
+            server.stop()
+        finally:
+            try:
+                if warmer is not None:
+                    warmer.stop()
+                stager.stop()
+                upload_stager.stop()
+            finally:
+                try:
+                    launcher.stop()
+                    sender.stop()
+                    launcher.save_all()
+                finally:
+                    pool.stop()
+                    session_lock.release()
     return 0
+
+
+def _finish_playtime_session(service, launcher, session):
+    service.finish(session)
+    with launcher._lock:
+        launcher.sessions.pop(session.session_id, None)
 
 
 if __name__ == "__main__":

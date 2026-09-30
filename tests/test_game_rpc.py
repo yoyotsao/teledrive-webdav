@@ -380,3 +380,26 @@ def test_game_exe_and_launch_rpc_use_relative_paths_and_return_session_id(tmp_pa
     assert game["status"] == "running"
     assert game["elapsed_seconds"] == 0
     assert game["capabilities"] == {"locale_emulator": True}
+
+
+def test_unexpected_handler_error_still_carries_cors_and_json(game_rpc):
+    app, _session = game_rpc
+
+    class Boom:
+        def states(self, _paths):
+            raise RuntimeError("boom with secret-path")
+
+    app.state = Boom()
+    result = request(app, authorization=f"Bearer {token()}", query="paths=game%2FA")
+    assert result["status"] == 500
+    assert result["headers"]["Access-Control-Allow-Origin"] == ALLOWED_ORIGIN
+    assert b"secret" not in result["body"]
+
+
+def test_upstream_forbidden_is_403_not_a_logout_401(game_rpc):
+    app, session = game_rpc
+    session.response = Response(403)
+    result = request(app, authorization=f"Bearer {token()}")
+    assert result["status"] == 403
+    assert json.loads(result["body"])["code"] == "teledrive_forbidden"
+    assert result["headers"]["Access-Control-Allow-Origin"] == ALLOWED_ORIGIN

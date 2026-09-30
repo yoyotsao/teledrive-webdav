@@ -137,7 +137,14 @@ class GameState:
 
     def _state_for(self, path: str) -> dict:
         segments = self.canonical_game_segments(path)
-        root = self._root_for(path, segments)
+        try:
+            root = self._root_for(path, segments)
+        except FileNotFoundError:
+            # 遠端已刪除或改名：這是遊戲狀態（absent），不是 bridge 連線失敗
+            root = None
+        except Exception:
+            log.exception("resolving the local game root failed")
+            raise GameStateError(503, "bridge_backend_unavailable", "TeleDrive backend is unavailable") from None
         with self._lock:
             job = self._jobs.get(path)
             job_active = job is not None and not job.finished.is_set()
@@ -164,9 +171,9 @@ class GameState:
                 except Exception:
                     log.exception("running elapsed provider failed for a game path")
                     elapsed = 0
-        elif not job_active and (root / self.COMPLETE_MARKER).is_file():
+        elif not job_active and root is not None and (root / self.COMPLETE_MARKER).is_file():
             status = "ready"
-        elif not job_active and root.exists():
+        elif not job_active and root is not None and root.exists():
             status = "incomplete"
         elif not job_active:
             status = "absent"
@@ -384,8 +391,11 @@ class GameRpc:
             log.warning("browser token validation unavailable: %s", type(exc).__name__)
             raise GameRpcError(503, "authentication service unavailable", "auth_service_unavailable") from None
 
-        if response.status_code in (401, 403):
+        if response.status_code == 401:
             raise GameRpcError(401, "invalid bearer token", "invalid_bearer_token")
+        if response.status_code == 403:
+            # token 有效但 TeleDrive 拒絕授權：不是登入失效，不能讓網頁端因此登出
+            raise GameRpcError(403, "TeleDrive denied access", "teledrive_forbidden")
         if response.status_code != 200:
             raise GameRpcError(503, "authentication service unavailable", "auth_service_unavailable")
 
@@ -434,6 +444,14 @@ class GameRpc:
         except GameRpcError as exc:
             return self._response(start_response, exc.status, {"code": exc.code, "error": exc.message}, cors)
 
+        try:
+            return self._route(environ, start_response, method, cors)
+        except Exception:
+            # 任何未預期例外都要回帶 CORS 的 JSON，否則瀏覽器只會看到連線錯誤
+            log.exception("unexpected game RPC failure")
+            return self._response(start_response, 500, {"code": "internal_error", "error": "internal error"}, cors)
+
+    def _route(self, environ, start_response, method, cors):
         route = environ.get("PATH_INFO", "")
         if route == "/rpc/game/state":
             if method != "GET":

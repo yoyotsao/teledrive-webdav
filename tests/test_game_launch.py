@@ -140,7 +140,7 @@ def test_launch_rechecks_root_before_spawn_when_launcher_exited_before_first_pol
         launcher.launch("game/A", "start.exe", 41)
 
     assert error.value.status == 409
-    assert error.value.code == "bridge_game_not_ready"
+    assert error.value.code == "bridge_game_running"
     assert len(adapter.spawned) == spawn_count
     assert session.pids == [child.ref]
     assert store.sessions[session.session_id].pids == [child.ref]
@@ -282,3 +282,53 @@ def test_list_exes_does_not_traverse_directory_link_outside_root(game, tmp_path)
     except OSError as error:
         pytest.skip(f"directory symlink creation is unavailable: {error}")
     assert launcher.list_exes("game/A") == ["bin/game.exe", "start.exe"]
+
+
+class ScriptedStop:
+    """讓 _monitor 只跑指定輪數，每輪把假時鐘推進到腳本指定的時間。"""
+
+    def __init__(self, now, steps):
+        self.now, self.steps = now, list(steps)
+
+    def wait(self, _timeout):
+        if not self.steps:
+            return True
+        tick, action = self.steps.pop(0)
+        self.now[0] = tick
+        action()
+        return False
+
+
+def test_normal_exit_ends_at_last_observed_alive_time_not_stale_heartbeat(game):
+    _, adapter, _, now, launcher = game
+    session = launcher.launch("game/A", "start.exe", 9)
+    ended = []
+    launcher.on_session_end = lambda item: ended.append((item.start, item.last_seen))
+    alive = list(adapter.processes)
+    launcher._stop = ScriptedStop(now, [
+        (2030.0, lambda: None),
+        (2050.0, lambda: None),
+        (2052.0, lambda: setattr(adapter, "processes", [])),
+        (2054.0, lambda: None),
+    ])
+    launcher._monitor(session)
+    assert alive and ended == [(2000, 2050)]
+
+
+def test_graceful_shutdown_persists_last_observed_alive_time(game):
+    _, adapter, store, now, launcher = game
+    session = launcher.launch("game/A", "start.exe", 10)
+    now[0] = 2045.0
+    launcher.monitor_once(session)
+    store.sessions.clear()
+    launcher.save_all()
+    assert store.sessions[session.session_id].last_seen == 2045
+
+
+def test_already_running_game_uses_its_own_error_code(game):
+    _, _, _, _, launcher = game
+    launcher.launch("game/A", "start.exe", 11)
+    with pytest.raises(LaunchError) as caught:
+        launcher.launch("game/A", "start.exe", 11)
+    assert caught.value.status == 409
+    assert caught.value.code == "bridge_game_running"

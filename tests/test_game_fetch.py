@@ -392,3 +392,26 @@ def test_completion_wins_and_late_cancel_cannot_be_accepted(tmp_path, monkeypatc
     assert cancel_result[0].code == "download_not_active"
     assert (root / GameState.COMPLETE_MARKER).is_file()
     assert state.states(["game/A"])[0]["status"] == "ready"
+
+
+def test_game_state_reports_absent_when_remote_game_is_gone(tmp_path):
+    cfg = SimpleNamespace(game_folder="game", cache_dir=tmp_path / "cache", local_dir=tmp_path / "local")
+
+    def gone(_segments):
+        raise FileNotFoundError("not found: game/Gone")
+
+    state = GameState(cfg, SimpleNamespace(), SimpleNamespace(destination_for=gone))
+    game = state.states(["game/Gone"])[0]
+    assert game["status"] == "absent"
+
+
+def test_game_state_backend_failure_is_a_503_state_error(tmp_path):
+    cfg = SimpleNamespace(game_folder="game", cache_dir=tmp_path / "cache", local_dir=tmp_path / "local")
+
+    def down(_segments):
+        raise RuntimeError("backend unreachable")
+
+    state = GameState(cfg, SimpleNamespace(), SimpleNamespace(destination_for=down))
+    with pytest.raises(GameStateError) as caught:
+        state.states(["game/A"])
+    assert caught.value.status == 503

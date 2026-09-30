@@ -157,7 +157,10 @@ class GameLauncher:
         self._lock = threading.RLock()
         self._monitor_threads: dict[str, threading.Thread] = {}
         self._empty_polls: dict[str, int] = {}
+        # 最後一次確認程序樹仍存活的時間；只在記憶體，持久化仍受 60 秒心跳限制
+        self._last_alive: dict[str, int] = {}
         self._stop = threading.Event()
+        self.on_session_end = None
 
     def _adapter(self) -> ProcessAdapter:
         if self.process_adapter is None:
@@ -276,7 +279,7 @@ class GameLauncher:
         path_key = os.path.normcase(str(root)).casefold()
         with self._lock:
             if path_key in self._launching:
-                raise LaunchError(409, "bridge_game_not_ready", "该游戏已经在运行。")
+                raise LaunchError(409, "bridge_game_running", "该游戏已经在运行。")
             root_sessions = [
                 session for session in self.sessions.values()
                 if os.path.normcase(session.root).casefold() == path_key
@@ -291,7 +294,7 @@ class GameLauncher:
                         503, "bridge_process_scan_failed", "无法确认游戏当前是否已在运行，请稍后重试。",
                     ) from None
             if any(self._session_alive(session) for session in root_sessions):
-                raise LaunchError(409, "bridge_game_not_ready", "该游戏已经在运行。")
+                raise LaunchError(409, "bridge_game_running", "该游戏已经在运行。")
             self._launching.add(path_key)
 
         try:
@@ -396,6 +399,9 @@ class GameLauncher:
 
         owned = {ref for ref in retained if self.claim_process(session, ref)}
         current = sorted(owned)
+        if current:
+            with self._lock:
+                self._last_alive[session.session_id] = int(self.clock())
         with self._lock:
             previous = sorted(session.pids)
             if current != previous:
@@ -427,10 +433,48 @@ class GameLauncher:
             try:
                 self.monitor_once(session)
                 with self._lock:
-                    if self._empty_polls.get(session.session_id, 0) >= 2:
-                        break
+                    finished = self._empty_polls.get(session.session_id, 0) >= 2
+                if finished:
+                    self._apply_last_alive(session)
+                    if self.on_session_end is not None:
+                        self.on_session_end(session)
+                    break
             except Exception:
                 log.exception("game process monitor failed (session=%s)", session.session_id)
 
     def close(self) -> None:
+        self.stop()
+        self.save_all()
+
+    def stop(self) -> None:
         self._stop.set()
+        with self._lock:
+            threads = list(self._monitor_threads.values())
+        for thread in threads:
+            if thread is not threading.current_thread():
+                thread.join()
+
+    def _apply_last_alive(self, session: RunningSession) -> None:
+        """正常結束時以最後一次確認存活的時間當 end，而不是最多落後 60 秒的心跳。"""
+        with self._lock:
+            alive = self._last_alive.pop(session.session_id, None)
+            if alive is not None and alive > session.last_seen:
+                session.last_seen = alive
+
+    def save_all(self) -> None:
+        with self._lock:
+            for session in self.sessions.values():
+                alive = self._last_alive.get(session.session_id)
+                if alive is not None and alive > session.last_seen:
+                    session.last_seen = alive
+                self.store.save(session)
+
+    def resume(self, session: RunningSession) -> None:
+        """為已恢復的活躍 session 啟動程序樹監控。"""
+        if not self.start_monitor or session.session_id in self._monitor_threads:
+            return
+        thread = threading.Thread(
+            target=self._monitor, args=(session,), name=f"game-monitor-recovered-{session.session_id}", daemon=True,
+        )
+        self._monitor_threads[session.session_id] = thread
+        thread.start()
