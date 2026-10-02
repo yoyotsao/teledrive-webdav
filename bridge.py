@@ -1822,6 +1822,16 @@ def main(argv=None) -> int:
                     sender.stop()
                     launcher.save_all()
                 finally:
+    if cfg.auto_mount:
+        # Once the bridge is serving, make sure the drive is there. Idempotent:
+        # an rclone that is already up (it outlives bridge restarts on purpose)
+        # is left alone. Off the main thread because the mount waits on us.
+        import mountctl
+
+        threading.Thread(
+            target=lambda: mountctl.ensure_mounted(cfg), name="automount", daemon=True
+        ).start()
+    _install_console_close_handler(server)
                     pool.stop()
                     session_lock.release()
     return 0
@@ -1835,3 +1845,35 @@ def _finish_playtime_session(service, launcher, session):
 
 if __name__ == "__main__":
     sys.exit(main())
+def _install_console_close_handler(server) -> None:
+    """Make closing the console window shut down like Ctrl+C does.
+
+    Python turns Ctrl+C into KeyboardInterrupt but not CTRL_CLOSE_EVENT, so
+    closing the window used to kill the process mid-flight and leave a
+    running warmshell behind. Windows gives the handler a few seconds before
+    it terminates the process, which is enough to stop the server and let
+    ``main``'s ``finally`` run (warmup.stop kills the warmshell child).
+    """
+    if os.name != "nt":
+        return
+    import ctypes
+
+    handler_type = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
+
+    def handler(event: int) -> int:
+        if event in (2, 5, 6):  # CLOSE, LOGOFF, SHUTDOWN
+            log.info("console closing; shutting down")
+            server.stop()
+            time.sleep(4)  # let main()'s finally finish before the OS ends us
+            return 1
+        return 0
+
+    # Held at module level: a collected callback would crash the process.
+    global _CONSOLE_HANDLER
+    _CONSOLE_HANDLER = handler_type(handler)
+    ctypes.windll.kernel32.SetConsoleCtrlHandler(_CONSOLE_HANDLER, True)
+
+
+_CONSOLE_HANDLER = None
+
+

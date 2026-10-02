@@ -31,6 +31,7 @@ bridge 只用現有 public API，沒有為它新增任何會讀寫二進位資�
 | `install_menu.py` / `install_thumb.py` | 重跑安裝；property handler 那半要管理員（只有 HKLM） |
 | `config.ini` | `restart.bat`（路徑全部由 `cache_dir` 推導，重讀才生效） |
 
+- **關閉 bridge 不再需要手動管 warmshell**：`BackgroundWarmup.stop()` 會殺掉進行中的 warmshell，主控台視窗被關（`SetConsoleCtrlHandler`）也走同一條 `finally`。強殺 rclone 的 fallback 已移除——沒有任何腳本會在有 reader 的時候 `taskkill /F rclone.exe`。
 - **`restart.bat` 只重啟 bridge，不碰 rclone。** rclone 是對 127.0.0.1 講 HTTP 並且會重試，
   所以 `H:` 不會斷、VFS 快取也還在；殺掉 rclone 等於卸載磁碟又白丟 dir cache。
   重啟前先看 `/rpc/status`：staging/uploads 的 debounce 計時器不會續命（檔案還在，計時歸零）。
@@ -66,7 +67,9 @@ bridge 只用現有 public API，沒有為它新增任何會讀寫二進位資�
 | `install_thumb.py` | 註冊/移除 shell handler，逐副檔名記錄被取代的既有 CLSID |
 | `shellthumb/` | C++ shell 擴充：`IThumbnailProvider` + `IPropertyStore`，同一份 DLL 兩個 CLSID；`warmshell.exe` 把縮圖灌進 Windows thumbcache，`bench.exe` / `isolate.exe` 量測 |
 | `config.py` | 讀 `config.ini`，空值回退環境變數，再回退 `env_file`；由單一 `cache_dir` 推導所有路徑；並發參數做範圍檢查（0 或負數直接 `ConfigError`，不是靜靜跑一個壞值） |
-| `start.bat` | 啟動 bridge + `rclone mount` |
+| `mountctl.py` | 擁有 `rclone mount`：`ensure`（冪等，bridge 啟動後自己呼叫）、`stop`（`rclone rc core/quit`，**永不強殺**）、`check`/`status`。rclone 以 detached 行程啟動，bridge 重啟不會帶走 `H:`；log 在 `meta/rclone.log` |
+| `start.bat` | 啟動 bridge（已在跑就沿用），等 `H:` 掛好。掛載由 bridge 自己做（`[bridge] auto_mount`），磁碟代號只在 `config.ini` 一處 |
+| `stop.bat` | 固定順序：warmshell → `rclone core/quit` → bridge。任一步失敗就停在原地，不碰後面的（半停的系統還能讀完，被殺的不行） |
 | `restart.bat` | 只重啟 bridge（rclone 與 `H:` 不動），改完 Python 後的收尾 |
 
 `config.ini` 只有 `cache_dir` 一個路徑設定，底下的 `meta/` `rclone/` `local/` `staging/` `uploads/`

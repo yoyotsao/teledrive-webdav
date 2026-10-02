@@ -184,6 +184,38 @@ def walk(
             out.append((f"{path}/{entry.name}", entry))
 
 
+
+_ACTIVE_WARMERS: set = set()
+_ACTIVE_WARMERS_LOCK = threading.Lock()
+
+
+def _track_warmer(proc, active: bool) -> None:
+    with _ACTIVE_WARMERS_LOCK:
+        (_ACTIVE_WARMERS.add if active else _ACTIVE_WARMERS.discard)(proc)
+
+
+def stop_active_warmers(timeout: float = 5.0) -> bool:
+    """Kill every warmshell this process started; True when all are gone.
+
+    The launch gate is held while snapshotting, so a batch that is about to
+    spawn either appears in the snapshot or waits and then sees ``_stop``.
+    """
+    with _ACTIVE_WARMERS_LOCK:
+        procs = list(_ACTIVE_WARMERS)
+    for proc in procs:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    deadline = time.monotonic() + timeout
+    for proc in procs:
+        try:
+            proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            log.warning("warmshell pid %s did not exit after kill", proc.pid)
+            return False
+    return True
+
 class Warmer:
     """One pass over the tree, filling the caches the bridge serves from.
 
@@ -328,6 +360,7 @@ class Warmer:
                     # window alive after the bridge exits.
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
+                _track_warmer(proc, True)
         except (OSError, subprocess.SubprocessError) as exc:
             log.warning("shell warm failed to run: %s", exc)
             return 0, True
@@ -357,6 +390,7 @@ class Warmer:
         except (OSError, subprocess.SubprocessError) as exc:
             log.warning("shell warm failed to run: %s", exc)
             return 0, True
+        _track_warmer(proc, False)
         reported = _shell_report(err)
         warmed = sum(1 for ok in reported.values() if ok)
         if not wedged:
@@ -472,6 +506,10 @@ class BackgroundWarmup:
         self._stop.set()
         if self.converter is not None:
             self.converter.stop()
+        # A shell warm in flight is a child that would outlive this process, and
+        # an orphaned warmshell is the one thing that can pin the mount until a
+        # reboot. Take it down before anything below this line is torn down.
+        stop_active_warmers()
         if self._thread is not None:
             # Only long enough to leave the current batch; the thread is a daemon
             # and every cache it writes is complete after each batch anyway.

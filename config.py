@@ -43,6 +43,7 @@ class Config:
     host: str = "127.0.0.1"
     port: int = 8081
     mount_drive: str = "E:"
+    auto_mount: bool = True
     log_level: str = "INFO"
     cache_dir: Path = Path("data/meta")
     local_dir: Path = Path("data/local")
