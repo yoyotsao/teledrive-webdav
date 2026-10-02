@@ -1673,7 +1673,26 @@ def main(argv=None) -> int:
     # stopped) are exactly the ones you go looking for afterwards. Rotating
     # rather than truncating: a restart must not throw away the log of whatever
     # made you restart.
-    handlers: List[logging.Handler] = [logging.StreamHandler()]
+    # The console goes through a queue and its own thread. A console window can
+    # stall indefinitely (a click into it starts a text selection, which blocks
+    # every write until a key is pressed), and a log call made while holding a
+    # lock — ``UploadStager.touch`` does — would then freeze every thread that
+    # needs the same lock: PUTs trickled in at KB/s with the bridge otherwise
+    # idle. Overflow is dropped rather than blocked; bridge.log has everything.
+    import queue as _queue
+    from logging.handlers import QueueHandler, QueueListener
+
+    class _DropOnFull(QueueHandler):
+        def enqueue(self, record):
+            try:
+                self.queue.put_nowait(record)
+            except _queue.Full:
+                pass
+
+    console_queue: "_queue.Queue" = _queue.Queue(maxsize=10000)
+    console_listener = QueueListener(console_queue, logging.StreamHandler(), respect_handler_level=True)
+    console_listener.start()
+    handlers: List[logging.Handler] = [_DropOnFull(console_queue)]
     log_file = args.log_file if args.log_file is not None else cfg.cache_dir / "bridge.log"
     if str(log_file) != "-":
         from logging.handlers import RotatingFileHandler
@@ -1803,6 +1822,16 @@ def main(argv=None) -> int:
         'mount with: rclone mount :webdav,url="http://%s:%s",vendor=other: %s',
         cfg.host, cfg.port, cfg.mount_drive,
     )
+    if cfg.auto_mount:
+        # Once the bridge is serving, make sure the drive is there. Idempotent:
+        # an rclone that is already up (it outlives bridge restarts on purpose)
+        # is left alone. Off the main thread because the mount waits on us.
+        import mountctl
+
+        threading.Thread(
+            target=lambda: mountctl.ensure_mounted(cfg), name="automount", daemon=True
+        ).start()
+    _install_console_close_handler(server)
     try:
         server.start()
     except KeyboardInterrupt:
@@ -1822,29 +1851,11 @@ def main(argv=None) -> int:
                     sender.stop()
                     launcher.save_all()
                 finally:
-    if cfg.auto_mount:
-        # Once the bridge is serving, make sure the drive is there. Idempotent:
-        # an rclone that is already up (it outlives bridge restarts on purpose)
-        # is left alone. Off the main thread because the mount waits on us.
-        import mountctl
-
-        threading.Thread(
-            target=lambda: mountctl.ensure_mounted(cfg), name="automount", daemon=True
-        ).start()
-    _install_console_close_handler(server)
                     pool.stop()
                     session_lock.release()
     return 0
 
 
-def _finish_playtime_session(service, launcher, session):
-    service.finish(session)
-    with launcher._lock:
-        launcher.sessions.pop(session.session_id, None)
-
-
-if __name__ == "__main__":
-    sys.exit(main())
 def _install_console_close_handler(server) -> None:
     """Make closing the console window shut down like Ctrl+C does.
 
@@ -1877,3 +1888,11 @@ def _install_console_close_handler(server) -> None:
 _CONSOLE_HANDLER = None
 
 
+def _finish_playtime_session(service, launcher, session):
+    service.finish(session)
+    with launcher._lock:
+        launcher.sessions.pop(session.session_id, None)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
