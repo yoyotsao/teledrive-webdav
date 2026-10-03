@@ -93,6 +93,14 @@ backend 的垃圾桶端點，跟路徑本身無關：
   覆寫既有檔案也走這條路（`RemoteFileResource.begin_write`）——backend 沒有
   `UNIQUE(filename, parent_id)`，所以覆寫就是用新內容再註冊一筆同名 row，
   新舊都在、讀取時新的蓋掉舊的（既有的「同名檔案」規則，見「已知限制」第 5 點）。
+  **等待時間兩邊分開，而且都從 PUT 結束才起算**：一般路徑是 `[upload] debounce_seconds`
+  （10 秒），`/game` 是 `[game] debounce_minutes`（5 分鐘）。兩個 stager
+  （`UploadStager` / `GameStager`）都在 pending record 上用 `writers` 計數擋住進行中的 PUT
+  （`begin_write` +1、`end_write` -1，`_due` 對 `writers > 0` 一律不算到期；計數而非布林，
+  rclone 重試與原請求重疊時一個結束不會解除另一個的保護）。PUT 失敗
+  （`end_write(ok=False)`）就丟掉那份半成品——它從來不是完整副本，不違反「暫存是唯一副本」；
+  `/game` 只刪那一個檔，不動整個 unit。`gamestage.WRITER_STALE_SECONDS`（1 小時）是 thread
+  沒走到 `end_write` 時的保險，`_adopt_leftovers` 重建的 record `writers` 一律是 0。
 - **`DELETE`** 能不能做，看的是「這個名字現在解析到的是本機還沒上傳的暫存，
   還是 backend 已經註冊過的真實資料」，跟在不在 `/game` 底下無關——`/game` 跟
   一般路徑的差別只在上傳前有沒有先打包成 zip，不是刪除能力本身的分界。

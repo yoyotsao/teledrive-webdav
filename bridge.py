@@ -759,6 +759,20 @@ class _ReadOnlyFile(DAVNonCollection):
         raise DAVError(HTTP_FORBIDDEN, "already uploaded — TeleDrive has no copy/rename endpoint for this.")
 
 
+def _close_quietly(handle) -> None:
+    """Release a write handle wsgidav may have left open.
+
+    On a failed byte copy wsgidav calls ``end_write`` without closing the file,
+    and Windows will not unlink a file that is still open — the partial would
+    survive on disk with no record and be adopted as complete on next start.
+    """
+    if handle is not None:
+        try:
+            handle.close()
+        except OSError:
+            pass
+
+
 class RemoteFileResource(_ReadOnlyFile):
     def __init__(self, path, environ, resolver: Resolver, entry: Entry):
         self.resolver = resolver
@@ -779,13 +793,19 @@ class RemoteFileResource(_ReadOnlyFile):
         self._upload_segments = split_dav_path(self.path)
         parent = self.resolver.api.resolve(self._upload_segments[:-1]) if len(self._upload_segments) > 1 else None
         self._upload_parent_id = parent.file_id if parent is not None else None
-        local = self.resolver.upload_stager.create_file(self._upload_segments, self._upload_parent_id)
-        return local.open("wb")
+        stager = self.resolver.upload_stager
+        local = stager.create_file(self._upload_segments, self._upload_parent_id)
+        stager.begin_write(self._upload_segments, self._upload_parent_id)
+        self._write_handle = local.open("wb")
+        return self._write_handle
 
     def end_write(self, *, with_errors):
-        if with_errors or self.resolver.upload_stager is None:
+        _close_quietly(getattr(self, "_write_handle", None))
+        if self.resolver.upload_stager is None:
             return
-        self.resolver.upload_stager.touch(self._upload_segments, self._upload_parent_id)
+        self.resolver.upload_stager.end_write(
+            self._upload_segments, self._upload_parent_id, ok=not with_errors
+        )
 
     def delete(self):
         self.resolver.api.trash(self.entry.file_id, self.entry.parent_id)
@@ -1157,13 +1177,15 @@ class StagingFileResource(_StagingCopyMove, DAVNonCollection):
 
     def begin_write(self, *, content_type=None):
         self.local.parent.mkdir(parents=True, exist_ok=True)
-        self.stager.touch(self.top)
-        return self.local.open("wb")
+        self.stager.begin_write(self.top)
+        self._write_handle = self.local.open("wb")
+        return self._write_handle
 
     def end_write(self, *, with_errors):
+        _close_quietly(getattr(self, "_write_handle", None))
         if with_errors:
-            log.warning("PUT failed for %s — leaving the partial file in staging", self.local)
-        self.stager.touch(self.top)
+            log.warning("PUT failed for %s — discarding the partial file", self.local)
+        self.stager.end_write(self.top, self.local, ok=not with_errors)
 
     def set_last_modified(self, dest_path, time_stamp, *, dry_run):
         if not dry_run:
@@ -1239,13 +1261,15 @@ class UploadFileResource(DAVNonCollection):
 
     def begin_write(self, *, content_type=None):
         self.local.parent.mkdir(parents=True, exist_ok=True)
-        self.upload_stager.touch(self.segments, self.parent_id)
-        return self.local.open("wb")
+        self.upload_stager.begin_write(self.segments, self.parent_id)
+        self._write_handle = self.local.open("wb")
+        return self._write_handle
 
     def end_write(self, *, with_errors):
+        _close_quietly(getattr(self, "_write_handle", None))
         if with_errors:
-            log.warning("PUT failed for %s — leaving the partial file staged", self.local)
-        self.upload_stager.touch(self.segments, self.parent_id)
+            log.warning("PUT failed for %s — discarding the partial file", self.local)
+        self.upload_stager.end_write(self.segments, self.parent_id, ok=not with_errors)
 
     def delete(self):
         try:

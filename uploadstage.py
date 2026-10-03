@@ -1,7 +1,7 @@
 """Plain writes outside /game: land locally, debounce, then upload as-is.
 
 Mirrors gamestage.py's staging model file for file: a write lands under
-``upload_dir`` first, and once quiet for ``debounce_minutes`` it is uploaded
+``upload_dir`` first, and once quiet for ``upload_debounce_seconds`` it is uploaded
 to Telegram and registered with TeleDrive. The differences are only what
 follows from there being no packing step:
 
@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from config import ext_path as _ext
-from gamestage import MAX_ATTEMPTS, RETRY_SECONDS, TICK_SECONDS
+from gamestage import MAX_ATTEMPTS, RETRY_SECONDS, TICK_SECONDS, WRITER_STALE_SECONDS
 from transfer_models import QueueStage, TransferRequest
 from upload_engine import guess_mime_type, redact
 
@@ -64,6 +64,8 @@ class PendingUpload:
     retry_after: float = 0.0
     detail: str = ""
     accounts: Tuple[int, ...] = ()
+    writers: int = 0
+    writer_started: float = 0.0
 
     @property
     def name(self) -> str:
@@ -219,6 +221,42 @@ class UploadStager:
                 unit.detail = detail
         self._save()
 
+    def begin_write(self, segments: Sequence[str], parent_id: Optional[str] = None) -> None:
+        """A PUT for this file has started: it cannot be due until it ends."""
+        self.touch(segments, parent_id)
+        with self._lock:
+            pending = self._pending.get(tuple(segments))
+            if pending is not None:
+                if pending.writers == 0:
+                    pending.writer_started = time.monotonic()
+                pending.writers += 1
+
+    def end_write(self, segments: Sequence[str], parent_id: Optional[str] = None, *, ok: bool) -> None:
+        """The PUT ended. The quiet window restarts now, not when it began.
+
+        A failed PUT leaves a truncated file that was never a complete copy of
+        anything, so it is discarded rather than left for the debounce to
+        upload — unless another PUT is still writing the same file.
+        """
+        key = tuple(segments)
+        discard = False
+        with self._lock:
+            pending = self._pending.get(key)
+            if pending is not None and pending.writers > 0:
+                pending.writers -= 1
+            if not ok and (pending is None or pending.writers == 0):
+                discard = True
+        if discard:
+            path = self.path_for(key)
+            if path is not None:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            self.forget(key)
+            return
+        self.touch(key, parent_id)
+
     def status_for(self, segments: Sequence[str]) -> Optional[dict]:
         unit = self.get(segments)
         if unit is None:
@@ -307,6 +345,7 @@ class UploadStager:
                     "idle_seconds": round(now - p.last_write, 1),
                     "attempts": p.attempts,
                     "accounts": list(p.accounts),
+                    "writers": p.writers,
                     "detail": p.detail,
                 }
                 for p in self._pending.values()
@@ -314,13 +353,13 @@ class UploadStager:
         scheduler_status = getattr(self.engine, "scheduler_status", None)
         schedulers = scheduler_status() if callable(scheduler_status) else []
         return {
-            "debounce_minutes": self.cfg.debounce_minutes,
+            "debounce_seconds": self.cfg.upload_debounce_seconds,
             "pending": pending,
             "schedulers": schedulers,
         }
 
     def _loop(self) -> None:
-        debounce = self.cfg.debounce_minutes * 60
+        debounce = self.cfg.upload_debounce_seconds
         while not self._stop.wait(TICK_SECONDS):
             try:
                 due = self._due(debounce)
@@ -343,6 +382,8 @@ class UploadStager:
                 if pending.stage not in (QueueStage.STAGING, QueueStage.FAILED):
                     continue
                 if pending.stage is QueueStage.FAILED and now < pending.retry_after:
+                    continue
+                if pending.writers > 0 and now - pending.writer_started < WRITER_STALE_SECONDS:
                     continue
                 if now - pending.last_write >= debounce:
                     pending.stage = QueueStage.UPLOADING

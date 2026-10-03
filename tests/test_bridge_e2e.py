@@ -467,6 +467,13 @@ class Rig:
     def request(self, method, path, **kw):
         return requests.request(method, self.base + path, timeout=30, **kw)
 
+    def resource(self, path):
+        """The DAV resource for ``path``, to drive begin_write/end_write directly."""
+        provider = bridge.TeleDriveProvider(self.resolver)
+        provider.set_share_path("")
+        environ = {"wsgidav.provider": provider, "wsgidav.config": {}}
+        return provider.get_resource_inst(path, environ)
+
     def propfind(self, path, depth="1"):
         return self.request("PROPFIND", path, headers={"Depth": depth})
 
@@ -543,7 +550,7 @@ def rig(tmp_path):
         local_dir=tmp_path / "local",
         staging_dir=tmp_path / "staging",
         upload_dir=tmp_path / "uploads",
-        debounce_minutes=0.0,
+        debounce_minutes=0.0, upload_debounce_seconds=0.0,
     )
     for path in (cfg.cache_dir, cfg.local_dir, cfg.staging_dir, cfg.pack_dir, cfg.upload_dir):
         path.mkdir(parents=True, exist_ok=True)
@@ -2117,3 +2124,57 @@ def test_shell_warm_paths_are_absolute_when_warming_a_subtree(rig):
     photos = rig.entry_for("photos")
     files, _ = warmer.pending(photos.file_id, "/photos")
     assert warmer.shell_paths(files) == [rig.cfg.mount_drive + r"\photos\shot.png"]
+
+
+def test_a_put_that_is_still_writing_is_not_uploaded(rig):
+    assert rig.request("PUT", "/photos/inflight.bin", data=b"first").status_code == 201
+    resource = rig.resource("/photos/inflight.bin")
+    resource.begin_write().close()
+    try:
+        assert ("photos", "inflight.bin") not in rig.upload_stager._due(0.0)
+    finally:
+        resource.end_write(with_errors=False)
+    assert ("photos", "inflight.bin") in rig.upload_stager._due(0.0)
+
+
+def test_a_failed_put_leaves_nothing_to_upload(rig):
+    assert rig.request("PUT", "/photos/torn.bin", data=b"ok").status_code == 201
+    resource = rig.resource("/photos/torn.bin")
+    out = resource.begin_write()
+    out.write(b"par")
+    # wsgidav never closes the handle when the byte copy raises; on Windows an
+    # open file cannot be unlinked, so end_write must release it itself.
+    resource.end_write(with_errors=True)
+    assert rig.upload_stager.get(("photos", "torn.bin")) is None
+    assert not rig.upload_stager.path_for(("photos", "torn.bin")).exists()
+    out.close()
+    assert ("photos", "torn.bin") not in rig.upload_stager._due(0.0)
+
+
+def test_overwriting_an_uploaded_file_is_protected_while_it_writes(rig):
+    resource = rig.resource("/photos/small.txt")  # registered in the fake backend
+    resource.begin_write().close()
+    assert ("photos", "small.txt") not in rig.upload_stager._due(0.0)
+    resource.end_write(with_errors=False)
+    assert ("photos", "small.txt") in rig.upload_stager._due(0.0)
+
+
+def test_a_failed_overwrite_leaves_nothing_to_upload(rig):
+    resource = rig.resource("/photos/small.txt")
+    out = resource.begin_write()
+    resource.end_write(with_errors=True)
+    assert rig.upload_stager.get(("photos", "small.txt")) is None
+    assert not rig.upload_stager.path_for(("photos", "small.txt")).exists()
+    out.close()
+
+
+def test_a_failed_put_inside_game_removes_its_partial_file(rig):
+    assert rig.request("MKCOL", "/game/Torn").status_code == 201
+    assert rig.request("PUT", "/game/Torn/a.bin", data=b"ok").status_code == 201
+    resource = rig.resource("/game/Torn/a.bin")
+    out = resource.begin_write()
+    out.write(b"par")
+    resource.end_write(with_errors=True)
+    assert not (rig.cfg.staging_dir / "Torn" / "a.bin").exists()
+    out.close()
+

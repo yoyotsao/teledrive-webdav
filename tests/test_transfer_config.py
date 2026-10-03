@@ -69,3 +69,19 @@ def test_primary_user_id_must_be_positive(tmp_path):
     path.write_text(text, encoding="utf-8")
     with pytest.raises(ConfigError, match="primary_user_id"):
         load_config(path)
+
+
+def test_upload_debounce_is_separate_from_game_debounce(tmp_path, monkeypatch):
+    cfg = load_minimal_config(tmp_path, monkeypatch)
+    assert cfg.upload_debounce_seconds == 10.0
+    assert cfg.debounce_minutes == 5.0  # /game is untouched
+
+
+def test_upload_debounce_can_be_set_and_must_be_positive(tmp_path, monkeypatch):
+    monkeypatch.delenv("TELEGRAM_API_ID", raising=False)
+    monkeypatch.delenv("TELEGRAM_API_HASH", raising=False)
+    monkeypatch.delenv("TELEGRAM_SESSION_STRING", raising=False)
+    cfg = load_config(write_config(tmp_path, "[upload]\ndebounce_seconds = 3\n"))
+    assert cfg.upload_debounce_seconds == 3.0
+    with pytest.raises(ConfigError):
+        load_config(write_config(tmp_path, "[upload]\ndebounce_seconds = 0\n"))

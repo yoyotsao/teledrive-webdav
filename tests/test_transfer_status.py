@@ -73,7 +73,7 @@ def cfg(tmp_path):
         mount_drive="E:", log_level="WARNING",
         cache_dir=tmp_path / "cache", local_dir=tmp_path / "local",
         staging_dir=tmp_path / "staging", upload_dir=tmp_path / "uploads",
-        debounce_minutes=0.0,
+        debounce_minutes=0.0, upload_debounce_seconds=0.0,
     )
     for path in (built.cache_dir, built.local_dir, built.staging_dir, built.pack_dir, built.upload_dir):
         path.mkdir(parents=True, exist_ok=True)
