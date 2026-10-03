@@ -78,6 +78,13 @@ class FakeWorker:
         blob = self.messages[message_id]
         return blob[offset : offset + length]
 
+    def submit_chunk(self, message_id: int, expected_file_id: str, offset: int, expected_size=None):
+        from concurrent.futures import Future
+
+        fut = Future()
+        fut.set_result(self.read(message_id, expected_file_id, offset, 512 * 1024, expected_size))
+        return fut
+
     def set_thumb(self, message_id: int, data: bytes) -> None:
         self.thumbs[message_id] = data
 

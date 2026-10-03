@@ -36,9 +36,14 @@ class Reader(io.BytesIO):
         super().__init__(data)
         self._log = log
 
-    def seek(self, pos, whence=0):
-        self._log.append(("seek", pos))
-        return super().seek(pos, whence)
+    def iter_stream(self, start=0):
+        self._log.append(("seek", start))
+        self.seek(start)
+        while True:
+            chunk = self.read(zipfetch.COPY_CHUNK)
+            if not chunk:
+                return
+            yield chunk
 
 
 class Rig:

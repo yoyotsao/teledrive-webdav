@@ -164,13 +164,11 @@ def fetch_archive(
         try:
             source = resolver.open_remote(entry)
             try:
-                if have:
-                    source.seek(have)
                 with open(ext_path(part), "ab" if have else "wb") as out:
-                    while have + downloaded < total:
-                        chunk = source.read(COPY_CHUNK)
-                        if not chunk:
-                            break
+                    # Sliding window over the whole archive: one request completes,
+                    # the next goes out, instead of 8 MiB batches that each wait
+                    # for their slowest chunk.
+                    for chunk in source.iter_stream(have):
                         out.write(chunk)
                         downloaded += len(chunk)
                         now = time.monotonic()

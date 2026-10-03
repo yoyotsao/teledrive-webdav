@@ -23,7 +23,7 @@ import logging
 import mimetypes
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
@@ -130,6 +130,13 @@ BLOCKS_CACHED = DOWNLOAD_CONNECTIONS * READS_IN_FLIGHT
 # per-connection depth is the point, and this is where it comes from.
 STREAM_BLOCK_SIZE = REQUEST_SIZE * DOWNLOAD_CONNECTIONS * READS_IN_FLIGHT
 
+# Requests kept outstanding by a sequential bulk download (SeekableRemoteFile.
+# iter_stream). A read() batch waits for its slowest chunk before the next one
+# starts, so every batch boundary drains the pipe; a sliding window tops it up
+# by one the moment any chunk lands. 16 is the ceiling already measured not to
+# draw FLOOD_WAIT (8 connections x 2) -- more did.
+STREAM_WINDOW = DOWNLOAD_CONNECTIONS * READS_IN_FLIGHT
+
 # Same split boundary as the browser uploader: MAX_PARTS (1000) x CHUNK_SIZE
 # (512 KB) = 500 MiB, see frontend/src/lib/gramjs.ts:502 and frontend config.ts.
 # Not 512 MiB — that would exceed the browser's 1000-part-per-message ceiling.
@@ -191,6 +198,13 @@ def _assert_media_id(
         raise RemoteIdentityError(
             f"Telegram file mismatch: expected {expected_file_id}, got {actual}"
         )
+
+
+def read_part_chunk(pool, part: RemotePart, offset: int):
+    """Future for one REQUEST_SIZE chunk of a routed part (see ``submit_chunk``)."""
+    return pool.for_read(part.telegram_user_id).worker.submit_chunk(
+        part.message_id, part.file_id, offset, expected_size=part.size
+    )
 
 
 def read_part(pool, part: RemotePart, offset: int, length: int) -> bytes:
@@ -884,6 +898,26 @@ class TelegramWorker:
             )
             return self.run(self._read(doc, offset, length))
 
+    def submit_chunk(self, message_id: int, expected_file_id: str, offset: int, expected_size: Optional[int] = None):
+        """Start one REQUEST_SIZE read and return its ``concurrent.futures.Future``.
+
+        The caller owns the pacing: it keeps N of these outstanding and consumes
+        them in order (a sliding window), instead of handing ``read`` a whole
+        batch that must finish before the next can start.
+        """
+        doc = self.get_document(message_id, expected_file_id, expected_size=expected_size)
+
+        async def go():
+            pool = await self._download_pool()
+            return await self._chunk(self._next_client(pool), doc, offset)
+
+        return asyncio.run_coroutine_threadsafe(go(), self._loop)
+
+    def refresh_document(self, message_id: int, expected_file_id: str, expected_size: Optional[int] = None) -> None:
+        """Re-fetch the Document so a new file_reference is used (after expiry)."""
+        log.warning("file_reference expired for message %s — refetching", message_id)
+        self.get_document(message_id, expected_file_id, refresh=True, expected_size=expected_size)
+
     async def _read(self, doc, offset: int, length: int) -> bytes:
         """Fetch a range as REQUEST_SIZE chunks, one per pooled connection.
 
@@ -969,6 +1003,28 @@ class TelegramWorker:
             log.warning("could not pin a sender for DC %s: %s", dc_id, exc)
 
     async def _chunk(self, client, doc, offset: int) -> bytes:
+        """One REQUEST_SIZE read, timed into the periodic ``chunk timing`` line."""
+        t0 = time.monotonic()
+        try:
+            return await self._chunk_untimed(client, doc, offset)
+        finally:
+            self._note_chunk(time.monotonic() - t0)
+
+    def _note_chunk(self, seconds: float) -> None:
+        """Log chunk latency every 10s: in-flight depth = chunks/s x mean latency."""
+        st = self.__dict__.setdefault("_chunk_stats", [0, 0.0, 0.0, time.monotonic()])
+        st[0] += 1
+        st[1] += seconds
+        st[2] = max(st[2], seconds)
+        now = time.monotonic()
+        if now - st[3] >= 10:
+            log.info(
+                "chunk timing: %s chunks in %.0fs mean=%.0fms max=%.0fms",
+                st[0], now - st[3], st[1] / st[0] * 1000, st[2] * 1000,
+            )
+            st[:] = [0, 0.0, 0.0, now]
+
+    async def _chunk_untimed(self, client, doc, offset: int) -> bytes:
         """One REQUEST_SIZE read. Short only at end of file."""
         attempt = 0
         while True:
@@ -1683,6 +1739,79 @@ class SeekableRemoteFile(io.RawIOBase):
         while len(self._blocks) > self._blocks_cached:
             self._blocks.popitem(last=False)
         return found
+
+    def iter_stream(self, start: int = 0, *, window: int = STREAM_WINDOW):
+        """Yield the file from ``start`` to the end as in-order chunks, sliding window.
+
+        Keeps ``window`` chunk requests outstanding and submits the next one as
+        soon as the oldest is consumed, so the pipe is never drained at a batch
+        boundary. Meant for one sequential pass (bulk download); random access
+        should keep using ``read``.
+        """
+        if start < 0 or start >= self._total:
+            return
+        queue = deque()  # (future, part_index, offset_in_part, want, skip)
+        cursor = [self._locate(start)]  # (part index, offset in part) of next chunk to submit
+        skip_first = start - (self._table[cursor[0][0]].start + cursor[0][1])
+
+        def submit():
+            index, inner = cursor[0]
+            if index >= len(self._table):
+                return False
+            part = self._table[index]
+            want = min(REQUEST_SIZE, part.size - inner)
+            fut = read_part_chunk(self._pool, part.remote, inner)
+            queue.append((fut, index, inner, want))
+            inner += want
+            cursor[0] = (index, inner) if inner < part.size else (index + 1, 0)
+            return True
+
+        try:
+            while len(queue) < window and submit():
+                pass
+            first = True
+            while queue:
+                fut, index, inner, want = queue[0]
+                try:
+                    data = fut.result()
+                except Exception as exc:
+                    if not _is_file_reference_error(exc):
+                        raise
+                    # Expired reference: every outstanding request used it. Drop
+                    # them, refresh once, and restart the window at this chunk.
+                    for item in queue:
+                        item[0].cancel()
+                    queue.clear()
+                    part = self._table[index]
+                    self._pool.for_read(part.remote.telegram_user_id).worker.refresh_document(
+                        part.message_id, part.remote.file_id, expected_size=part.remote.size
+                    )
+                    cursor[0] = (index, inner)
+                    while len(queue) < window and submit():
+                        pass
+                    continue
+                if len(data) != want:
+                    raise OSError(
+                        f"short read from Telegram: wanted {want} bytes at part {index} offset {inner}, got {len(data)}"
+                    )
+                queue.popleft()
+                submit()
+                if first:
+                    first = False
+                    data = data[skip_first:]
+                if data:
+                    yield data
+        finally:
+            for item in queue:
+                item[0].cancel()
+
+    def _locate(self, offset: int):
+        """(part index, REQUEST_SIZE-aligned offset inside that part) covering ``offset``."""
+        for index, part in enumerate(self._table):
+            if offset < part.start + part.size:
+                inner = offset - part.start
+                return index, inner - (inner % REQUEST_SIZE)
+        return len(self._table), 0
 
     def _fetch(self, offset: int, length: int) -> bytes:
         out = bytearray()
