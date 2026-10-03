@@ -26,7 +26,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, List, Optional
 
+import zipfetch
 from config import ext_path
+from upload_engine import redact
 
 log = logging.getLogger("fetchlocal")
 
@@ -170,6 +172,20 @@ class LocalFetcher:
             yield f"OK {root}"
             return
 
+        if loc.kind == bridge.ZIPDIR and loc.view is not None and loc.node is loc.view.root:
+            # Whole archive: one sequential read + local unpack beats one cold
+            # reader (and one Telegram round trip) per member.
+            yield from zipfetch.fetch_archive(
+                resolver=self.resolver,
+                entry=loc.entry,
+                view=loc.view,
+                base=root,
+                local_dir=self.cfg.local_dir,
+                skip_existing=skip_existing,
+                cancel=cancel,
+            )
+            return
+
         done = 0
         last = 0.0
         started = time.monotonic()
@@ -243,6 +259,14 @@ class LocalFetcher:
             yield "CANCELLED download cancelled"
             return
         elapsed = time.monotonic() - started
+        log.info(
+            "%s",
+            redact(
+                f"download complete files={len(items)} bytes={total} mode=per-member "
+                f"download_ms={int(elapsed * 1000)} extract_ms=0 total_ms={int(elapsed * 1000)} "
+                f"MiB/s={total / 1048576 / max(elapsed, 0.001):.2f}"
+            ),
+        )
         yield f"PROGRESS {total} {total} {len(items)}/{len(items)} done"
         yield f"done in {elapsed:.0f}s ({human(total / max(elapsed, 0.001))}/s)"
         yield f"OK {root}"
