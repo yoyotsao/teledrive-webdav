@@ -61,6 +61,25 @@ def _unlink(path: Path) -> None:
         pass
 
 
+_FORBIDDEN = re.compile(r'[<>"|?*\x00-\x1f]')
+
+
+def _safe_rel(rel: str) -> str:
+    """Windows cannot hold ``<>"|?*`` or a trailing dot/space in a name.
+
+    Archives written in another codepage show up as mojibake that contains such
+    characters (``|`` is common), so the name is mapped instead of failing the
+    whole game. Names that are already valid are untouched.
+    """
+    out = []
+    for seg in rel.split("/"):
+        seg = _FORBIDDEN.sub("_", seg)
+        if seg.endswith(".") or seg.endswith(" "):
+            seg = seg.rstrip(". ") + "_"
+        out.append(seg)
+    return "/".join(out)
+
+
 def _extract_one(zf: zipfile.ZipFile, node, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(dest.name + ".part")
@@ -69,7 +88,10 @@ def _extract_one(zf: zipfile.ZipFile, node, dest: Path) -> None:
             shutil.copyfileobj(src, out, COPY_CHUNK)
         os.replace(ext_path(tmp), ext_path(dest))
     except BaseException:
-        _unlink(tmp)
+        try:
+            _unlink(tmp)
+        except OSError:
+            pass  # never let cleanup hide the error that got us here
         raise
 
 
@@ -186,7 +208,7 @@ def fetch_archive(
             root = base.resolve()
             targets = []
             for rel, node in members:
-                dest = base / rel
+                dest = base / _safe_rel(rel)
                 if root not in dest.resolve().parents:
                     yield f"ERROR unsafe path in archive: {rel!r}"
                     return

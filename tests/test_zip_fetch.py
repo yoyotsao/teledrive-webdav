@@ -263,3 +263,28 @@ def test_fetch_segments_routes_archive_root_whole_and_subfolder_per_member(tmp_p
     calls.clear()
     lines = fetch(root.children["bin"])
     assert lines[-1].startswith("OK ") and calls == [] and opened == ["game.exe"]
+
+
+def test_members_with_characters_windows_forbids_are_extracted_under_a_safe_name(tmp_path):
+    # mojibake from a Shift-JIS archive read as cp437 puts '|' and friends in names
+    members = {"img/ä|b_CLEAR.png": b"1", 'q?/we"ird*.txt': b"2", "dot./trail .txt": b"3"}
+    rig = Rig(tmp_path, make_zip(members))
+    lines = rig.run()
+    assert lines[-1].startswith("OK "), lines
+    found = sorted(p.relative_to(rig.base).as_posix() for p in rig.base.rglob("*") if p.is_file())
+    assert found == ["dot_/trail .txt", "img/ä_b_CLEAR.png", "q_/we_ird_.txt"]
+
+
+def test_cleanup_failure_does_not_mask_the_real_extract_error(tmp_path, monkeypatch):
+    rig = Rig(tmp_path, make_zip())
+    real_unlink = zipfetch.os.unlink
+
+    def unlink(p):
+        if str(p).endswith(".txt.part"):
+            raise OSError(123, "bad name")
+        real_unlink(p)
+
+    monkeypatch.setattr(zipfetch.os, "unlink", unlink)
+    monkeypatch.setattr(zipfetch.shutil, "copyfileobj", lambda *a, **k: (_ for _ in ()).throw(OSError(22, "Invalid argument")))
+    lines = rig.run()
+    assert lines[-1].startswith("ERROR") and "Invalid argument" in lines[-1], lines
