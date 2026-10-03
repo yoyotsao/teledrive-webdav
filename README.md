@@ -59,8 +59,8 @@ session_dir = D:\TeleDriveSessions
 | 設定 | 預設 | 意思 |
 |---|---|---|
 | `cache_dir` | `E:\teledrive` | **所有東西**都放這裡（快取、取回的檔案、暫存）。要指到空間夠的碟。 |
-| `mount_drive` | `H:` | 要掛成哪個磁碟機代號。**改了的話 `start.bat` 裡的 `MOUNT=` 也要一起改。** |
-| `debounce_minutes` | `5` | 丟進 `H:\game\` 的資料夾靜置多久算「搬完了」，然後開始打包 |
+| `mount_drive` | `H:` | 要掛成哪個磁碟機代號。只在 `config.ini` 設一處，bridge 自己掛載。 |
+| `debounce_minutes` | `5` | 丟進 `H:\game\` 的資料夾靜置多久算「搬完了」，然後開始打包。只管 `/game`；其他資料夾的檔案用 `[upload] debounce_seconds`（預設 10 秒，寫完後再等這麼久才上傳） |
 
 ### 3. 建立 Telegram SQLite session
 
@@ -214,7 +214,7 @@ Windows 的縮圖與屬性處理是**依副檔名**註冊的，沒有「只對�
 ### 把遊戲存上去
 
 1. 把整個 `<遊戲名>` 資料夾拖進 `H:\game\`
-2. 等 5 分鐘（`debounce_minutes`）沒有新的寫入，它就會自動打包上傳
+2. 等 5 分鐘（`debounce_minutes`）沒有新的寫入（複製還在進行中不會被打包），它就會自動打包上傳
 3. 上傳完之後，`H:\game\<遊戲名>\` 還是一個資料夾，裡面每個檔案都看得到、也能單獨取回
 
 已經上傳過的名字不能再改（往裡面寫會被拒絕）。要更新的話，先去網頁把那個 `.zip` 刪掉，或換個名字。
@@ -242,7 +242,7 @@ Windows 的縮圖與屬性處理是**依副檔名**註冊的，沒有「只對�
 - 訊息裡有 `rclone is not on PATH` → rclone 沒裝好，或裝完沒重開 PowerShell
 - 訊息裡有 `bridge did not come up` → 執行 `.venv\Scripts\python.exe bridge.py`，
   視窗裡會直接印出原因（通常是 config.ini 或憑證的問題）
-- `H:` 已經被別的東西佔用 → 改 `config.ini` 的 `mount_drive` 和 `start.bat` 的 `MOUNT=`，兩邊要一致
+- `H:` 已經被別的東西佔用 → 改 `config.ini` 的 `mount_drive`（只有這一處）
 
 ### 瀏覽變慢、縮圖跑不出來
 

@@ -759,6 +759,20 @@ class _ReadOnlyFile(DAVNonCollection):
         raise DAVError(HTTP_FORBIDDEN, "already uploaded — TeleDrive has no copy/rename endpoint for this.")
 
 
+def _close_quietly(handle) -> None:
+    """Release a write handle wsgidav may have left open.
+
+    On a failed byte copy wsgidav calls ``end_write`` without closing the file,
+    and Windows will not unlink a file that is still open — the partial would
+    survive on disk with no record and be adopted as complete on next start.
+    """
+    if handle is not None:
+        try:
+            handle.close()
+        except OSError:
+            pass
+
+
 class RemoteFileResource(_ReadOnlyFile):
     def __init__(self, path, environ, resolver: Resolver, entry: Entry):
         self.resolver = resolver
@@ -779,13 +793,19 @@ class RemoteFileResource(_ReadOnlyFile):
         self._upload_segments = split_dav_path(self.path)
         parent = self.resolver.api.resolve(self._upload_segments[:-1]) if len(self._upload_segments) > 1 else None
         self._upload_parent_id = parent.file_id if parent is not None else None
-        local = self.resolver.upload_stager.create_file(self._upload_segments, self._upload_parent_id)
-        return local.open("wb")
+        stager = self.resolver.upload_stager
+        local = stager.create_file(self._upload_segments, self._upload_parent_id)
+        stager.begin_write(self._upload_segments, self._upload_parent_id)
+        self._write_handle = local.open("wb")
+        return self._write_handle
 
     def end_write(self, *, with_errors):
-        if with_errors or self.resolver.upload_stager is None:
+        _close_quietly(getattr(self, "_write_handle", None))
+        if self.resolver.upload_stager is None:
             return
-        self.resolver.upload_stager.touch(self._upload_segments, self._upload_parent_id)
+        self.resolver.upload_stager.end_write(
+            self._upload_segments, self._upload_parent_id, ok=not with_errors
+        )
 
     def delete(self):
         self.resolver.api.trash(self.entry.file_id, self.entry.parent_id)
@@ -1157,13 +1177,15 @@ class StagingFileResource(_StagingCopyMove, DAVNonCollection):
 
     def begin_write(self, *, content_type=None):
         self.local.parent.mkdir(parents=True, exist_ok=True)
-        self.stager.touch(self.top)
-        return self.local.open("wb")
+        self.stager.begin_write(self.top)
+        self._write_handle = self.local.open("wb")
+        return self._write_handle
 
     def end_write(self, *, with_errors):
+        _close_quietly(getattr(self, "_write_handle", None))
         if with_errors:
-            log.warning("PUT failed for %s — leaving the partial file in staging", self.local)
-        self.stager.touch(self.top)
+            log.warning("PUT failed for %s — discarding the partial file", self.local)
+        self.stager.end_write(self.top, self.local, ok=not with_errors)
 
     def set_last_modified(self, dest_path, time_stamp, *, dry_run):
         if not dry_run:
@@ -1239,13 +1261,15 @@ class UploadFileResource(DAVNonCollection):
 
     def begin_write(self, *, content_type=None):
         self.local.parent.mkdir(parents=True, exist_ok=True)
-        self.upload_stager.touch(self.segments, self.parent_id)
-        return self.local.open("wb")
+        self.upload_stager.begin_write(self.segments, self.parent_id)
+        self._write_handle = self.local.open("wb")
+        return self._write_handle
 
     def end_write(self, *, with_errors):
+        _close_quietly(getattr(self, "_write_handle", None))
         if with_errors:
-            log.warning("PUT failed for %s — leaving the partial file staged", self.local)
-        self.upload_stager.touch(self.segments, self.parent_id)
+            log.warning("PUT failed for %s — discarding the partial file", self.local)
+        self.upload_stager.end_write(self.segments, self.parent_id, ok=not with_errors)
 
     def delete(self):
         try:
@@ -1673,7 +1697,26 @@ def main(argv=None) -> int:
     # stopped) are exactly the ones you go looking for afterwards. Rotating
     # rather than truncating: a restart must not throw away the log of whatever
     # made you restart.
-    handlers: List[logging.Handler] = [logging.StreamHandler()]
+    # The console goes through a queue and its own thread. A console window can
+    # stall indefinitely (a click into it starts a text selection, which blocks
+    # every write until a key is pressed), and a log call made while holding a
+    # lock — ``UploadStager.touch`` does — would then freeze every thread that
+    # needs the same lock: PUTs trickled in at KB/s with the bridge otherwise
+    # idle. Overflow is dropped rather than blocked; bridge.log has everything.
+    import queue as _queue
+    from logging.handlers import QueueHandler, QueueListener
+
+    class _DropOnFull(QueueHandler):
+        def enqueue(self, record):
+            try:
+                self.queue.put_nowait(record)
+            except _queue.Full:
+                pass
+
+    console_queue: "_queue.Queue" = _queue.Queue(maxsize=10000)
+    console_listener = QueueListener(console_queue, logging.StreamHandler(), respect_handler_level=True)
+    console_listener.start()
+    handlers: List[logging.Handler] = [_DropOnFull(console_queue)]
     log_file = args.log_file if args.log_file is not None else cfg.cache_dir / "bridge.log"
     if str(log_file) != "-":
         from logging.handlers import RotatingFileHandler
@@ -1803,6 +1846,16 @@ def main(argv=None) -> int:
         'mount with: rclone mount :webdav,url="http://%s:%s",vendor=other: %s',
         cfg.host, cfg.port, cfg.mount_drive,
     )
+    if cfg.auto_mount:
+        # Once the bridge is serving, make sure the drive is there. Idempotent:
+        # an rclone that is already up (it outlives bridge restarts on purpose)
+        # is left alone. Off the main thread because the mount waits on us.
+        import mountctl
+
+        threading.Thread(
+            target=lambda: mountctl.ensure_mounted(cfg), name="automount", daemon=True
+        ).start()
+    _install_console_close_handler(server)
     try:
         server.start()
     except KeyboardInterrupt:
@@ -1825,6 +1878,38 @@ def main(argv=None) -> int:
                     pool.stop()
                     session_lock.release()
     return 0
+
+
+def _install_console_close_handler(server) -> None:
+    """Make closing the console window shut down like Ctrl+C does.
+
+    Python turns Ctrl+C into KeyboardInterrupt but not CTRL_CLOSE_EVENT, so
+    closing the window used to kill the process mid-flight and leave a
+    running warmshell behind. Windows gives the handler a few seconds before
+    it terminates the process, which is enough to stop the server and let
+    ``main``'s ``finally`` run (warmup.stop kills the warmshell child).
+    """
+    if os.name != "nt":
+        return
+    import ctypes
+
+    handler_type = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
+
+    def handler(event: int) -> int:
+        if event in (2, 5, 6):  # CLOSE, LOGOFF, SHUTDOWN
+            log.info("console closing; shutting down")
+            server.stop()
+            time.sleep(4)  # let main()'s finally finish before the OS ends us
+            return 1
+        return 0
+
+    # Held at module level: a collected callback would crash the process.
+    global _CONSOLE_HANDLER
+    _CONSOLE_HANDLER = handler_type(handler)
+    ctypes.windll.kernel32.SetConsoleCtrlHandler(_CONSOLE_HANDLER, True)
+
+
+_CONSOLE_HANDLER = None
 
 
 def _finish_playtime_session(service, launcher, session):

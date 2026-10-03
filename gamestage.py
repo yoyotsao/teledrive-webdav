@@ -47,6 +47,11 @@ log = logging.getLogger("gamestage")
 HASH_SAMPLE = 100 * 1024 * 1024
 
 TICK_SECONDS = 15
+
+#: A PUT that began but never reported back (its thread died) must not hold a
+#: file out of the queue forever. A loopback PUT of even tens of GB finishes
+#: well inside this; past it, the writer is assumed gone.
+WRITER_STALE_SECONDS = 3600.0
 RETRY_SECONDS = 600
 MAX_ATTEMPTS = 5
 
@@ -111,6 +116,8 @@ class Unit:
     attempts: int = 0
     retry_after: float = 0.0
     detail: str = ""
+    writers: int = 0
+    writer_started: float = 0.0
 
 
 class GameStager:
@@ -215,6 +222,33 @@ class GameStager:
                 unit.state = "staging"
                 unit.attempts = 0
 
+    def begin_write(self, top: str) -> None:
+        """A PUT inside this unit has started: the unit cannot be packed yet."""
+        self.touch(top)
+        with self._lock:
+            unit = self._units.get(top)
+            if unit is not None:
+                if unit.writers == 0:
+                    unit.writer_started = time.monotonic()
+                unit.writers += 1
+
+    def end_write(self, top: str, local: Path, *, ok: bool) -> None:
+        """The PUT ended; the unit's quiet window restarts now.
+
+        A failed PUT's truncated file is removed on its own — leaving it would
+        pack a corrupt member into the zip. The rest of the unit is untouched.
+        """
+        with self._lock:
+            unit = self._units.get(top)
+            if unit is not None and unit.writers > 0:
+                unit.writers -= 1
+        if not ok:
+            try:
+                local.unlink()
+            except OSError:
+                pass
+        self.touch(top)
+
     def _adopt_leftovers(self) -> None:
         """Pick up staging left behind by a crash, dated by newest file mtime."""
         now = time.time()
@@ -256,6 +290,7 @@ class GameStager:
                     "state": u.state,
                     "idle_seconds": round(now - u.last_write, 1),
                     "attempts": u.attempts,
+                    "writers": u.writers,
                     "detail": u.detail,
                 }
                 for u in self._units.values()
@@ -285,6 +320,8 @@ class GameStager:
                 if unit.state not in ("staging", "failed"):
                     continue
                 if unit.state == "failed" and now < unit.retry_after:
+                    continue
+                if unit.writers > 0 and now - unit.writer_started < WRITER_STALE_SECONDS:
                     continue
                 if now - unit.last_write >= debounce:
                     unit.state = "packing"

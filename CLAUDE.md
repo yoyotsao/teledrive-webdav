@@ -31,6 +31,7 @@ bridge 只用現有 public API，沒有為它新增任何會讀寫二進位資�
 | `install_menu.py` / `install_thumb.py` | 重跑安裝；property handler 那半要管理員（只有 HKLM） |
 | `config.ini` | `restart.bat`（路徑全部由 `cache_dir` 推導，重讀才生效） |
 
+- **關閉 bridge 不再需要手動管 warmshell**：`BackgroundWarmup.stop()` 會殺掉進行中的 warmshell，主控台視窗被關（`SetConsoleCtrlHandler`）也走同一條 `finally`。強殺 rclone 的 fallback 已移除——沒有任何腳本會在有 reader 的時候 `taskkill /F rclone.exe`。
 - **`restart.bat` 只重啟 bridge，不碰 rclone。** rclone 是對 127.0.0.1 講 HTTP 並且會重試，
   所以 `H:` 不會斷、VFS 快取也還在；殺掉 rclone 等於卸載磁碟又白丟 dir cache。
   重啟前先看 `/rpc/status`：staging/uploads 的 debounce 計時器不會續命（檔案還在，計時歸零）。
@@ -66,7 +67,9 @@ bridge 只用現有 public API，沒有為它新增任何會讀寫二進位資�
 | `install_thumb.py` | 註冊/移除 shell handler，逐副檔名記錄被取代的既有 CLSID |
 | `shellthumb/` | C++ shell 擴充：`IThumbnailProvider` + `IPropertyStore`，同一份 DLL 兩個 CLSID；`warmshell.exe` 把縮圖灌進 Windows thumbcache，`bench.exe` / `isolate.exe` 量測 |
 | `config.py` | 讀 `config.ini`，空值回退環境變數，再回退 `env_file`；由單一 `cache_dir` 推導所有路徑；並發參數做範圍檢查（0 或負數直接 `ConfigError`，不是靜靜跑一個壞值） |
-| `start.bat` | 啟動 bridge + `rclone mount` |
+| `mountctl.py` | 擁有 `rclone mount`：`ensure`（冪等，bridge 啟動後自己呼叫）、`stop`（`rclone rc core/quit`，**永不強殺**）、`check`/`status`。rclone 以 detached 行程啟動，bridge 重啟不會帶走 `H:`；log 在 `meta/rclone.log` |
+| `start.bat` | 啟動 bridge（已在跑就沿用），等 `H:` 掛好。掛載由 bridge 自己做（`[bridge] auto_mount`），磁碟代號只在 `config.ini` 一處 |
+| `stop.bat` | 固定順序：warmshell → `rclone core/quit` → bridge。任一步失敗就停在原地，不碰後面的（半停的系統還能讀完，被殺的不行） |
 | `restart.bat` | 只重啟 bridge（rclone 與 `H:` 不動），改完 Python 後的收尾 |
 
 `config.ini` 只有 `cache_dir` 一個路徑設定，底下的 `meta/` `rclone/` `local/` `staging/` `uploads/`
@@ -90,6 +93,14 @@ backend 的垃圾桶端點，跟路徑本身無關：
   覆寫既有檔案也走這條路（`RemoteFileResource.begin_write`）——backend 沒有
   `UNIQUE(filename, parent_id)`，所以覆寫就是用新內容再註冊一筆同名 row，
   新舊都在、讀取時新的蓋掉舊的（既有的「同名檔案」規則，見「已知限制」第 5 點）。
+  **等待時間兩邊分開，而且都從 PUT 結束才起算**：一般路徑是 `[upload] debounce_seconds`
+  （10 秒），`/game` 是 `[game] debounce_minutes`（5 分鐘）。兩個 stager
+  （`UploadStager` / `GameStager`）都在 pending record 上用 `writers` 計數擋住進行中的 PUT
+  （`begin_write` +1、`end_write` -1，`_due` 對 `writers > 0` 一律不算到期；計數而非布林，
+  rclone 重試與原請求重疊時一個結束不會解除另一個的保護）。PUT 失敗
+  （`end_write(ok=False)`）就丟掉那份半成品——它從來不是完整副本，不違反「暫存是唯一副本」；
+  `/game` 只刪那一個檔，不動整個 unit。`gamestage.WRITER_STALE_SECONDS`（1 小時）是 thread
+  沒走到 `end_write` 時的保險，`_adopt_leftovers` 重建的 record `writers` 一律是 0。
 - **`DELETE`** 能不能做，看的是「這個名字現在解析到的是本機還沒上傳的暫存，
   還是 backend 已經註冊過的真實資料」，跟在不在 `/game` 底下無關——`/game` 跟
   一般路徑的差別只在上傳前有沒有先打包成 zip，不是刪除能力本身的分界。
@@ -885,6 +896,79 @@ GET /files    0.52s ┘
 | `POST /rpc/fetch-local` | `path=<Windows 路徑>`，串流回進度 |
 | `GET /rpc/thumb` | `path=<Windows 路徑>` → Telegram 預覽圖（JPEG）；沒有就 404 讓 DLL 走 fallback |
 | `GET /rpc/props` | `path=<Windows 路徑>` → `{width,height,duration,size}`，不讀檔案內容 |
+
+## 瀏覽器遊戲 RPC 與遊玩時間（ReinaManager 網頁版）
+
+ReinaManager 網頁版（TeleDrive 的 `/game/`）由**瀏覽器直接**呼叫這支 bridge 下載、啟動遊戲；
+遊玩時間由 bridge 記錄後補送給 reina-server。分工：server 存遊戲庫與統計，bridge 只管本機下載、
+進程與計時。程式在 `gamestate.py`（下載狀態 + RPC 骨架）、`gamelaunch.py`（啟動與進程追蹤）、
+`playtime.py`（durable store + 補送佇列）。
+
+### `[reina]` 設定
+
+| 鍵 | 說明 |
+|---|---|
+| `allowed_origin` | 網頁 Origin，**精確比對**（協定/網域/連接埠）；不可含萬用字元、帳密、path/query。 |
+| `server_url` | reina-server 的 base URL；補送遊玩記錄時打 `<server_url>/game/api/sessions`。 |
+| `locale_emulator` | Locale Emulator 執行檔路徑；留空即停用（`capabilities.locale_emulator=false`）。 |
+
+`allowed_origin` 或 `server_url` 任一為空、或 origin 不合法，`/rpc/game/*` 整組回 `503 game_rpc_disabled`。
+改 `config.ini` 後要 `restart.bat`（見上方收尾表，先看 `/rpc/status`）。
+
+### `/rpc/game/*`
+
+一律要求：`Origin` 等於 `allowed_origin`、`Authorization: Bearer <TeleDrive JWT>`。
+bridge 用 `GET <api>/folders` 向 TeleDrive 驗證 token（成功結果最多快取 5 分鐘、只存 token 的 SHA-256），
+再比對 JWT 的 `user_id` 是否等於 bridge 主 Telegram 帳號，不符回 `403 bridge_owner_mismatch`。
+預檢 `OPTIONS` 回 CORS 標頭；帶 `Access-Control-Request-Private-Network: true` 時回 `Access-Control-Allow-Private-Network`
+（Chrome 的 Private Network Access）。
+
+| 端點 | 用途 |
+|---|---|
+| `GET /rpc/game/state?paths=…`（可重複） | 每個 canonical 路徑（`game/…`）的 `status`（`running` / `downloading` / `ready` / `incomplete` / `absent`）、進度位元組、`elapsed_seconds`、`error`、`capabilities` |
+| `POST /rpc/game/fetch` `{path}` | 背景下載（202）；已在下載就回現況。 |
+| `DELETE /rpc/game/fetch?path=…` | 取消下載；沒有進行中的下載回 409 `download_not_active`。 |
+| `GET /rpc/game/exes?path=…` | 已下載遊戲內可選的執行檔（相對路徑）。 |
+| `POST /rpc/game/launch` `{path, exe_relpath, game_id, locale_emulator}` | 啟動並開始計時，回 `session_id`。未下載完成 409 `bridge_game_not_ready`；已在跑 409 `bridge_game_running`。 |
+
+路徑必須是 `<game_folder>/…` 且不含 `.`、`..`。`ready` 的判準是遊戲根目錄下的 `.reina-complete` 標記
+（下載完整成功才寫）；有內容但沒有標記是 `incomplete`，之後重新 fetch 會跳過已存在的檔案續傳。
+下載失敗訊息回給瀏覽器前先經 `upload_engine.redact` 並遮蔽本機絕對路徑與 JWT 形狀字串（`_safe_download_error`）。
+
+### 狀態檔（都在 `cache_dir` 底下）
+
+| 檔案 | 內容 | 注意 |
+|---|---|---|
+| `reina-games.json` | canonical 路徑 → 本機遊戲根目錄的對應（下載完成時寫入，原子替換） | 對應失效或不在 `local/` 之下時，會退回由路徑重新推導；不是快取，別亂刪 |
+| `playtime-running.json` | 執行中會話：`session_id`、`game_id`、裝置、開始時間、根目錄、PID + 建立時間、`last_seen` | 每次變更 fsync + 原子替換 |
+| `playtime-queue.jsonl` | 已結束、待補送的遊玩記錄（每行一筆 `{id, game_id, device, start, end, seconds}`） | 見下 |
+
+會話結束時**先 append 進 queue（fsync）再從 running store 移除**（queue-first），所以任何時刻掛掉都不會丟記錄；
+`id` 就是 `session_id`，server 端以它去重，重送是冪等的。queue 的最後一行若是寫到一半會在載入時修復
+（可解析就補換行，否則截掉）；中間行損壞或整個檔案無法載入時，原檔改名為 `*.corrupt-<時間戳>`
+並從空檔重新開始（不讓 bridge 與 `H:` 起不來），事後要手動處理那份備份。
+
+`PlaytimeSender` 背景執行緒用 bridge 自己的 TeleDrive JWT 送 `POST /game/api/sessions`，200 且 `accepted` 為布林才 ack：
+暫時性失敗（網路、5xx、429…）指數退避 5/10/30/60/300 秒；404 `not_found`（遊戲已刪）擱置該筆 15 分鐘；
+400 擱置 1 小時；403 拉長間隔；401 先強制重登一次，仍 401 暫停 30 分鐘。被擱置的單筆不擋後面的記錄。
+所以「遊玩時間沒出現」通常是 queue 還在排隊，先看 `bridge.log` 的 `playtime send deferred` / `retained`，
+再數 `playtime-queue.jsonl` 行數。
+
+啟動時 `recover_sessions()` 會逐筆檢查 running store：已在 queue 的直接清掉；程序仍活著
+（PID + 建立時間一致，或根目錄底下、開始時間之後建立的程序）就接回繼續計時；都找不到就用 `last_seen` 結算進 queue。
+
+### 重啟前
+
+`/rpc/status` 目前只列上傳/暫存與帳號狀態，**不會顯示執行中的遊戲或 playtime queue**。重啟 bridge 前：
+先看 `/rpc/status`（有無 debounce 中的 staging/uploads），再看 `playtime-running.json` 是否有執行中的會話、
+`/rpc/game/state` 是否有 `downloading`。仍只用 `restart.bat`（不動 rclone）。進行中的下載會在重啟時中斷，
+重啟後該遊戲是 `incomplete`，要在網頁重新按下載。
+
+### 憑證不外洩（redaction）
+
+JWT 與 Telegram session 不得出現在任何日誌、`/rpc/status`、錯誤回應或文件。bridge 只在記憶體使用 JWT；
+token 快取以 SHA-256 為鍵；錯誤訊息一律先 `redact`；`/rpc/game/*` 的 401/403/503 只回固定的 `code`。
+貼 issue 時不要貼 `Authorization` 標頭或 `config.ini`。
 
 ## 測試
 

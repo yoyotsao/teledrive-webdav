@@ -43,11 +43,13 @@ class Config:
     host: str = "127.0.0.1"
     port: int = 8081
     mount_drive: str = "E:"
+    auto_mount: bool = True
     log_level: str = "INFO"
     cache_dir: Path = Path("data/meta")
     local_dir: Path = Path("data/local")
     staging_dir: Path = Path("data/staging")
     debounce_minutes: float = 5.0
+    upload_debounce_seconds: float = 10.0
     download_connections: int = 8
     rclone_dir: Path = Path("data/rclone")
     warmup_auto: bool = True
@@ -230,6 +232,9 @@ def load_config(path: Optional[Path] = None) -> Config:
         upload_files=positive_int("upload_files", get("telegram", "upload_files", "3")),
         upload_parts=positive_int("upload_parts", get("telegram", "upload_parts", "12")),
         hash_concurrency=positive_int("hash_concurrency", get("upload", "hash_concurrency", "2")),
+        upload_debounce_seconds=positive_float(
+            "upload_debounce_seconds", get("upload", "debounce_seconds", "10")
+        ),
         hash_check_concurrency=positive_int(
             "hash_check_concurrency", get("upload", "hash_check_concurrency", "8")
         ),

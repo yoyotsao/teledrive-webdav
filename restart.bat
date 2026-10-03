@@ -43,10 +43,27 @@ if %tries% GEQ 30 (
   echo [error] bridge did not come up. See ^<cache_dir^>\bridge.log
   goto :fail
 )
-timeout /t 2 /nobreak >nul
+"%SystemRoot%\System32\timeout.exe" /t 2 /nobreak >nul
 goto wait
 :ready
-echo       bridge is up. H: is still mounted.
+echo       bridge is up.
+:: The bridge mounts the drive itself if rclone is not already there; wait for
+:: it so "restarted" means the drive is usable. A rclone that was running is
+:: untouched (it talks HTTP to 127.0.0.1 and retries).
+set /a tries=0
+:waitmount
+set /a tries+=1
+"%PY%" mountctl.py check >nul 2>&1
+if not errorlevel 1 goto mounted
+if %tries% GEQ 20 (
+  echo [error] drive did not appear. See ^<cache_dir^>
+clone.log
+  goto :fail
+)
+"%SystemRoot%\System32\timeout.exe" /t 2 /nobreak >nul
+goto waitmount
+:mounted
+echo       drive is mounted.
 goto :eof
 
 :fail

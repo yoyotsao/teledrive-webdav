@@ -22,6 +22,7 @@ import pytest
 import gamestage
 import upload_engine
 import uploadstage
+from gamestage import WRITER_STALE_SECONDS
 from telegram_accounts import TelegramAccountPool
 from transfer_models import (
     AccountSpec,
@@ -311,7 +312,7 @@ class FakeEngine:
 def stager(tmp_path):
     cfg = SimpleNamespace(
         upload_dir=tmp_path / "uploads", cache_dir=tmp_path / "meta",
-        debounce_minutes=0.0, register_concurrency=8, hash_concurrency=2,
+        debounce_minutes=0.0, upload_debounce_seconds=0.0, register_concurrency=8, hash_concurrency=2,
     )
     cfg.cache_dir.mkdir(parents=True, exist_ok=True)
     api = SimpleNamespace(resolve=lambda segments: None)
@@ -445,3 +446,64 @@ def test_status_reports_stage_attempts_and_a_redacted_error(stager):
     assert entry["attempts"] == 1
     assert "registration failed" in entry["detail"]
     assert "session" not in json.dumps(stager.status()).lower()
+
+
+def test_a_file_mid_put_is_never_due(stager):
+    path = stager.create_file(["big.bin"], "parent")
+    stager.begin_write(["big.bin"], "parent")
+    path.write_bytes(b"half")
+    assert ("big.bin",) not in stager._due(0.0)
+    stager.end_write(["big.bin"], "parent", ok=True)
+    assert ("big.bin",) in stager._due(0.0)
+
+
+def test_the_quiet_window_starts_when_the_put_ends(stager):
+    stager.create_file(["slow.bin"], "parent")
+    stager.begin_write(["slow.bin"], "parent")
+    stager.get(("slow.bin",)).last_write -= 1000  # the PUT ran for ages
+    stager.end_write(["slow.bin"], "parent", ok=True)
+    assert ("slow.bin",) not in stager._due(60.0)  # just finished: not quiet yet
+
+
+def test_overlapping_puts_need_both_to_finish(stager):
+    stager.create_file(["twice.bin"], "parent")
+    stager.begin_write(["twice.bin"], "parent")
+    stager.begin_write(["twice.bin"], "parent")  # rclone retry overlapping the original
+    stager.end_write(["twice.bin"], "parent", ok=True)
+    assert ("twice.bin",) not in stager._due(0.0)
+    stager.end_write(["twice.bin"], "parent", ok=True)
+    assert ("twice.bin",) in stager._due(0.0)
+
+
+def test_a_failed_put_drops_its_partial_file(stager):
+    path = stager.create_file(["broken.bin"], "parent")
+    stager.begin_write(["broken.bin"], "parent")
+    path.write_bytes(b"partial")
+    stager.end_write(["broken.bin"], "parent", ok=False)
+    assert not path.exists()
+    assert stager.get(("broken.bin",)) is None
+    assert ("broken.bin",) not in stager._due(0.0)
+
+
+def test_a_failed_overlap_keeps_the_file_the_other_put_is_writing(stager):
+    path = stager.create_file(["shared.bin"], "parent")
+    stager.begin_write(["shared.bin"], "parent")
+    stager.begin_write(["shared.bin"], "parent")
+    path.write_bytes(b"x")
+    stager.end_write(["shared.bin"], "parent", ok=False)
+    assert path.exists()  # the second PUT is still writing it
+    assert stager.get(("shared.bin",)).writers == 1
+
+
+def test_a_writer_that_never_ended_stops_blocking_after_the_stale_limit(stager):
+    stager.create_file(["lost.bin"], "parent")
+    stager.begin_write(["lost.bin"], "parent")
+    stager.get(("lost.bin",)).writer_started -= WRITER_STALE_SECONDS + 1
+    assert ("lost.bin",) in stager._due(0.0)
+
+
+def test_adopted_leftovers_have_no_writers(stager):
+    stager.stage_file("crashed.bin")
+    stager.begin_write(["crashed.bin"], "parent")
+    revived = uploadstage.UploadStager(stager.cfg, stager.api, stager.engine)
+    assert revived.get(("crashed.bin",)).writers == 0
