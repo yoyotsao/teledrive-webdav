@@ -349,6 +349,11 @@ class FakeBackend:
             rows = [r for r in self.rows if r["file_hash"] and r["file_hash"] == params.get("hash")]
             return {"found": bool(rows), "files": rows}
         if path == "/files/register":
+            # The real backend's schema rejects 0 (HTTP 422, "greater_than").
+            # Pinned for the empty-file path only; other registrations here
+            # have always sent 0 and are not what this check is about.
+            if payload["message_id"] == 0:
+                assert (payload.get("telegram_user_id") or 0) > 0, "422: telegram_user_id must be > 0"
             row = self._row(
                 payload["filename"],
                 payload["filesize"],
@@ -1515,6 +1520,40 @@ def test_copy_pending_general_upload_creates_an_independent_second_file(rig):
     row = next(r for r in rig.backend.rows if r["filename"] == "pending2.bin")
     photos_id = next(r["file_id"] for r in rig.backend.rows if r["filename"] == "photos")
     assert row["parent_id"] == photos_id
+
+
+def test_empty_file_is_registered_as_metadata_only_and_reads_back(rig):
+    """Telegram rejects empty documents: no hash, no message, an ``empty:`` id."""
+    rig.request("PUT", "/photos/empty.txt", data=b"")
+    _upload_now(rig, "photos", "empty.txt")
+
+    rows = [r for r in rig.backend.rows if r["filename"] == "empty.txt"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["filesize"] == 0
+    assert row["telegram_message_id"] == 0
+    assert row["file_id"].startswith("empty:")
+    assert row["file_hash"] is None
+    assert row["has_thumbnail"] is False
+    # Registered, so the staging copy is gone and nothing is left to retry.
+    assert not (rig.cfg.upload_dir / "photos" / "empty.txt").exists()
+    assert rig.request("GET", "/rpc/status").json()["uploads"]["pending"] == []
+
+    rig.worker.reads.clear()
+    resp = rig.request("GET", "/photos/empty.txt")
+    assert resp.status_code == 200 and resp.content == b""
+    assert rig.worker.reads == []  # never asked Telegram
+
+
+def test_two_empty_files_do_not_collapse_into_one(rig):
+    rig.request("PUT", "/photos/a.empty", data=b"")
+    rig.request("PUT", "/photos/b.empty", data=b"")
+    keys = [("photos", "a.empty"), ("photos", "b.empty")]
+    assert set(keys) <= set(rig.upload_stager._due(0.0))
+    rig.upload_stager.process_due(keys)
+
+    ids = [r["file_id"] for r in rig.backend.rows if r["filename"] in ("a.empty", "b.empty")]
+    assert len(ids) == 2 and len(set(ids)) == 2
 
 
 def test_copy_general_pending_upload_across_game_boundary_is_forbidden(rig):

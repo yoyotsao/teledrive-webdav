@@ -1151,6 +1151,26 @@ class UploadEngine:
     # never use this compatibility spelling.
     _upload_segment = _upload_segment_once
 
+    def register_empty(self, request: TransferRequest) -> None:
+        """A 0-byte file never touches Telegram, which rejects empty documents.
+
+        It skips fingerprinting too: every empty file hashes the same, so the
+        dedup and claim machinery would treat the second one as a duplicate of
+        the first. Same-name replacement still works as for any other file --
+        a new row with a fresh id that reads back newest-wins.
+        """
+        try:
+            self.api.register_empty(
+                request.upload_name, request.mime_type,
+                telegram_user_id=self.pool.primary.telegram_user_id,
+                parent_id=request.parent_id,
+            )
+        except BaseException as exc:  # noqa: BLE001 - logged, then re-raised
+            log.warning("registration failed name=%s %s", request.upload_name, redact(exc))
+            raise
+        self.api.invalidate(request.parent_id)
+        log.info("transfer complete protocol=empty bytes=0 name=%s", request.upload_name)
+
     def register_result(self, result: TransferResult) -> None:
         """Settle every part registration, then say where the time went.
 

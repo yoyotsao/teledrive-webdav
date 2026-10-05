@@ -225,6 +225,8 @@ class Resolver:
 
     def open_remote(self, entry: Entry) -> SeekableRemoteFile:
         """A fresh seekable reader over a cloud file (split parts concatenated)."""
+        if entry.is_empty:
+            return io.BytesIO(b"")  # no Telegram message behind it
         self.note_demand()
         return SeekableRemoteFile(
             self.pool,

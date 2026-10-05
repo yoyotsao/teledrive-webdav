@@ -159,7 +159,9 @@ class UploadStager:
             if parent_id is not None:
                 pending.parent_id = parent_id
             pending.last_write = time.monotonic()
-            if pending.stage in (QueueStage.FAILED,):
+            # A fresh write is new user intent: it re-arms an abandoned file too.
+            # Abandoning only stops the *automatic* retries.
+            if pending.stage in (QueueStage.FAILED, QueueStage.ABANDONED):
                 pending.stage = QueueStage.STAGING
                 pending.attempts = 0
                 pending.detail = ""
@@ -418,6 +420,12 @@ class UploadStager:
                 requests[str(request.source)] = key
                 dispatched.append(key)
                 log.info("uploading %s", "/".join(key))
+                if request.logical_size == 0:
+                    # Telegram rejects empty documents: metadata only, no engine.
+                    self._set_stage(key, QueueStage.REGISTERING)
+                    with lock:
+                        registrations[key] = pool.submit(self.engine.register_empty, request)
+                    continue
                 yield request
 
         def status_sink(request, stage, detail=""):

@@ -75,6 +75,11 @@ class Entry:
     parent_id: Optional[str] = None
 
     @property
+    def is_empty(self) -> bool:
+        """A 0-byte file: metadata only, there is no Telegram message to read."""
+        return not self.is_dir and self.message_id is None and self.size == 0
+
+    @property
     def real_size(self) -> Optional[int]:
         """True byte length, or None if the backend did not record one.
 
@@ -174,7 +179,10 @@ def _to_entry(row: dict) -> Entry:
         size=int(row.get("filesize") or 0),
         mtime=_parse_time(row.get("created_at")),
         mime=row.get("mime_type"),
-        message_id=row.get("telegram_message_id"),
+        # 0 is the backend's "no Telegram message" marker for 0-byte files.
+        # Folding it into None means every existing ``message_id is None`` guard
+        # (thumbs, props, heads, warmup) skips them without a second spelling.
+        message_id=row.get("telegram_message_id") or None,
         access_hash=row.get("access_hash"),
         is_split=bool(row.get("is_split_file")),
         split_group_id=row.get("split_group_id"),
@@ -700,6 +708,8 @@ class TeleDriveClient:
         Sizes are clipped to ``entry.real_size`` so the table never claims bytes
         the Telegram documents do not hold — see ``Entry.real_size``.
         """
+        if entry.is_empty:
+            return []
         if not (entry.is_split and entry.split_group_id):
             if entry.message_id is None:
                 raise ApiError(404, f"{entry.name} has no Telegram message")
@@ -843,6 +853,27 @@ class TeleDriveClient:
         self.invalidate(parent_id)
         return data
 
+    def register_empty(
+        self,
+        filename: str,
+        mime_type: Optional[str],
+        *,
+        telegram_user_id: int,
+        parent_id: Optional[str] = None,
+    ) -> dict:
+        """Register a 0-byte file. Telegram refuses empty documents, so the row
+        is metadata only: ``message_id=0``, a random ``empty:<uuid>`` id, no
+        hash (every empty file would share one and dedup would merge them).
+
+        The backend still validates ``telegram_user_id > 0`` on every register,
+        so the row names the account that owns the drive's uploads even though
+        no message exists under it."""
+        return self.register(
+            filename=filename, filesize=0, mime_type=mime_type, message_id=0,
+            file_id=f"empty:{uuid.uuid4()}", telegram_user_id=telegram_user_id,
+            parent_id=parent_id,
+        )
+
     def trash(self, file_id: str, parent_id: Optional[str]) -> None:
         """Soft-delete: the backend stamps trashed_at on the whole subtree and
         keeps every Telegram message untouched. Listings already exclude
@@ -864,6 +895,11 @@ class TeleDriveClient:
         existing hash-dedup path in register() already relies on the same
         fact to avoid re-uploading identical content.
         """
+        if entry.is_empty:
+            self.register_empty(
+                filename, entry.mime, telegram_user_id=entry.telegram_user_id, parent_id=parent_id,
+            )
+            return
         if not (entry.is_split and entry.split_group_id):
             self.register(
                 filename=filename,
