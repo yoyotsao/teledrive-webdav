@@ -60,7 +60,10 @@ class UploadLease:
             if self._closed:
                 return ActivityChange(self.runtime.telegram_user_id, False, False, False)
             self._closed = True
-            return self.pool._release_upload_locked(self.runtime, self.work_id)
+            change = self.pool._release_upload_locked(self.runtime, self.work_id)
+        # Outside the pool lock: a listener may take locks of its own.
+        self.pool._notify_slot_released(self.runtime.telegram_user_id)
+        return change
 
     def __exit__(self, *_exc):
         self.close()
@@ -121,6 +124,7 @@ class TelegramAccountPool:
         }
         self._rr = 0
         self._lock = threading.RLock()
+        self._release_listeners: list = []
         self.speed_tracker = speed_tracker or UploadSpeedTracker()
         self.activity = activity_registry or AccountActivityRegistry(
             speed_tracker=self.speed_tracker
@@ -287,6 +291,24 @@ class TelegramAccountPool:
     def _next_work_id_locked(self) -> str:
         self._work_sequence += 1
         return f"upload:{self._work_sequence}"
+
+    def add_release_listener(self, callback) -> None:
+        """Call ``callback(account_id)`` after any upload file slot is freed.
+
+        Whoever is waiting for a slot (a segment scheduler with every segment
+        PENDING) has no other signal that one has opened up.
+        """
+        with self._lock:
+            self._release_listeners.append(callback)
+
+    def _notify_slot_released(self, account_id: int) -> None:
+        with self._lock:
+            listeners = list(self._release_listeners)
+        for callback in listeners:
+            try:
+                callback(account_id)
+            except Exception:  # a broken listener must not fail the upload that freed the slot
+                log.exception("upload slot release listener failed")
 
     def _release_upload_locked(self, runtime: AccountRuntime, work_id: str) -> ActivityChange:
         change = self.activity.end_job(runtime.telegram_user_id, work_id)

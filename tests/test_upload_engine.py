@@ -495,3 +495,27 @@ def test_upload_client_short_flood_reaches_message_bucket_before_sender_retry(mo
     inner_requests = [getattr(request, "query", request) for request in requests]
     assert [type(request).__name__ for request in inner_requests] == ["SendMediaRequest", "SendMediaRequest"]
     assert all(request.media.file is handle for request in inner_requests)
+
+
+def test_a_freed_file_slot_wakes_schedulers_waiting_for_one():
+    """A scheduler whose segments are all PENDING waits with no deadline; a slot
+    freed by a *different* transfer on the account is its only wake-up."""
+    class StubScheduler:
+        def __init__(self):
+            self.woken = threading.Event()
+
+        def notify_account_changed(self, _account_id=None):
+            self.woken.set()
+
+    class Pool:
+        def add_release_listener(self, callback):
+            self.callback = callback
+
+    pool = Pool()
+    engine = upload_engine.UploadEngine(Api(), pool)
+    waiting = StubScheduler()
+    engine._active_schedulers[1] = waiting
+
+    pool.callback(1)
+
+    assert waiting.woken.wait(timeout=2)

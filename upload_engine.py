@@ -11,7 +11,7 @@ from collections import deque
 from contextlib import contextmanager
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from threading import BoundedSemaphore, Lock
+from threading import BoundedSemaphore, Lock, Thread
 from typing import Callable, Dict, Mapping, Optional, Sequence
 from uuid import uuid4
 
@@ -465,6 +465,26 @@ class UploadEngine:
         self._metrics_lock = Lock()
         self._active_schedulers: Dict[int, SegmentScheduler] = {}
         self._scheduler_state_lock = Lock()
+        add_listener = getattr(pool, "add_release_listener", None)
+        if callable(add_listener):
+            add_listener(self._on_upload_slot_released)
+
+    def _on_upload_slot_released(self, _account_id=None) -> None:
+        # A scheduler whose segments are all PENDING waits with no deadline;
+        # this is the only thing that tells it a file slot opened up (e.g. a
+        # different transfer on the same account just finished). Hand off to a
+        # short thread: the caller may hold another scheduler's lock, and
+        # taking this one's from there could deadlock two schedulers.
+        with self._scheduler_state_lock:
+            schedulers = list(self._active_schedulers.values())
+        if not schedulers:
+            return
+
+        def wake():
+            for scheduler in schedulers:
+                scheduler.notify_account_changed()
+
+        Thread(target=wake, name="scheduler-wake", daemon=True).start()
 
     def _supports_failover_scheduler(self) -> bool:
         required = (

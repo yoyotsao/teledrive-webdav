@@ -340,3 +340,29 @@ def test_worker_can_start_again_after_connection_failure():
         assert worker.user_id == 7
     finally:
         worker.stop()
+
+
+def test_closing_a_lease_notifies_release_listeners_outside_the_pool_lock():
+    pool, _ = make_pool([spec(1)], {1: FakeWorker(1)}, linked={1}, upload_files=1)
+    seen = []
+
+    def listener(account_id):
+        # The pool lock is an RLock, so probe from another thread: if close()
+        # still held it, this acquire would time out.
+        import threading
+        free = []
+        probe = threading.Thread(
+            target=lambda: free.append(pool._lock.acquire(timeout=1) and pool._lock.release() is None)
+        )
+        probe.start()
+        probe.join()
+        seen.append((account_id, free == [True]))
+
+    try:
+        pool.add_release_listener(listener)
+        pool.add_release_listener(lambda _id: 1 / 0)  # must not break the others or the close
+        with pool.acquire_upload(timeout=0.1):
+            assert seen == []
+        assert seen == [(1, True)]
+    finally:
+        pool.stop()
