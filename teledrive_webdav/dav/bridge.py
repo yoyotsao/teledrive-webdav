@@ -37,6 +37,7 @@ from wsgidav.dav_provider import DAVCollection, DAVNonCollection, DAVProvider
 from wsgidav.wsgidav_app import WsgiDAVApp
 
 from teledrive_webdav.dav import zipfs
+from teledrive_webdav.core import fileid, logscrub
 from teledrive_webdav.core.config import Config, ext_path as _ext, load_config
 from teledrive_webdav.game.gamestate import GameRpc
 from teledrive_webdav.dav.rejectedputs import RejectedPuts
@@ -254,7 +255,8 @@ class Resolver:
         self.note_demand()
         parts = self.api.parts_for(entry)
         for part in parts:  # so ``chunk timing`` can say which file is being read
-            note_read_label(getattr(part, "message_id", None), label or entry.name)
+            if label:
+                note_read_label(getattr(part, "message_id", None), label)
         return SeekableRemoteFile(
             self.pool,
             parts,
@@ -337,7 +339,7 @@ class Resolver:
                 try:
                     _write_atomic(path, data)
                 except OSError as exc:  # pragma: no cover - cache is best-effort
-                    log.warning("could not cache thumbnail %s: %s", path.name, exc)
+                    log.warning("could not cache thumbnail: %s", exc)
         return found
 
     def thumb_bytes(self, entry: Entry) -> Optional[bytes]:
@@ -416,7 +418,7 @@ class Resolver:
                 _write_atomic(self._head_path(entry), data)
                 return True
             except Exception as exc:  # pragma: no cover - cache is best-effort
-                log.warning("could not cache head of %s: %s", entry.name, exc)
+                log.warning("could not cache head: %s", exc)
                 return False
 
         done = 0
@@ -439,7 +441,7 @@ class Resolver:
             try:
                 self._head_path(entry).unlink(missing_ok=True)
             except OSError as exc:  # pragma: no cover - best-effort cleanup
-                log.warning("could not drop head of %s: %s", entry.name, exc)
+                log.warning("could not drop head: %s", exc)
 
     def clear_heads(self) -> None:
         """Delete every scratch head file still on disk.
@@ -456,7 +458,7 @@ class Resolver:
             try:
                 path.unlink()
             except OSError as exc:  # pragma: no cover - best-effort cleanup
-                log.warning("could not clear head %s: %s", path.name, exc)
+                log.warning("could not clear head: %s", exc)
 
     def props_for(
         self, entries: List[Entry], *, demand: bool = True
@@ -703,7 +705,7 @@ class Resolver:
             try:
                 node = view.lookup(rest[1:])
             except Exception as exc:
-                log.warning("cannot read zip directory of %s: %s", zip_entry.name, exc)
+                log.warning("cannot read zip directory: %s", exc)
                 return Loc(MISSING)
             if node is None:
                 return Loc(MISSING)
@@ -810,7 +812,7 @@ class RemoteFileResource(_ReadOnlyFile):
         super().__init__(path, environ, size, entry.mtime, f"{entry.file_id}-{size}", entry.mime)
 
     def get_content(self):
-        return self.resolver.open_remote(self.entry, label=self.path)
+        return self.resolver.open_remote(self.entry, label=fileid.tag_dav(self.path))
 
     # Overwriting an existing plain file: there is no backend "replace" call,
     # so this is a new write of the same name into the same parent — the
@@ -962,7 +964,7 @@ class PlaceholderListings:
                 self._save_locked()
             self._start_locked()
         if first:
-            log.warning("listing /%s: backend unavailable and no earlier copy; showing it empty for now", rel_path)
+            log.warning("listing %s: backend unavailable and no earlier copy; showing it empty for now", fileid.tag_dav(rel_path))
 
     def pending(self) -> List[str]:
         with self._lock:
@@ -990,7 +992,7 @@ class PlaceholderListings:
                 with self._lock:
                     self._pending.discard(rel_path)
                     self._save_locked()
-                log.info("listing /%s answers again; told rclone to re-list it", rel_path)
+                log.info("listing %s answers again; told rclone to re-list it", fileid.tag_dav(rel_path))
 
 
 def _unavailable(path: str, exc: Exception) -> DAVError:
@@ -1001,7 +1003,7 @@ def _unavailable(path: str, exc: Exception) -> DAVError:
     not shorten the retries -- answering quickly does. What 503 buys over 404 is
     that the folder does not vanish from rclone's dir cache during an outage.
     """
-    log.warning("%s unavailable: %s", path, exc)
+    log.warning("%s unavailable: %s", fileid.tag_dav(path), exc)
     return DAVError(HTTP_SERVICE_UNAVAILABLE, "TeleDrive backend unavailable", src_exception=exc)
 
 
@@ -1036,13 +1038,13 @@ class _IsolatedMembers(DAVCollection):
             except DAVError as exc:
                 if exc.value == HTTP_SERVICE_UNAVAILABLE:
                     raise
-                log.warning("listing %s: %r left out (%s)", self.path, name, exc)
+                log.warning("listing %s: child %s left out (%s)", fileid.tag_dav(self.path), fileid.tag_dav(f"{self.path.rstrip('/')}/{name}"), exc)
                 continue
             except Exception as exc:
-                log.warning("listing %s: %r left out (%s: %s)", self.path, name, type(exc).__name__, exc)
+                log.warning("listing %s: child %s left out (%s: %s)", fileid.tag_dav(self.path), fileid.tag_dav(f"{self.path.rstrip('/')}/{name}"), type(exc).__name__, exc)
                 continue
             if member is None:
-                log.warning("listing %s: %r did not resolve; left out", self.path, name)
+                log.warning("listing %s: child %s did not resolve; left out", fileid.tag_dav(self.path), fileid.tag_dav(f"{self.path.rstrip('/')}/{name}"))
                 continue
             members.append(member)
         return members
@@ -1106,7 +1108,7 @@ class RootCollection(_ReadOnlyCollection):
         try:
             self.resolver.api.create_folder(name, parent_id=self.parent_id)
         except ApiError as exc:
-            log.warning("create folder %r under %s failed: %s", name, self.parent_id, exc)
+            log.warning("create folder under %s failed: %s", fileid.tag_dav(self.path), exc)
             raise DAVError(HTTP_INTERNAL_ERROR, str(exc))
         return None
 
@@ -1238,7 +1240,7 @@ class ZipDirCollection(_ReadOnlyCollection):
                 # on PROPFIND, which rclone retries forever while holding the
                 # parent's dir lock -- every Explorer window on H: freezes.
                 # An empty folder plus one warning is the answer that ends it.
-                log.warning("cannot read zip directory of %s: %s", self.path, exc)
+                log.warning("cannot read zip directory of %s: %s", fileid.tag_dav(self.path), exc)
                 self._unreadable = True
         return self._node
 
@@ -1515,7 +1517,7 @@ class TeleDriveProvider(DAVProvider):
         except ApiError as exc:
             raise _unavailable(path, exc) from None
         except Exception as exc:
-            log.exception("resolve %s crashed", path)
+            log.exception("resolve %s crashed", fileid.tag_dav(path))
             raise DAVError(HTTP_INTERNAL_ERROR, src_exception=exc) from None
 
         res = self.resolver
@@ -1589,7 +1591,7 @@ class WriteGuard:
         if method in WRITE_METHODS and method not in UNGATED_METHODS:
             path = environ.get("PATH_INFO", "")
             if not self._allowed(path):
-                log.info("403 %s %s (read-only path)", method, path)
+                log.info("403 %s %s (read-only path)", method, fileid.tag_dav(path))
                 return _text_response(
                     start_response,
                     "403 Forbidden",
@@ -1597,7 +1599,7 @@ class WriteGuard:
                 )
             dest = environ.get("HTTP_DESTINATION")
             if dest and not self._allowed(urlsplit(dest).path):
-                log.info("403 %s %s -> %s (destination read-only)", method, path, dest)
+                log.info("403 %s %s -> %s (destination read-only)", method, fileid.tag_dav(path), fileid.tag_dav(urlsplit(dest).path))
                 return _text_response(
                     start_response, "403 Forbidden", "Destination is outside the writable /game area.\n"
                 )
@@ -1900,27 +1902,11 @@ class ThrottleRepeats(logging.Filter):
         return True
 
 
-def main(argv=None) -> int:
-    import argparse
+def configure_logging(cfg: Config, log_file) -> "QueueListener":
+    """Console and rotating file logging, both scrubbed; returns the console listener.
 
-    parser = argparse.ArgumentParser(description="TeleDrive WebDAV bridge")
-    parser.add_argument("--config", type=Path, default=None)
-    parser.add_argument("--port", type=int, default=None)
-    parser.add_argument(
-        "--log-file",
-        type=Path,
-        default=None,
-        help="where to mirror the log (default: <cache_dir>/bridge.log; '-' disables)",
-    )
-    args = parser.parse_args(argv)
-
-    cfg = load_config(args.config)
-    if args.port:
-        cfg = dataclasses.replace(cfg, port=args.port)
-
-    for path in (cfg.cache_dir, cfg.staging_dir, cfg.pack_dir, cfg.local_dir, cfg.upload_dir):
-        path.mkdir(parents=True, exist_ok=True)
-
+    ``log_file`` of ``'-'`` disables the file. The caller owns ``listener.stop()``.
+    """
     # Console *and* file. The console window is where a person watches, but it
     # scrolls away and is gone when the window closes — and the interesting
     # failures here (FLOOD_WAIT storms, "stored in DC N", a warmup pass that
@@ -1947,21 +1933,54 @@ def main(argv=None) -> int:
     console_listener = QueueListener(console_queue, logging.StreamHandler(), respect_handler_level=True)
     console_listener.start()
     handlers: List[logging.Handler] = [_DropOnFull(console_queue)]
-    log_file = args.log_file if args.log_file is not None else cfg.cache_dir / "bridge.log"
     if str(log_file) != "-":
         from logging.handlers import RotatingFileHandler
 
         handlers.append(
             RotatingFileHandler(log_file, maxBytes=8 * 1024 * 1024, backupCount=3, encoding="utf-8")
         )
-    logging.basicConfig(
-        level=getattr(logging, cfg.log_level, logging.INFO),
-        format="%(asctime)s %(levelname)-7s %(name)-10s %(message)s",
-        handlers=handlers,
+    # Every handler scrubs: a name or path that reaches a log call anyway (an OSError
+    # message, a traceback) is replaced by its id on the way out. Explicit wiring
+    # rather than basicConfig, which silently does nothing when the root logger
+    # already has handlers.
+    formatter = logscrub.ScrubbingFormatter(
+        "%(asctime)s %(levelname)-7s %(name)-10s %(message)s",
+        cache_dir=cfg.cache_dir.parent, drive=cfg.mount_drive,
     )
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, cfg.log_level, logging.INFO))
+    for handler in handlers:
+        handler.setFormatter(formatter)
+        root.addHandler(handler)
     # Per-request narration from Telethon's downloader, throttled rather than
     # silenced; see ThrottleRepeats for why this one logger and not a level.
     logging.getLogger("telethon.client.downloads").addFilter(ThrottleRepeats())
+    return console_listener
+
+def main(argv=None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="TeleDrive WebDAV bridge")
+    parser.add_argument("--config", type=Path, default=None)
+    parser.add_argument("--port", type=int, default=None)
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="where to mirror the log (default: <cache_dir>/bridge.log; '-' disables)",
+    )
+    args = parser.parse_args(argv)
+
+    cfg = load_config(args.config)
+    if args.port:
+        cfg = dataclasses.replace(cfg, port=args.port)
+
+    for path in (cfg.cache_dir, cfg.staging_dir, cfg.pack_dir, cfg.local_dir, cfg.upload_dir):
+        path.mkdir(parents=True, exist_ok=True)
+
+    log_file = args.log_file if args.log_file is not None else cfg.cache_dir / "bridge.log"
+    console_listener = configure_logging(cfg, log_file)  # noqa: F841 - lives for the process
+    logscrub.install_excepthooks()
 
     # Imported here so `python bridge.py --help` works without Telethon present.
     from teledrive_webdav.windows.fetchlocal import LocalFetcher
@@ -2060,6 +2079,8 @@ def main(argv=None) -> int:
     from cheroot import wsgi
 
     server = wsgi.Server((cfg.host, cfg.port), app, numthreads=16, request_queue_size=64)
+    # cheroot writes its own errors (tracebacks naming local paths) straight to stderr.
+    server.error_log = logscrub.make_cheroot_error_log()
     # No keep-alive. On Windows cheroot's connection manager does not get woken
     # when an idle connection becomes readable, so it polls instead, capped at
     # 50ms (cheroot/connections.py, "select() does not return when a socket is

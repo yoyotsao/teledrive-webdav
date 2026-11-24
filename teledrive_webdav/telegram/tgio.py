@@ -199,7 +199,7 @@ def _assert_media_id(
     actual = str(getattr(media, "id", ""))
     if actual != expected and not _size_confirms(media, expected_size):
         raise RemoteIdentityError(
-            f"Telegram file mismatch: expected {expected_file_id}, got {actual}"
+            "Telegram file mismatch: the message holds different media than the metadata names"
         )
 
 
@@ -700,7 +700,7 @@ class TelegramWorker:
         msg = messages[0] if messages else None
         media = _message_media(msg)
         if media is None:
-            raise FileNotFoundError(f"Telegram message {message_id} has no document or photo")
+            raise FileNotFoundError(f"Telegram message {label_for(message_id)} has no document or photo")
         return media
 
     # -- thumbnails ------------------------------------------------------- #
@@ -1038,7 +1038,7 @@ class TelegramWorker:
         """Log chunk latency every 10s: in-flight depth = chunks/s x mean latency.
 
         Also says who the reads were for — per account (this worker), per file
-        DC, and the busiest files — because "the line is slow" is not
+        DC, and the slowest files — because "the line is slow" is not
         actionable until you know whether it is one stream, a sweep, or a
         cross-DC file.
         """
@@ -1057,7 +1057,7 @@ class TelegramWorker:
         now = time.monotonic()
         if now - st[3] >= 10:
             dcs = " ".join(f"dc{d}={n}" for d, n in sorted(st[4].items(), key=lambda kv: -kv[1]))
-            top = sorted(st[5].values(), key=lambda p: -p[2])[:3]
+            top = sorted(st[5].values(), key=lambda p: -(p[3] / p[2]))[:3]
             files = " | ".join(f"{p[0]} dc{p[1]} n={p[2]} mean={p[3] / p[2] * 1000:.0f}ms" for p in top)
             log.info(
                 "chunk timing: account=%s %s chunks in %.0fs mean=%.0fms max=%.0fms [%s] files=%s top: %s",
@@ -1358,20 +1358,18 @@ def make_preview(
     all five queue attempts and leave the file ``abandoned``.
     """
     mime = mime_type or mimetypes.guess_type(str(path))[0] or ""
-    name = getattr(path, "name", path)
     for attempt in range(1, PREVIEW_ATTEMPTS + 1):
         try:
             result = capture_thumbnail(path, mime, ffmpeg)
             break
         except ThumbnailError as exc:
             if attempt == PREVIEW_ATTEMPTS:
-                log.warning("no preview for %s after %s attempts, uploading without one: %s",
-                            name, attempt, exc)
+                log.warning("no preview after %s attempts, uploading without one: %s", attempt, exc)
                 return None
-            log.info("preview attempt %s for %s failed: %s", attempt, name, exc)
+            log.info("preview attempt %s failed: %s", attempt, exc)
     if result.kind != "ready":
         if result.error:
-            log.info("no preview for %s: %s", getattr(path, "name", path), result.error)
+            log.info("no preview: %s", result.error)
         return None
     return result.jpeg, result.width, result.height
 
@@ -1468,17 +1466,21 @@ def _tag_message(doc, message_id) -> None:
         pass
 
 
+def label_for(message_id) -> str:
+    """The ``id=0x...`` tag last registered for a message, else ``id=?``.
+
+    Never the message id and never a file name from Telegram's attributes: both
+    identify what the person stored, and this ends up in bridge.log.
+    """
+    try:
+        return READ_LABELS.get(int(message_id)) or "id=?"
+    except (TypeError, ValueError):
+        return "id=?"
+
+
 def _doc_label(doc) -> str:
-    """A short, log-safe name for a document or photo (for ``chunk timing``)."""
-    path = READ_LABELS.get(getattr(doc, "_td_msg", None))
-    if path:
-        return path if len(path) <= 70 else "..." + path[-67:]
-    for attr in getattr(doc, "attributes", None) or ():
-        name = getattr(attr, "file_name", None)
-        if name:
-            return name if len(name) <= 40 else name[:37] + "..."
-    kind = "doc" if hasattr(doc, "attributes") else "photo"
-    return f"{kind}:{getattr(doc, 'id', '?')}"
+    """A log-safe tag for a document or photo (for ``chunk timing``)."""
+    return label_for(getattr(doc, "_td_msg", None))
 
 
 def _media_size(media) -> Optional[int]:
