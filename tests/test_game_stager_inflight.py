@@ -5,9 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
-import gamestage
-from config import Config
-from gamestage import WRITER_STALE_SECONDS
+from teledrive_webdav.game import gamestage
+from teledrive_webdav.core.config import Config
+from teledrive_webdav.game.gamestage import WRITER_STALE_SECONDS
 
 
 class _Api:

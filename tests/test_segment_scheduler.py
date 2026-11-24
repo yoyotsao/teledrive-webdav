@@ -4,9 +4,9 @@ from dataclasses import dataclass
 
 import pytest
 
-from segment_scheduler import SegmentDescriptor, SegmentScheduler, SegmentState
-from transfer_models import AttemptLease, UploadedPart
-from upload_activity import AccountActivityRegistry, UploadSpeedTracker
+from teledrive_webdav.upload.segment_scheduler import SegmentDescriptor, SegmentScheduler, SegmentState
+from teledrive_webdav.upload.transfer_models import AttemptLease, UploadedPart
+from teledrive_webdav.upload.upload_activity import AccountActivityRegistry, UploadSpeedTracker
 
 
 class Clock:
@@ -37,7 +37,7 @@ class Lease:
 
     def close(self):
         if self.closed:
-            from upload_activity import ActivityChange
+            from teledrive_webdav.upload.upload_activity import ActivityChange
             return ActivityChange(self.runtime.telegram_user_id, False, False, False)
         self.closed = True
         self.fake_release_count += 1

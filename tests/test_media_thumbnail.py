@@ -9,7 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from media_thumbnail import (  # noqa: E402
+from teledrive_webdav.telegram.media_thumbnail import (  # noqa: E402
     ThumbnailError,
     capture_thumbnail,
     discover_ffmpeg,
@@ -34,7 +34,7 @@ def fake_ffmpeg(tmp_path, monkeypatch):
         calls.append((args, kwargs))
         return CompletedProcess(args, 0, jpeg.read_bytes(), b"")
 
-    monkeypatch.setattr("media_thumbnail.subprocess.run", run)
+    monkeypatch.setattr("teledrive_webdav.telegram.media_thumbnail.subprocess.run", run)
     return calls
 
 
@@ -99,7 +99,7 @@ def test_unsupported_video_codec_is_explicitly_undecodable(tmp_path, fake_ffmpeg
     def invalid(args, **kwargs):
         return CompletedProcess(args, 1, b"", b"Invalid data found when processing input")
 
-    monkeypatch.setattr("media_thumbnail.subprocess.run", invalid)
+    monkeypatch.setattr("teledrive_webdav.telegram.media_thumbnail.subprocess.run", invalid)
     path = tmp_path / "bad.mkv"
     path.write_bytes(b"unsupported codec")
 
@@ -113,7 +113,7 @@ def test_video_that_decodes_but_yields_no_frame_raises_capture_error(tmp_path, f
     def empty(args, **kwargs):
         return CompletedProcess(args, 0, b"", b"")
 
-    monkeypatch.setattr("media_thumbnail.subprocess.run", empty)
+    monkeypatch.setattr("teledrive_webdav.telegram.media_thumbnail.subprocess.run", empty)
     path = tmp_path / "empty.mp4"
     path.write_bytes(b"decodable but no frame")
 
@@ -123,7 +123,7 @@ def test_video_that_decodes_but_yields_no_frame_raises_capture_error(tmp_path, f
 
 def test_ffmpeg_discovery_uses_config_then_environment_then_path(monkeypatch):
     monkeypatch.setenv("FFMPEG", "from-environment")
-    monkeypatch.setattr("media_thumbnail.shutil.which", lambda command: "from-path")
+    monkeypatch.setattr("teledrive_webdav.telegram.media_thumbnail.shutil.which", lambda command: "from-path")
 
     assert discover_ffmpeg("configured") == "configured"
     assert discover_ffmpeg("") == "from-environment"

@@ -30,8 +30,8 @@ class FakeClock:
 @pytest.fixture
 def module():
     # Keep a missing implementation an explicit test failure, not collection error.
-    assert importlib.util.find_spec("upload_limiter"), "Web limiter module is missing"
-    return importlib.import_module("upload_limiter")
+    assert importlib.util.find_spec("teledrive_webdav.upload.upload_limiter"), "Web limiter module is missing"
+    return importlib.import_module("teledrive_webdav.upload.upload_limiter")
 
 
 @pytest.fixture

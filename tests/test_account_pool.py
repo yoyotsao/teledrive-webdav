@@ -8,11 +8,11 @@ from types import SimpleNamespace
 
 import pytest
 
-import tdapi
-from config import ConfigError
-from telegram_accounts import AccountUnavailableError, TelegramAccountPool
-from tgio import TelegramWorker
-from transfer_models import AccountSpec
+from teledrive_webdav.core import tdapi
+from teledrive_webdav.core.config import ConfigError
+from teledrive_webdav.telegram.telegram_accounts import AccountUnavailableError, TelegramAccountPool
+from teledrive_webdav.telegram.tgio import TelegramWorker
+from teledrive_webdav.upload.transfer_models import AccountSpec
 
 
 class FakeWorker:
@@ -277,7 +277,7 @@ def test_runtime_binds_its_injected_chunk_limiter_to_its_worker():
 
 
 def test_from_config_builds_and_binds_one_persisted_limiter_per_account(tmp_path):
-    from upload_limiter import AdaptiveUploadLimiter
+    from teledrive_webdav.upload.upload_limiter import AdaptiveUploadLimiter
 
     session_dir = tmp_path / "sessions"
     session_dir.mkdir()

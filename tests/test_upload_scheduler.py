@@ -19,13 +19,13 @@ from types import SimpleNamespace
 
 import pytest
 
-import gamestage
-import upload_engine
-import uploadstage
-from fileid import path_id
-from gamestage import WRITER_STALE_SECONDS
-from telegram_accounts import TelegramAccountPool
-from transfer_models import (
+from teledrive_webdav.game import gamestage
+from teledrive_webdav.upload import upload_engine
+from teledrive_webdav.upload import uploadstage
+from teledrive_webdav.core.fileid import path_id
+from teledrive_webdav.game.gamestage import WRITER_STALE_SECONDS
+from teledrive_webdav.telegram.telegram_accounts import TelegramAccountPool
+from teledrive_webdav.upload.transfer_models import (
     AccountSpec,
     QueueStage,
     TransferRequest,

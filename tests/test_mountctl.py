@@ -2,7 +2,7 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
-import mountctl
+from teledrive_webdav.windows import mountctl
 
 
 def cfg(tmp_path):
@@ -74,7 +74,7 @@ def test_mount_command_uses_configured_cache_sizes(tmp_path):
 
 def test_rclone_size_rejects_typos():
     import pytest
-    from config import ConfigError, rclone_size
+    from teledrive_webdav.core.config import ConfigError, rclone_size
 
     assert rclone_size("x", " 1.5T ") == "1.5T"
     for bad in ("160GB", "0G", "-5G", "big", ""):

@@ -19,13 +19,13 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import bridge  # noqa: E402
-import gamestage  # noqa: E402
-import upload_engine  # noqa: E402
-import warmup  # noqa: E402
-from config import Config  # noqa: E402
-from telegram_accounts import AccountUnavailableError, TelegramAccountPool  # noqa: E402
-from transfer_models import AccountSpec, TransferResult, UploadedPart  # noqa: E402
+from teledrive_webdav.dav import bridge  # noqa: E402
+from teledrive_webdav.game import gamestage  # noqa: E402
+from teledrive_webdav.upload import upload_engine  # noqa: E402
+from teledrive_webdav.windows import warmup  # noqa: E402
+from teledrive_webdav.core.config import Config  # noqa: E402
+from teledrive_webdav.telegram.telegram_accounts import AccountUnavailableError, TelegramAccountPool  # noqa: E402
+from teledrive_webdav.upload.transfer_models import AccountSpec, TransferResult, UploadedPart  # noqa: E402
 
 
 class RecordingEngine:
@@ -201,7 +201,7 @@ def rpc(cfg):
     engine = RecordingEngine()
     resolver = bridge.Resolver(cfg, api, pool)
     stager = gamestage.GameStager(cfg, api, engine)
-    from uploadstage import UploadStager
+    from teledrive_webdav.upload.uploadstage import UploadStager
 
     upload_stager = UploadStager(cfg, api, engine)
     app = bridge.RpcApp(cfg, resolver, None, stager, upload_stager)
@@ -307,7 +307,7 @@ def test_warmup_reads_previews_and_properties_through_the_owning_account(cfg):
     for identity in (1, 2):
         pool.runtime(identity).online = pool.runtime(identity).linked = True
 
-    from tdapi import Entry
+    from teledrive_webdav.core.tdapi import Entry
 
     entries = [
         Entry(file_id="a", name="a.jpg", is_dir=False, size=4, mtime=0.0, mime="image/jpeg",

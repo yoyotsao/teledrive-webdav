@@ -3,7 +3,7 @@ accepted into quarantine so rclone's endless writeback retry stops."""
 
 import io
 
-from rejectedputs import RejectedPuts
+from teledrive_webdav.dav.rejectedputs import RejectedPuts
 
 
 class Clock:

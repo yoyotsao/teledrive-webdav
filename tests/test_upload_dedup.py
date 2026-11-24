@@ -9,8 +9,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from transfer_models import TransferRequest  # noqa: E402
-from upload_engine import (  # noqa: E402
+from teledrive_webdav.upload.transfer_models import TransferRequest  # noqa: E402
+from teledrive_webdav.upload.upload_engine import (  # noqa: E402
     CoverageError,
     FingerprintClaims,
     UploadEngine,

@@ -12,8 +12,8 @@ import time
 
 import pytest
 
-import tdapi
-from tdapi import BackendUnavailable, TeleDriveClient
+from teledrive_webdav.core import tdapi
+from teledrive_webdav.core.tdapi import BackendUnavailable, TeleDriveClient
 
 
 class Cfg:
@@ -192,7 +192,7 @@ def test_the_stale_warning_is_logged_once_per_folder(tmp_path, caplog):
 
 
 def test_list_deadline_must_be_between_2_and_60():
-    from config import ConfigError, list_deadline
+    from teledrive_webdav.core.config import ConfigError, list_deadline
     assert list_deadline("8") == 8.0
     for bad in ("1", "61", "0", "x"):
         with pytest.raises(ConfigError):

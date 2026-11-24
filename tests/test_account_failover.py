@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from telegram_accounts import TelegramAccountPool
-from transfer_models import AccountSpec, AttemptLease, UploadRpcToken
+from teledrive_webdav.telegram.telegram_accounts import TelegramAccountPool
+from teledrive_webdav.upload.transfer_models import AccountSpec, AttemptLease, UploadRpcToken
 
 
 class Worker:

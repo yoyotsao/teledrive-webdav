@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 
 :: One step: start the bridge. The bridge mounts the drive itself once it is
-:: serving (mountctl.py, config.ini [bridge] mount_drive), and does nothing if
+:: serving (teledrive_webdav/windows/mountctl.py, config.ini [bridge] mount_drive), and does nothing if
 :: the drive is already mounted -- so running this twice is harmless.
 
 set PY=.venv\Scripts\python.exe
@@ -32,7 +32,7 @@ set /a tries=0
 set /a tries+=1
 call :health
 if not errorlevel 1 (
-  "%PY%" mountctl.py check >nul 2>&1
+  "%PY%" -m teledrive_webdav.windows.mountctl check >nul 2>&1
   if not errorlevel 1 goto ready
 )
 if %tries% GEQ 40 (

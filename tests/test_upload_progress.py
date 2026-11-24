@@ -7,13 +7,13 @@ from pathlib import Path
 
 import pytest
 
-import fileid
-import upload_engine
-from segment_scheduler import SegmentDescriptor, SegmentScheduler
+from teledrive_webdav.core import fileid
+from teledrive_webdav.upload import upload_engine
+from teledrive_webdav.upload.segment_scheduler import SegmentDescriptor, SegmentScheduler
 from test_bridge_e2e import _upload_now, rig  # noqa: F401
 from test_segment_scheduler import Clock, Pool
-from transfer_models import TransferRequest
-from upload_activity import AccountActivityRegistry, UploadSpeedTracker
+from teledrive_webdav.upload.transfer_models import TransferRequest
+from teledrive_webdav.upload.upload_activity import AccountActivityRegistry, UploadSpeedTracker
 
 MIB = 1 << 20
 

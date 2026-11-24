@@ -20,8 +20,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import upload_engine  # noqa: E402
-from transfer_models import TransferRequest  # noqa: E402
+from teledrive_webdav.upload import upload_engine  # noqa: E402
+from teledrive_webdav.upload.transfer_models import TransferRequest  # noqa: E402
 
 # thumb/slot are left out when zero and migrated/extra_sent when nothing moved;
 # speed only for a single segment (see _log_complete).
@@ -58,7 +58,7 @@ class Limiter:
 
 class Pool:
     def __init__(self):
-        from upload_activity import AccountActivityRegistry, UploadSpeedTracker
+        from teledrive_webdav.upload.upload_activity import AccountActivityRegistry, UploadSpeedTracker
 
         self.runtime = SimpleNamespace(
             worker=Worker(), telegram_user_id=Worker.user_id,

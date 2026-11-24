@@ -7,14 +7,14 @@ from pathlib import Path
 
 import pytest
 
-from sessionctl import (
+from teledrive_webdav.telegram.sessionctl import (
     PosixSessionPermissionPolicy,
     SessionCtlError,
     SessionExistsError,
     login_session,
     resolve_session_dir_for_cli,
 )
-from telegram_sessions import SessionDirectoryLock
+from teledrive_webdav.telegram.telegram_sessions import SessionDirectoryLock
 
 
 class FakePolicy:
@@ -187,7 +187,7 @@ def test_windows_acl_runner_passes_path_to_script(tmp_path):
     # `powershell -Command <script> <path>` never binds <path> to $args, so
     # every ACL call used to fail with a null path. The path must arrive
     # intact, including spaces and single quotes.
-    from sessionctl import WindowsSessionPermissionPolicy
+    from teledrive_webdav.telegram.sessionctl import WindowsSessionPermissionPolicy
 
     target = tmp_path / "it's a dir"
     target.mkdir()

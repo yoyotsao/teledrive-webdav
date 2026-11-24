@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-import fileid
-import fileinfo
-from fileid import path_id
+from teledrive_webdav.core import fileid
+from teledrive_webdav.windows import fileinfo
+from teledrive_webdav.core.fileid import path_id
 
 MARK = "PRIVATE-名前-123.jpg"
 FOLDER = "PRIVATE-folder"

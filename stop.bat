@@ -21,7 +21,7 @@ if errorlevel 1 (
 )
 
 echo [2/3] unmounting (rclone core/quit, no force)...
-"%PY%" mountctl.py stop
+"%PY%" -m teledrive_webdav.windows.mountctl stop
 if errorlevel 1 (
   echo   [error] rclone is still mounted. Close whatever has the drive open and run stop.bat again.
   exit /b 1

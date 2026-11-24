@@ -10,8 +10,8 @@ from pathlib import Path
 
 import pytest
 
-import fileid
-from fileid import UNKNOWN_TAG, path_id, tag, tag_dav, tag_drive, tag_local
+from teledrive_webdav.core import fileid
+from teledrive_webdav.core.fileid import UNKNOWN_TAG, path_id, tag, tag_dav, tag_drive, tag_local
 
 VECTORS = {
     "": 0x4BF29CE484222325,

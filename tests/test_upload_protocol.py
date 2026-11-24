@@ -12,7 +12,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tgupload import (  # noqa: E402
+from teledrive_webdav.telegram.tgupload import (  # noqa: E402
     BIG_PART_SIZE,
     SMALL_PART_SIZE,
     _PartReader,
@@ -21,7 +21,7 @@ from tgupload import (  # noqa: E402
     upload_big_file_parts,
     upload_small_file_parts,
 )
-from tgio import TelegramWorker  # noqa: E402
+from teledrive_webdav.telegram.tgio import TelegramWorker  # noqa: E402
 
 
 def run(coro):
@@ -302,8 +302,8 @@ def test_worker_uses_explicit_small_primitive_instead_of_telethon_shortcut(monke
 
     worker._upload_client = upload_client
     worker._upload_gate = lambda: limiter
-    monkeypatch.setattr("tgupload.upload_small_file_parts", upload_small)
-    monkeypatch.setattr("tgupload.upload_big_file_parts", upload_big)
+    monkeypatch.setattr("teledrive_webdav.telegram.tgupload.upload_small_file_parts", upload_small)
+    monkeypatch.setattr("teledrive_webdav.telegram.tgupload.upload_big_file_parts", upload_big)
 
     result = run(worker._upload_segment(io.BytesIO(b"x"), 1, "x.bin", None))
 

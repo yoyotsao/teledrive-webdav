@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from config import ConfigError, load_config
-from transfer_models import UploadedPart
+from teledrive_webdav.core.config import ConfigError, load_config
+from teledrive_webdav.upload.transfer_models import UploadedPart
 
 
 def write_config(tmp_path: Path, extra: str = "") -> Path:

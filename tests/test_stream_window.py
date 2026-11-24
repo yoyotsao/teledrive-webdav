@@ -9,9 +9,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import tgio  # noqa: E402
-from tgio import REQUEST_SIZE, SeekableRemoteFile  # noqa: E402
-from transfer_models import RemotePart  # noqa: E402
+from teledrive_webdav.telegram import tgio  # noqa: E402
+from teledrive_webdav.telegram.tgio import REQUEST_SIZE, SeekableRemoteFile  # noqa: E402
+from teledrive_webdav.upload.transfer_models import RemotePart  # noqa: E402
 
 
 class FakeWorker:
@@ -105,7 +105,7 @@ def test_expired_file_reference_refreshes_and_retries_the_chunk():
         pass
 
     f, worker, expected = make([3 * REQUEST_SIZE], fail={(1, REQUEST_SIZE): Expired("FILE_REFERENCE_EXPIRED")})
-    import tgio as t
+    from teledrive_webdav.telegram import tgio as t
 
     orig = t._is_file_reference_error
     t._is_file_reference_error = lambda exc: isinstance(exc, Expired)

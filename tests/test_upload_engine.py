@@ -10,13 +10,13 @@ from types import SimpleNamespace
 
 import pytest
 
-import gamestage
-import tgupload
-import upload_engine
-from media_thumbnail import ThumbnailResult
-from telegram_accounts import TelegramAccountPool
-from tgio import TelegramWorker
-from transfer_models import AccountSpec, TransferRequest, TransferResult, UploadedPart
+from teledrive_webdav.game import gamestage
+from teledrive_webdav.telegram import tgupload
+from teledrive_webdav.upload import upload_engine
+from teledrive_webdav.telegram.media_thumbnail import ThumbnailResult
+from teledrive_webdav.telegram.telegram_accounts import TelegramAccountPool
+from teledrive_webdav.telegram.tgio import TelegramWorker
+from teledrive_webdav.upload.transfer_models import AccountSpec, TransferRequest, TransferResult, UploadedPart
 
 MiB = 1024 * 1024
 
@@ -190,7 +190,7 @@ def test_segments_overlap_and_results_return_in_plan_order(rig, monkeypatch):
 
 
 def test_only_segment_zero_has_thumbnail_and_upload_uses_chunk_limiter(rig, monkeypatch):
-    monkeypatch.setattr("tgio.capture_thumbnail", lambda *_: ThumbnailResult("ready", b"jpeg", 640, 360))
+    monkeypatch.setattr("teledrive_webdav.telegram.tgio.capture_thumbnail", lambda *_: ThumbnailResult("ready", b"jpeg", 640, 360))
     result = rig.engine().transfer(rig.request(500 * MiB + 1, "video/mp4"))
     assert [p.has_thumbnail for p in result.parts] == [True, False]
     first = rig.workers[1].client

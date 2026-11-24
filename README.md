@@ -72,7 +72,7 @@ primary_user_id = 123456789
 ### 3. 建立 Telegram SQLite session
 
 ```powershell
-python sessionctl.py login --config config.ini
+python -m teledrive_webdav.telegram.sessionctl login --config config.ini
 ```
 
 它會互動式詢問手機、驗證碼與 2FA；成功後只留下 `<telegram_user_id>.session`。要加入次要帳號就重跑一次，所有帳號都放同一個目錄，新增後重啟 bridge 即可。第一個／主要帳號不是看檔名順序，而是由 `primary_user_id` 明確指定。
@@ -80,7 +80,7 @@ python sessionctl.py login --config config.ini
 `.session` 是**未加密的 bearer credential**：拿到檔案的人等同拿到登入權限。不要放進 repo、同步碟或備份公開區。若舊的 StringSession 已經外洩，應先在 Telegram 撤銷該登入再用 `sessionctl login` 建新 session；不要把已外洩憑證遷移過來。只有確認舊 plaintext 從未外洩時，才可用：
 
 ```powershell
-python sessionctl.py migrate --config config.ini
+python -m teledrive_webdav.telegram.sessionctl migrate --config config.ini
 ```
 
 ### 大檔 premium flood 自動接手
@@ -122,7 +122,7 @@ Telegram wait 結束後，直到第一個真正的 `sender.send()` 才開始 60 
 ### 5. 裝右鍵選單
 
 ```powershell
-.venv\Scripts\python.exe install_menu.py --install
+.venv\Scripts\python.exe -m teledrive_webdav.windows.install_menu --install
 ```
 
 之後在 `H:` 底下的檔案按右鍵 → **顯示更多選項**（或按 Shift+F10）→
@@ -139,7 +139,7 @@ Telegram wait 結束後，直到第一個真正的 `sender.send()` 才開始 60 
 
 ```powershell
 shellthumb\build.bat
-.venv\Scripts\python.exe install_thumb.py --install
+.venv\Scripts\python.exe -m teledrive_webdav.windows.install_thumb --install
 ```
 
 （`build.bat` 會編出兩個東西：處理常式的 DLL，以及步驟 7 預熱要用的
@@ -149,7 +149,7 @@ shellthumb\build.bat
 
 ```powershell
 cd D:\python\teledrive-webdav
-.venv\Scripts\python.exe install_thumb.py --install-props
+.venv\Scripts\python.exe -m teledrive_webdav.windows.install_thumb --install-props
 ```
 
 （第二行處理的是「圖片尺寸」。少了它，檔案總管會為了知道長寬去讀每張圖的檔頭，
@@ -158,7 +158,7 @@ cd D:\python\teledrive-webdav
 想確認裝好了沒：
 
 ```powershell
-.venv\Scripts\python.exe install_thumb.py --status
+.venv\Scripts\python.exe -m teledrive_webdav.windows.install_thumb --status
 ```
 
 **要移除**：`--uninstall`（縮圖）和 `--uninstall-props`（屬性，需管理員）。
@@ -198,8 +198,8 @@ Windows 的縮圖與屬性處理是**依副檔名**註冊的，沒有「只對�
 想立刻抓完（例如剛裝好、今晚就要用），可以另外手動跑一次：
 
 ```powershell
-.venv\Scripts\python.exe warmup.py            # 全部
-.venv\Scripts\python.exe warmup.py pixiv      # 只抓某一區
+.venv\Scripts\python.exe -m teledrive_webdav.windows.warmup            # 全部
+.venv\Scripts\python.exe -m teledrive_webdav.windows.warmup pixiv      # 只抓某一區
 ```
 
 手動跑不會禮讓，所以快得多，但跑的時候瀏覽會比較卡。**不需要跟 bridge 同時跑**——
@@ -237,7 +237,7 @@ Windows 的縮圖與屬性處理是**依副檔名**註冊的，沒有「只對�
 也可以用指令：
 
 ```powershell
-.venv\Scripts\python.exe fetchlocal.py "H:\game\MyGame"
+.venv\Scripts\python.exe -m teledrive_webdav.windows.fetchlocal "H:\game\MyGame"
 ```
 
 ---
@@ -247,7 +247,7 @@ Windows 的縮圖與屬性處理是**依副檔名**註冊的，沒有「只對�
 ### `H:` 沒出現 / start.bat 跑失敗
 
 - 訊息裡有 `rclone is not on PATH` → rclone 沒裝好，或裝完沒重開 PowerShell
-- 訊息裡有 `bridge did not come up` → 執行 `.venv\Scripts\python.exe bridge.py`，
+- 訊息裡有 `bridge did not come up` → 執行 `.venv\Scripts\python.exe -m teledrive_webdav.dav.bridge`，
   視窗裡會直接印出原因（通常是 config.ini 或憑證的問題）
 - `H:` 已經被別的東西佔用 → 改 `config.ini` 的 `mount_drive`（只有這一處）
 
@@ -256,8 +256,8 @@ Windows 的縮圖與屬性處理是**依副檔名**註冊的，沒有「只對�
 依序試：
 
 1. `start.bat` 的視窗還開著嗎？關掉就沒有磁碟了
-2. `.venv\Scripts\python.exe install_thumb.py --status` —— 兩個 handler 都有裝嗎？
-3. `.venv\Scripts\python.exe warmup.py` —— 新上傳的東西背景預抓還沒輪到，手動跑一次就好
+2. `.venv\Scripts\python.exe -m teledrive_webdav.windows.install_thumb --status` —— 兩個 handler 都有裝嗎？
+3. `.venv\Scripts\python.exe -m teledrive_webdav.windows.warmup` —— 新上傳的東西背景預抓還沒輪到，手動跑一次就好
 
 正常速度是**每秒 10 張以上**。進一個從沒開過的資料夾，第一個檔案可能要等十秒左右
 （在解析路徑），之後就順了。
@@ -283,9 +283,9 @@ Windows 的縮圖與屬性處理是**依副檔名**註冊的，沒有「只對�
 ### 檔案總管的縮圖怪怪的、想整個關掉
 
 ```powershell
-.venv\Scripts\python.exe install_thumb.py --uninstall
+.venv\Scripts\python.exe -m teledrive_webdav.windows.install_thumb --uninstall
 # 系統管理員身分：
-.venv\Scripts\python.exe install_thumb.py --uninstall-props
+.venv\Scripts\python.exe -m teledrive_webdav.windows.install_thumb --uninstall-props
 ```
 
 會完整還原成沒裝之前的狀態。

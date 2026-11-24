@@ -3,8 +3,8 @@ import json
 
 import pytest
 
-import fileinfo
-from fileid import path_id
+from teledrive_webdav.windows import fileinfo
+from teledrive_webdav.core.fileid import path_id
 from test_fileinfo import FOLDER, MARK, _lookup, _row, drive  # noqa: F401
 
 

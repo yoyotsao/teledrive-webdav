@@ -7,9 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from config import ConfigError, load_config
-from telegram_sessions import discover_account_specs
-from transfer_models import AccountSpec
+from teledrive_webdav.core.config import ConfigError, load_config
+from teledrive_webdav.telegram.telegram_sessions import discover_account_specs
+from teledrive_webdav.upload.transfer_models import AccountSpec
 
 
 def _root_and_sessions(tmp_path: Path):
@@ -159,8 +159,8 @@ def test_legacy_only_config_is_rejected_without_rendering_secret(tmp_path, monke
 def test_runtime_has_no_plaintext_session_configuration():
     # Task 6 will keep this as a repository-wide guard; adding it now ensures
     # Task 1 does not accidentally retain the old runtime fallback.
-    assert "TELEGRAM_SESSION_STRING" not in Path("config.py").read_text("utf-8")
-    assert 'get("telegram", "session")' not in Path("config.py").read_text("utf-8")
+    assert "TELEGRAM_SESSION_STRING" not in Path("teledrive_webdav/core/config.py").read_text("utf-8")
+    assert 'get("telegram", "session")' not in Path("teledrive_webdav/core/config.py").read_text("utf-8")
 
 
 def test_a_leftover_session_dir_setting_is_ignored(tmp_path, monkeypatch, caplog):

@@ -14,8 +14,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import zipfs  # noqa: E402
-from tdapi import JsonStore  # noqa: E402
+from teledrive_webdav.dav import zipfs  # noqa: E402
+from teledrive_webdav.core.tdapi import JsonStore  # noqa: E402
 
 CONTENTS = {
     "bin/game.exe": b"MZ" + bytes(range(256)) * 40,

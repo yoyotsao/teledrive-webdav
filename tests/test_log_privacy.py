@@ -12,8 +12,8 @@ from urllib.parse import quote
 
 import pytest
 
-from fileid import path_id, tag, tag_dav
-import logscrub
+from teledrive_webdav.core.fileid import path_id, tag, tag_dav
+from teledrive_webdav.core import logscrub
 
 MARK = "PRIVATE-名前-123.jpg"
 FMT = "%(asctime)s %(levelname)-7s %(name)-10s %(message)s"
@@ -143,7 +143,7 @@ def _fake_cfg(cache):
 
 
 def test_console_queue_path_is_scrubbed_with_single_timestamp(cache, capsys):
-    import bridge
+    from teledrive_webdav.dav import bridge
 
     cache.mkdir(parents=True)
     root = logging.getLogger()
@@ -263,7 +263,7 @@ def test_guard_listing_failure_and_rejected_writes(rig, prod_log, capsys, monkey
 
 
 def test_unknown_label_prints_id_question_mark_never_the_message_id():
-    import tgio
+    from teledrive_webdav.telegram import tgio
 
     assert tgio.label_for(987654321) == "id=?"
     assert tgio.label_for(None) == "id=?"
@@ -272,7 +272,7 @@ def test_unknown_label_prints_id_question_mark_never_the_message_id():
 
 
 def test_identity_mismatch_error_names_neither_id():
-    import tgio
+    from teledrive_webdav.telegram import tgio
 
     media = type("M", (), {"id": 111222333})()
     with pytest.raises(tgio.RemoteIdentityError) as err:
@@ -284,7 +284,7 @@ def test_chunk_timing_lists_files_by_id_slowest_first(caplog):
     import time
     import types
 
-    import tgio
+    from teledrive_webdav.telegram import tgio
 
     tgio.note_read_label(701, tag("fast/one.bin"))
     tgio.note_read_label(702, tag("slow/two.bin"))
@@ -396,8 +396,8 @@ def test_coverage_error_names_the_file_by_id_only():
     import types
     from pathlib import Path
 
-    import upload_engine
-    from transfer_models import TransferRequest
+    from teledrive_webdav.upload import upload_engine
+    from teledrive_webdav.upload.transfer_models import TransferRequest
 
     engine = object.__new__(upload_engine.UploadEngine)
     engine.api = types.SimpleNamespace(check_hash=lambda fingerprint: {"files": []})
@@ -414,7 +414,7 @@ def test_missing_telegram_media_error_has_no_message_id():
     import asyncio
     import types
 
-    import tgio
+    from teledrive_webdav.telegram import tgio
 
     async def get_messages(*a, **k):
         return [None]
@@ -429,7 +429,7 @@ def test_7zip_stderr_member_names_do_not_reach_the_error(monkeypatch, tmp_path):
     import subprocess
     import sys
 
-    import gamestage
+    from teledrive_webdav.game import gamestage
 
     def fake_run(*a, **k):
         return types.SimpleNamespace(returncode=2, stdout="", stderr="ERROR: CRC Failed : Game\\save\\PRIVATE.dat")

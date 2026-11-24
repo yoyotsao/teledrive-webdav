@@ -15,9 +15,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import tdapi  # noqa: E402
-from tdapi import Entry, _clip_parts, _hash_size  # noqa: E402
-from transfer_models import RemotePart  # noqa: E402
+from teledrive_webdav.core import tdapi  # noqa: E402
+from teledrive_webdav.core.tdapi import Entry, _clip_parts, _hash_size  # noqa: E402
+from teledrive_webdav.upload.transfer_models import RemotePart  # noqa: E402
 
 PART = 512 * 1024
 SEG = 1000 * PART  # 524288000
@@ -119,7 +119,7 @@ class FakeApi:
         self._cache = {}
 
     # borrowed implementations under test
-    from tdapi import TeleDriveClient
+    from teledrive_webdav.core.tdapi import TeleDriveClient
 
     parts_for = TeleDriveClient.parts_for
     total_size = TeleDriveClient.total_size
@@ -200,7 +200,7 @@ def test_clipping_survives_the_disk_cache():
 
 
 def test_flush_keeps_entries_another_writer_added(tmp_path):
-    from tdapi import JsonStore
+    from teledrive_webdav.core.tdapi import JsonStore
 
     path = tmp_path / "shared.json"
     first = JsonStore(path)
@@ -220,7 +220,7 @@ def test_flush_keeps_entries_another_writer_added(tmp_path):
 
 
 def test_flush_is_a_noop_when_nothing_changed(tmp_path):
-    from tdapi import JsonStore
+    from teledrive_webdav.core.tdapi import JsonStore
 
     path = tmp_path / "quiet.json"
     store = JsonStore(path)
@@ -229,7 +229,7 @@ def test_flush_is_a_noop_when_nothing_changed(tmp_path):
 
 
 def test_later_value_wins_over_the_file(tmp_path):
-    from tdapi import JsonStore
+    from teledrive_webdav.core.tdapi import JsonStore
 
     path = tmp_path / "shared.json"
     JsonStore(path).put("k", "old")
@@ -299,7 +299,7 @@ def test_json_store_put_during_flush_neither_crashes_nor_drops(tmp_path, monkeyp
     reads the whole file instead. A put landing between the snapshot and the
     merge was also dropped from memory for good.
     """
-    from tdapi import JsonStore
+    from teledrive_webdav.core.tdapi import JsonStore
 
     path = tmp_path / "props.json"
     store = JsonStore(path)

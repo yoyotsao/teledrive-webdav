@@ -30,17 +30,17 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import bridge  # noqa: E402
-import gamestage  # noqa: E402
-import tgio  # noqa: E402
-import tgupload  # noqa: E402
-import upload_engine  # noqa: E402
-from config import Config  # noqa: E402
-from fileid import path_id  # noqa: E402
-from fetchlocal import LocalFetcher  # noqa: E402
-from gamestage import GameStager  # noqa: E402
-from tdapi import TeleDriveClient  # noqa: E402
-from uploadstage import UploadStager  # noqa: E402
+from teledrive_webdav.dav import bridge  # noqa: E402
+from teledrive_webdav.game import gamestage  # noqa: E402
+from teledrive_webdav.telegram import tgio  # noqa: E402
+from teledrive_webdav.telegram import tgupload  # noqa: E402
+from teledrive_webdav.upload import upload_engine  # noqa: E402
+from teledrive_webdav.core.config import Config  # noqa: E402
+from teledrive_webdav.core.fileid import path_id  # noqa: E402
+from teledrive_webdav.windows.fetchlocal import LocalFetcher  # noqa: E402
+from teledrive_webdav.game.gamestage import GameStager  # noqa: E402
+from teledrive_webdav.core.tdapi import TeleDriveClient  # noqa: E402
+from teledrive_webdav.upload.uploadstage import UploadStager  # noqa: E402
 
 PAGE_SIZE = 10000
 
@@ -177,7 +177,7 @@ class FakeWorker:
     def prepare_album_item(self, source, size, file_name, mime_type, preview=None, *, message_limiter=None):
         from pathlib import Path
 
-        from transfer_models import PreparedAlbumItem
+        from teledrive_webdav.upload.transfer_models import PreparedAlbumItem
 
         self._next_id += 1
         document_id = str(self._next_id)
@@ -192,7 +192,7 @@ class FakeWorker:
         )
 
     def send_album(self, items, timeout=60, *, message_limiter=None):
-        from transfer_models import UploadedPart
+        from teledrive_webdav.upload.transfer_models import UploadedPart
 
         parts = []
         for item in items:
@@ -1955,7 +1955,7 @@ def test_props_rpc_caches_on_disk(rig):
 
 
 def _warmer(rig, **kw):
-    from warmup import Warmer
+    from teledrive_webdav.windows.warmup import Warmer
 
     kw.setdefault("quiet", 0.0)
     # No shell warm by default: it drives the real Windows thumbnail pipeline
@@ -2017,7 +2017,7 @@ def test_fill_fetches_the_head_of_still_images_and_drops_it_after(rig):
     itself found anything to do (shell_exe is None in these tests), because
     nothing past that one read ever looks at it again.
     """
-    from bridge import HEAD_SIZE
+    from teledrive_webdav.dav.bridge import HEAD_SIZE
 
     warmer = _warmer(rig)
     _, todo = warmer.pending()
@@ -2134,7 +2134,7 @@ def test_warmup_stops_mid_pass_when_asked(rig):
 
 
 def test_background_warmup_runs_a_pass_and_shuts_down(rig):
-    from warmup import BackgroundWarmup
+    from teledrive_webdav.windows.warmup import BackgroundWarmup
 
     warmup = BackgroundWarmup(rig.resolver, interval_minutes=60, start_delay=0.0)
     warmup.start()
@@ -2246,7 +2246,7 @@ def test_a_failed_put_inside_game_removes_its_partial_file(rig):
 
 
 def _break_listings(rig, monkeypatch):
-    import tdapi
+    from teledrive_webdav.core import tdapi
 
     real = rig.backend.call
 

@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from sessionctl import MigrationResult, SessionCtlError, migrate_legacy_sessions
-from telegram_sessions import SessionDirectoryLock
+from teledrive_webdav.telegram.sessionctl import MigrationResult, SessionCtlError, migrate_legacy_sessions
+from teledrive_webdav.telegram.telegram_sessions import SessionDirectoryLock
 
 
 class Policy:

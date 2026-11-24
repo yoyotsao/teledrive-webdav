@@ -7,7 +7,7 @@ Explorer 右鍵「儲存在本地」──▶ registry verb ──▶ POST 127.0
 Explorer 縮圖 ──▶ shellthumb.dll (IThumbnailProvider) ──▶ GET /rpc/thumb
 Explorer 屬性 ──▶ shellthumb.dll (IPropertyStore)     ──▶ GET /rpc/props
                                                           │
-H:  ──rclone mount(WinFsp)──▶ http://127.0.0.1:8081  (bridge.py, Python)
+H:  ──rclone mount(WinFsp)──▶ http://127.0.0.1:8081  (teledrive_webdav/dav/bridge.py, Python)
                                         │
                      metadata (HTTPS + JWT)          位元組 (MTProto)
                                         ▼                    ▼
@@ -46,39 +46,55 @@ bridge 只用現有 public API，沒有為它新增任何會讀寫二進位資�
   而且 crash 之後還在。
   **log 與 `/rpc/status` 不寫檔名／路徑，檔案一律是 `id=0x<16 位十六進位>`**（rclone 的穩定檔案 ID，
   與 rclone.log、`fsutil file queryFileID`、thumbcache 是同一個數字）。
-  `python fileid.py tag "H:\路徑"` 離線算出某個檔的 ID；`python fileid.py info 0x…`
+  `python -m teledrive_webdav.core.fileid tag "H:\路徑"` 離線算出某個檔的 ID；`python -m teledrive_webdav.core.fileid info 0x…`
   （或 bridge 開著時 `GET /rpc/fileinfo?id=0x…`）回報它是什麼類型的檔、在哪、什麼狀態，
   **不含名字**，可以直接貼出去。
 
 ## 檔案
 
+Python 程式在 `teledrive_webdav/` 套件底下，依職責分六個子套件；根目錄只留 `.bat` 與設定檔。
+bridge 以 `python -m teledrive_webdav.dav.bridge` 啟動，`stop_bridge.ps1` 靠命令列裡的這個名字辨識進程
+（過渡期仍認舊的 `bridge.py`）。
+import 一律寫完整路徑（`from teledrive_webdav.telegram import tgio`）；CLI 一律在 repo 根目錄用
+`python -m teledrive_webdav.<套件>.<模組>` 執行（`.bat` 本來就 `cd` 到根目錄）。右鍵 verb 例外：
+Explorer 不給 cwd，所以它指向 `scripts/fetchlocal.py`，那支腳本自己把 repo 根目錄放進 `sys.path`。
+
+| 子套件 | 內容 |
+|---|---|
+| `core/` | 全專案共用：`config`、`fileid`、`logscrub`、`tdapi`（backend REST client） |
+| `telegram/` | MTProto 一切：`tgio`、`tgupload`、帳號與 session、`sessionctl`、`media_thumbnail` |
+| `upload/` | 上傳引擎與一般路徑暫存：`upload_engine`、limiter、activity、scheduler、`uploadstage` |
+| `game/` | `/game` 專屬：打包、下載狀態、啟動、遊玩時間、存檔、RAR 轉換、整包下載 |
+| `dav/` | WebDAV：`bridge`（provider + `/rpc` + 伺服器）、`rejectedputs`、`zipfs` |
+| `windows/` | rclone／WinFsp／Explorer 整合：`mountctl`、`mountwatch`、`warmup`、`fetchlocal`、`fileinfo`、`install_*` |
+
 | 檔案 | 職責 |
 |---|---|
-| `bridge.py` | wsgidav provider、寫入保護、`/rpc/*`、cheroot 伺服器（綁 127.0.0.1） |
-| `tdapi.py` | TeleDrive REST client：JWT 取得（bot challenge，見「踩過的坑」）/快取/401 自動重登、路徑解析、listing 快取（記憶體 + `meta/dirs/`，`/folders` 與 `/files` 併發，見「效能」第 7 節）、split part 表快取、`JsonStore` |
-| `tgio.py` | split 位移數學、Telethon worker（背景 event loop）、連線池、`SeekableRemoteFile`、分段上傳、縮圖與 media attributes（讀 Telegram 的預覽，以及 `make_preview` 產自己上傳的那張） |
-| `tgupload.py` | 上傳的線路協定：`decide_protocol`（10 MiB / 500 MiB 兩個界線）、`SaveFilePart`（128 KiB × 4 workers）與 `SaveBigFilePart`（512 KiB）兩套 part 原語、繞過 `client._call` 直送 |
-| `upload_engine.py` | **所有**上傳的唯一入口：指紋 → check-hash → 協定選擇 → album/一般 → 帳號租借 → 訊息 → 註冊；`transfer_batch` 的串流階段、`FingerprintClaims`、精確去重覆蓋、`TransferMetrics` 完成日誌、`redact` |
-| `telegram_accounts.py` | 帳號檔載入與驗證、每個帳號一個 `TelegramWorker` 與各自的 file/chunk/message 額度、`for_read(id)` 精確路由、`acquire_upload()` round-robin 租借 |
-| `upload_limiter.py` | 移植網頁端 `adaptiveRateLimiter.ts` 的狀態機（ceiling / slow zone / probe / escalation）+ 訊息 token bucket；每個帳號一份 `meta/upload-rate-<id>.json`，原子寫入 |
-| `media_thumbnail.py` | 靜態圖（Pillow）與影片（ffmpeg）的預覽擷取，結果分成 `ready` / `not_media` / `undecodable` |
-| `transfer_models.py` | 不可變值物件：`AccountSpec` / `RemotePart` / `UploadedPart` / `TransferRequest` / `TransferResult` / `PreparedAlbumItem` / `QueueStage` |
-| `zipfs.py` | 讀 zip central directory → 虛擬目錄樹；單一 entry 的 range 讀取 |
-| `gamestage.py` | `/game` staging + debounce 打包（`ZIP_STORED`）+ 清理；打包完就交給 `upload_engine`。另外持有 `sample_hash` 與 `_preview_file`（engine 會回頭呼叫） |
-| `uploadstage.py` | `/game` 以外任意路徑的一般檔案寫入：落地 + debounce + **整批**交給 engine + 註冊 + 只在註冊落地後才刪暫存；佇列狀態持久化在 `meta/upload-queue.json` |
-| `rejectedputs.py` | 包在 `WriteGuard` 外的 WSGI 中介層：同一路徑的 PUT 失敗 3 次、且第一次失敗已過 30 分鐘，下一次就收進 `<cache_dir>\rejected\` 並回 201，之後 15 分鐘對那條路徑的 `Depth: 0` PROPFIND 回一份假的檔案屬性（rclone 上傳後會回頭確認） |
-| `savedata.py` | `/rpc/game/savedata/*`：存檔位置偵測（引擎識別 + 附帶存檔搜尋）與匯入（範圍白名單、拒絕連結／junction、覆蓋前備份），規則對齊桌面版 `detect.rs` / `import.rs` |
-| `fetchlocal.py` | 「儲存在本地」：伺服端複製邏輯 + 右鍵 verb 用的進度顯示 CLI |
-| `warmup.py` | 走遍整棵樹批次填滿縮圖與屬性快取、跑 Windows 縮圖快取，可續跑；`BackgroundWarmup` 讓 bridge 自己跑 |
-| `install_menu.py` | 註冊/移除 Explorer 右鍵 verb |
-| `install_thumb.py` | 註冊/移除 shell handler，逐副檔名記錄被取代的既有 CLSID |
+| `dav/bridge.py` | wsgidav provider、寫入保護、`/rpc/*`、cheroot 伺服器（綁 127.0.0.1） |
+| `core/tdapi.py` | TeleDrive REST client：JWT 取得（bot challenge，見「踩過的坑」）/快取/401 自動重登、路徑解析、listing 快取（記憶體 + `meta/dirs/`，`/folders` 與 `/files` 併發，見「效能」第 7 節）、split part 表快取、`JsonStore` |
+| `telegram/tgio.py` | split 位移數學、Telethon worker（背景 event loop）、連線池、`SeekableRemoteFile`、分段上傳、縮圖與 media attributes（讀 Telegram 的預覽，以及 `make_preview` 產自己上傳的那張） |
+| `telegram/tgupload.py` | 上傳的線路協定：`decide_protocol`（10 MiB / 500 MiB 兩個界線）、`SaveFilePart`（128 KiB × 4 workers）與 `SaveBigFilePart`（512 KiB）兩套 part 原語、繞過 `client._call` 直送 |
+| `upload/upload_engine.py` | **所有**上傳的唯一入口：指紋 → check-hash → 協定選擇 → album/一般 → 帳號租借 → 訊息 → 註冊；`transfer_batch` 的串流階段、`FingerprintClaims`、精確去重覆蓋、`TransferMetrics` 完成日誌、`redact` |
+| `telegram/telegram_accounts.py` | 帳號檔載入與驗證、每個帳號一個 `TelegramWorker` 與各自的 file/chunk/message 額度、`for_read(id)` 精確路由、`acquire_upload()` round-robin 租借 |
+| `upload/upload_limiter.py` | 移植網頁端 `adaptiveRateLimiter.ts` 的狀態機（ceiling / slow zone / probe / escalation）+ 訊息 token bucket；每個帳號一份 `meta/upload-rate-<id>.json`，原子寫入 |
+| `telegram/media_thumbnail.py` | 靜態圖（Pillow）與影片（ffmpeg）的預覽擷取，結果分成 `ready` / `not_media` / `undecodable` |
+| `upload/transfer_models.py` | 不可變值物件：`AccountSpec` / `RemotePart` / `UploadedPart` / `TransferRequest` / `TransferResult` / `PreparedAlbumItem` / `QueueStage` |
+| `dav/zipfs.py` | 讀 zip central directory → 虛擬目錄樹；單一 entry 的 range 讀取 |
+| `game/gamestage.py` | `/game` staging + debounce 打包（`ZIP_STORED`）+ 清理；打包完就交給 `upload_engine`。另外持有 `sample_hash` 與 `_preview_file`（engine 會回頭呼叫） |
+| `upload/uploadstage.py` | `/game` 以外任意路徑的一般檔案寫入：落地 + debounce + **整批**交給 engine + 註冊 + 只在註冊落地後才刪暫存；佇列狀態持久化在 `meta/upload-queue.json` |
+| `dav/rejectedputs.py` | 包在 `WriteGuard` 外的 WSGI 中介層：同一路徑的 PUT 失敗 3 次、且第一次失敗已過 30 分鐘，下一次就收進 `<cache_dir>\rejected\` 並回 201，之後 15 分鐘對那條路徑的 `Depth: 0` PROPFIND 回一份假的檔案屬性（rclone 上傳後會回頭確認） |
+| `game/savedata.py` | `/rpc/game/savedata/*`：存檔位置偵測（引擎識別 + 附帶存檔搜尋）與匯入（範圍白名單、拒絕連結／junction、覆蓋前備份），規則對齊桌面版 `detect.rs` / `import.rs` |
+| `windows/fetchlocal.py` | 「儲存在本地」：伺服端複製邏輯 + 右鍵 verb 用的進度顯示 CLI |
+| `windows/warmup.py` | 走遍整棵樹批次填滿縮圖與屬性快取、跑 Windows 縮圖快取，可續跑；`BackgroundWarmup` 讓 bridge 自己跑 |
+| `windows/install_menu.py` | 註冊/移除 Explorer 右鍵 verb |
+| `windows/install_thumb.py` | 註冊/移除 shell handler，逐副檔名記錄被取代的既有 CLSID |
 | `shellthumb/` | C++ shell 擴充：`IThumbnailProvider` + `IPropertyStore`，同一份 DLL 兩個 CLSID；`warmshell.exe` 把縮圖灌進 Windows thumbcache，`bench.exe` / `isolate.exe` 量測 |
-| `fileid.py` | 檔案 ID：`path_id`（`stableIno` 的移植）、`tag`／`tag_dav`／`tag_drive`／`tag_local`、CLI `tag`／`info`。**ID 的定義只有一個**：FNV-64a(rclone VFS path) 清最高位，Python 與 Go（`fs.StableID`）各有同一組向量測試 |
-| `fileinfo.py` | `fileid.py info` 與 `/rpc/fileinfo` 的查詢：只讀 `meta/dirs/`、`meta/zips/`、`uploads/`、`staging/` 快取，不打 backend；輸出刻意不含名字、`file_hash`、backend id、message id、telegram user id、精確大小 |
-| `logscrub.py` | 輸出端防漏網：`ScrubbingFormatter`（**是 Formatter 不是 Filter**，filter 看不到 traceback）把例外訊息／traceback 裡的本機路徑、`H:\` 路徑、bridge URL 換成 ID；`install_excepthooks`、cheroot `error_log` 也走 logging |
-| `config.py` | 讀 `config.ini`，空值回退環境變數，再回退 `env_file`；由單一 `cache_dir` 推導所有路徑；並發參數做範圍檢查（0 或負數直接 `ConfigError`，不是靜靜跑一個壞值） |
-| `mountctl.py` | 擁有 `rclone mount`：`ensure`（冪等，bridge 啟動後自己呼叫）、`stop`（`rclone rc core/quit`，**永不強殺**）、`check`/`status`。rclone 以 detached 行程啟動，bridge 重啟不會帶走 `H:`；log 在 `meta/rclone.log`。優先用 `tools/rclone-stableino/rclone.exe`，找不到才退回 PATH 並 warning；固定 `-o VolumeSerialNumber` |
-| `mountwatch.py` | 每 5 分鐘讀 rclone 的 goroutine dump（`127.0.0.1:5572/debug/pprof`），連續 3 次「有人在 `pacer.beginCall` 等 token、沒人在 call 裡、也沒有補 token 的計時 goroutine」就判定 pacer 名額漏光（11-01 那次）：`bridge.log` ERROR + `/rpc/status` 的 `mount.pacer_exhausted`。`[bridge] auto_recover_mount`（預設關）才會在沒有 writeback、一分鐘沒人瀏覽時 `core/quit` 再掛回 |
+| `core/fileid.py` | 檔案 ID：`path_id`（`stableIno` 的移植）、`tag`／`tag_dav`／`tag_drive`／`tag_local`、CLI `tag`／`info`。**ID 的定義只有一個**：FNV-64a(rclone VFS path) 清最高位，Python 與 Go（`fs.StableID`）各有同一組向量測試 |
+| `windows/fileinfo.py` | `fileid.py info` 與 `/rpc/fileinfo` 的查詢：只讀 `meta/dirs/`、`meta/zips/`、`uploads/`、`staging/` 快取，不打 backend；輸出刻意不含名字、`file_hash`、backend id、message id、telegram user id、精確大小 |
+| `core/logscrub.py` | 輸出端防漏網：`ScrubbingFormatter`（**是 Formatter 不是 Filter**，filter 看不到 traceback）把例外訊息／traceback 裡的本機路徑、`H:\` 路徑、bridge URL 換成 ID；`install_excepthooks`、cheroot `error_log` 也走 logging |
+| `core/config.py` | 讀 `config.ini`，空值回退環境變數，再回退 `env_file`；由單一 `cache_dir` 推導所有路徑；並發參數做範圍檢查（0 或負數直接 `ConfigError`，不是靜靜跑一個壞值） |
+| `windows/mountctl.py` | 擁有 `rclone mount`：`ensure`（冪等，bridge 啟動後自己呼叫）、`stop`（`rclone rc core/quit`，**永不強殺**）、`check`/`status`。rclone 以 detached 行程啟動，bridge 重啟不會帶走 `H:`；log 在 `meta/rclone.log`。優先用 `tools/rclone-stableino/rclone.exe`，找不到才退回 PATH 並 warning；固定 `-o VolumeSerialNumber` |
+| `windows/mountwatch.py` | 每 5 分鐘讀 rclone 的 goroutine dump（`127.0.0.1:5572/debug/pprof`），連續 3 次「有人在 `pacer.beginCall` 等 token、沒人在 call 裡、也沒有補 token 的計時 goroutine」就判定 pacer 名額漏光（11-01 那次）：`bridge.log` ERROR + `/rpc/status` 的 `mount.pacer_exhausted`。`[bridge] auto_recover_mount`（預設關）才會在沒有 writeback、一分鐘沒人瀏覽時 `core/quit` 再掛回 |
 | `tools/rclone-stableino/` | 自己編的 rclone：patch 讓檔案 ID 在重新掛載前後不變（見「踩過的坑」thumbcache 那條），並讓 rclone 自己的 log 也只印 `id=0x…`（`stable_id.go` 的 `fs.StableID` 是兩者共用的定義，`stable_log.go` 改寫 `object` 與訊息本文裡的 bridge URL／VFS 快取路徑）。`build.py` 下載釘住版本的原始碼（`src/`，不進 git）、套 patch（對不上就失敗）、跑 patch 的 Go 測試、`go build -tags cmount` 出 **`rclone.new.exe`**（執行中的 `rclone.exe` 被掛載開著、覆寫不了）：`stop.bat` 之後換名成 `rclone.exe` 再 `start.bat`。升級 rclone 改 `RCLONE_VERSION` 重跑，並跑一輪「現場驗證」確認 `rclone.log` 沒有檔名 |
 | `start.bat` | 啟動 bridge（已在跑就沿用），等 `H:` 掛好。掛載由 bridge 自己做（`[bridge] auto_mount`），磁碟代號只在 `config.ini` 一處 |
 | `stop.bat` | 固定順序：bridge → `rclone core/quit` → 殘留 warmshell。**warmshell 不能排第一**：卡在掛載碟讀取（kernel `PageIn`）的 warmshell 殺不掉，要 rclone 退出、讀取失敗才會死，先等它就是死結（11-17 那個卡了 49 小時，rclone 在等 bridge 給不出的位元組）。rclone 永不強殺；還沒交出去的寫入留在 VFS 快取，下次掛載再送 |

@@ -5,13 +5,13 @@ from contextlib import asynccontextmanager
 
 import pytest
 
-from tgupload import (
+from teledrive_webdav.telegram.tgupload import (
     AttemptRevoked,
     _cancelable_context,
     _wait_or_revoke,
     send_part,
 )
-from transfer_models import UploadRpcToken
+from teledrive_webdav.upload.transfer_models import UploadRpcToken
 
 
 class Gate:
@@ -204,7 +204,7 @@ def test_normal_send_with_no_observer_preserves_old_behavior():
 
 
 def test_premium_flood_callback_receives_post_flood_snapshot(monkeypatch):
-    import tgupload
+    from teledrive_webdav.telegram import tgupload
 
     class PremiumError(RuntimeError):
         pass

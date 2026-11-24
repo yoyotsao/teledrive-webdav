@@ -8,11 +8,11 @@ from types import SimpleNamespace
 
 import pytest
 
-import bridge
-import tdapi
-import tgio
-from tdapi import Entry, TeleDriveClient
-from transfer_models import RemotePart
+from teledrive_webdav.dav import bridge
+from teledrive_webdav.core import tdapi
+from teledrive_webdav.telegram import tgio
+from teledrive_webdav.core.tdapi import Entry, TeleDriveClient
+from teledrive_webdav.upload.transfer_models import RemotePart
 
 
 class _Message:

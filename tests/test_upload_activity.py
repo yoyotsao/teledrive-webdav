@@ -4,8 +4,8 @@ import threading
 
 import pytest
 
-from transfer_models import AttemptLease, UploadRpcToken
-from upload_activity import AccountActivityRegistry, UploadSpeedTracker
+from teledrive_webdav.upload.transfer_models import AttemptLease, UploadRpcToken
+from teledrive_webdav.upload.upload_activity import AccountActivityRegistry, UploadSpeedTracker
 
 
 class Clock:

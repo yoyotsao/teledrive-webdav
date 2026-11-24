@@ -7,9 +7,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import tdapi  # noqa: E402
-from tdapi import TeleDriveClient  # noqa: E402
-from transfer_models import RemotePart  # noqa: E402
+from teledrive_webdav.core import tdapi  # noqa: E402
+from teledrive_webdav.core.tdapi import TeleDriveClient  # noqa: E402
+from teledrive_webdav.upload.transfer_models import RemotePart  # noqa: E402
 
 
 class Cfg:

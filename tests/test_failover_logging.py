@@ -3,10 +3,10 @@ from __future__ import annotations
 import logging
 from types import SimpleNamespace
 
-from segment_scheduler import MigrationCommit
-from transfer_models import AttemptLease
-from upload_activity import FloodCycleSnapshot
-from upload_engine import TransferMetrics, UploadEngine
+from teledrive_webdav.upload.segment_scheduler import MigrationCommit
+from teledrive_webdav.upload.transfer_models import AttemptLease
+from teledrive_webdav.upload.upload_activity import FloodCycleSnapshot
+from teledrive_webdav.upload.upload_engine import TransferMetrics, UploadEngine
 
 
 def test_transfer_metrics_include_logical_physical_and_migration_counters():
@@ -69,8 +69,8 @@ def test_migration_log_contains_decision_inputs_without_secrets(caplog):
 
 
 def test_generic_account_observer_contributes_to_idle_speed_snapshot():
-    from upload_activity import AccountActivityRegistry, UploadSpeedTracker
-    from upload_engine import AccountUploadObserver
+    from teledrive_webdav.upload.upload_activity import AccountActivityRegistry, UploadSpeedTracker
+    from teledrive_webdav.upload.upload_engine import AccountUploadObserver
 
     now = [0.0]
     clock = lambda: now[0]

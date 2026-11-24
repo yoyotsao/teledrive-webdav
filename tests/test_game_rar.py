@@ -19,9 +19,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import gamestage  # noqa: E402
-from config import Config, load_config  # noqa: E402
-from transfer_models import TransferResult, UploadedPart  # noqa: E402
+from teledrive_webdav.game import gamestage  # noqa: E402
+from teledrive_webdav.core.config import Config, load_config  # noqa: E402
+from teledrive_webdav.upload.transfer_models import TransferResult, UploadedPart  # noqa: E402
 
 
 class RecordingEngine:

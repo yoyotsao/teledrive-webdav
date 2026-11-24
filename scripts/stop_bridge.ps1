@@ -70,7 +70,7 @@ try {
         }
         $hasBridgeParent = $null -ne $parent `
             -and $parent.Name -like 'python*' `
-            -and $parent.CommandLine -like '*bridge.py*'
+            -and $parent.CommandLine -match 'bridge\.py|teledrive_webdav\.dav\.bridge'
         if ($warmerExe -ne $expectedExe -or -not $hasBridgeParent) {
             $unsafe += $warmer
         }
@@ -133,7 +133,7 @@ try {
     try {
         $bridges = @(
             Get-CimInstance Win32_Process | Where-Object {
-                $_.Name -like 'python*' -and $_.CommandLine -like '*bridge.py*'
+                $_.Name -like 'python*' -and $_.CommandLine -match 'bridge\.py|teledrive_webdav\.dav\.bridge'
             }
         )
         $bridgeIds = @($bridges | ForEach-Object { [int]$_.ProcessId })

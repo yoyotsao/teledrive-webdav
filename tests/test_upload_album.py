@@ -8,12 +8,12 @@ from types import SimpleNamespace
 
 import pytest
 
-import gamestage
-import upload_engine
-from media_thumbnail import ThumbnailResult
-from telegram_accounts import TelegramAccountPool
-from tgio import TelegramWorker
-from transfer_models import AccountSpec, PreparedAlbumItem, TransferRequest
+from teledrive_webdav.game import gamestage
+from teledrive_webdav.upload import upload_engine
+from teledrive_webdav.telegram.media_thumbnail import ThumbnailResult
+from teledrive_webdav.telegram.telegram_accounts import TelegramAccountPool
+from teledrive_webdav.telegram.tgio import TelegramWorker
+from teledrive_webdav.upload.transfer_models import AccountSpec, PreparedAlbumItem, TransferRequest
 
 MiB = 1024 * 1024
 
@@ -120,7 +120,7 @@ class Worker(TelegramWorker):
 
 @pytest.fixture
 def rig(tmp_path, monkeypatch):
-    monkeypatch.setattr("tgio.capture_thumbnail", lambda *_: ThumbnailResult("ready", b"jpeg", 640, 360))
+    monkeypatch.setattr("teledrive_webdav.telegram.tgio.capture_thumbnail", lambda *_: ThumbnailResult("ready", b"jpeg", 640, 360))
     monkeypatch.setattr(gamestage, "HASH_SAMPLE", 32)
 
     def build(accounts=1):
@@ -185,7 +185,7 @@ def test_shuffled_updates_map_by_document_id_with_original_size_and_identity(rig
 
 def test_album_original_and_thumbnail_use_512k_shared_gate_and_message_bucket(rig, monkeypatch):
     r = rig()
-    monkeypatch.setattr("tgio.capture_thumbnail", lambda *_: ThumbnailResult("ready", b"t" * (512 * 1024 + 1), 640, 360))
+    monkeypatch.setattr("teledrive_webdav.telegram.tgio.capture_thumbnail", lambda *_: ThumbnailResult("ready", b"t" * (512 * 1024 + 1), 640, 360))
     r.engine.transfer_batch([r.request(0, 512 * 1024 + 1)])
     worker = r.workers[1]
     assert sorted(len(req.bytes) for req in worker.client.chunks) == [1, 1, 512 * 1024, 512 * 1024]
@@ -361,7 +361,7 @@ def test_album_default_timeout_is_sixty_seconds(rig, monkeypatch):
         deadlines.append(timeout)
         return await original(awaitable, timeout)
 
-    monkeypatch.setattr("tgio.asyncio.wait_for", wait_for)
+    monkeypatch.setattr("teledrive_webdav.telegram.tgio.asyncio.wait_for", wait_for)
     r.engine.transfer_batch([r.request(0)])
     # Part RPCs now have their own 120-second wrapper deadline; the album send
     # still owns the final, independent 60-second default deadline.

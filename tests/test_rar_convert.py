@@ -19,10 +19,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import rarconvert  # noqa: E402
-import warmup  # noqa: E402
-from config import load_config  # noqa: E402
-from tdapi import Entry  # noqa: E402
+from teledrive_webdav.game import rarconvert  # noqa: E402
+from teledrive_webdav.windows import warmup  # noqa: E402
+from teledrive_webdav.core.config import load_config  # noqa: E402
+from teledrive_webdav.core.tdapi import Entry  # noqa: E402
 
 
 def _entry(file_id, name, *, is_dir=False, size=0, parent="g"):

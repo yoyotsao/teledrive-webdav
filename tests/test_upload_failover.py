@@ -4,11 +4,11 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 
-from telegram_accounts import TelegramAccountPool
-from transfer_models import AccountSpec, AttemptLease, TransferRequest
-from tgupload import AttemptRevoked, ProtocolDecision
-from upload_activity import AccountActivityRegistry, UploadSpeedTracker
-from upload_engine import UploadEngine
+from teledrive_webdav.telegram.telegram_accounts import TelegramAccountPool
+from teledrive_webdav.upload.transfer_models import AccountSpec, AttemptLease, TransferRequest
+from teledrive_webdav.telegram.tgupload import AttemptRevoked, ProtocolDecision
+from teledrive_webdav.upload.upload_activity import AccountActivityRegistry, UploadSpeedTracker
+from teledrive_webdav.upload.upload_engine import UploadEngine
 
 
 class FakeClock:

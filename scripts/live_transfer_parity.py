@@ -47,8 +47,8 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from config import load_config  # noqa: E402
-from tdapi import TeleDriveClient  # noqa: E402
+from teledrive_webdav.core.config import load_config  # noqa: E402
+from teledrive_webdav.core.tdapi import TeleDriveClient  # noqa: E402
 
 MiB = 1024 * 1024
 
@@ -301,7 +301,7 @@ def entries_for(api: TeleDriveClient, folder: str) -> dict:
 
 
 def verify(item: Planned, entry, api: TeleDriveClient, rpc: str, folder: str) -> None:
-    from tgupload import MESSAGE_MAX, SMALL_FILE_MAX
+    from teledrive_webdav.telegram.tgupload import MESSAGE_MAX, SMALL_FILE_MAX
 
     if entry is None:
         item.findings.append("no backend row was registered")

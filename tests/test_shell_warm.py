@@ -18,8 +18,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import fileid  # noqa: E402
-import warmup  # noqa: E402
+from teledrive_webdav.core import fileid  # noqa: E402
+from teledrive_webdav.windows import warmup  # noqa: E402
 
 
 def _warmer(tmp_path, mount_drive="H:", exists=True):

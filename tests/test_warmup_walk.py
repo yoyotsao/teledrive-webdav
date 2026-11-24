@@ -6,8 +6,8 @@ timeout somewhere in ~7,400 listings, so the shell warm never ran at all.
 
 from types import SimpleNamespace
 
-import fileid
-import warmup
+from teledrive_webdav.core import fileid
+from teledrive_webdav.windows import warmup
 
 
 def entry(name, file_id, is_dir=False, message_id=1):

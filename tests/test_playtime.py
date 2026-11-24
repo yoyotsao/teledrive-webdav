@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from gamelaunch import ProcessInfo, ProcessRef, RunningSession
-from playtime import PlaytimeQueue, PlaytimeSender, PlaytimeService, RunningSessionStore
+from teledrive_webdav.game.gamelaunch import ProcessInfo, ProcessRef, RunningSession
+from teledrive_webdav.game.playtime import PlaytimeQueue, PlaytimeSender, PlaytimeService, RunningSessionStore
 
 
 def session(session_id="s1", pid=11, create_time=100.0):
@@ -115,7 +115,7 @@ def test_append_fsync_failure_keeps_running_and_restart_repairs_to_queue(tmp_pat
     queue = PlaytimeQueue(queue_path)
     item = session()
     store.save(item)
-    monkeypatch.setattr("playtime.os.fsync", lambda _fd: (_ for _ in ()).throw(OSError("injected fsync")))
+    monkeypatch.setattr("teledrive_webdav.game.playtime.os.fsync", lambda _fd: (_ for _ in ()).throw(OSError("injected fsync")))
     with pytest.raises(OSError):
         PlaytimeService(store, queue).finish(item)
     assert store.all()
@@ -138,7 +138,7 @@ def test_same_instance_fsync_failure_is_untrusted_until_reopen_barrier(tmp_path,
     def fail_fsync(_fd):
         raise OSError("injected fsync failure")
 
-    monkeypatch.setattr("playtime.os.fsync", fail_fsync)
+    monkeypatch.setattr("teledrive_webdav.game.playtime.os.fsync", fail_fsync)
     with pytest.raises(OSError):
         service.finish(item)
     with pytest.raises(RuntimeError, match="reopen"):
@@ -150,7 +150,7 @@ def test_same_instance_fsync_failure_is_untrusted_until_reopen_barrier(tmp_path,
         PlaytimeQueue(path)
     assert store.all()
 
-    monkeypatch.setattr("playtime.os.fsync", real_fsync)
+    monkeypatch.setattr("teledrive_webdav.game.playtime.os.fsync", real_fsync)
     reopened = PlaytimeQueue(path)
     PlaytimeService(store, reopened).finish(store.all()[0])
     assert [record["id"] for record in reopened.pending()] == [item.session_id]
@@ -163,7 +163,7 @@ def test_truncate_fsync_failure_keeps_running_until_restart_repair(tmp_path, mon
     store.save(item)
     queue_path = tmp_path / "queue.jsonl"
     queue_path.write_bytes(b'{"id":"prefix"}\n{"id":"torn"')
-    monkeypatch.setattr("playtime.os.fsync", lambda _fd: (_ for _ in ()).throw(OSError("injected fsync")))
+    monkeypatch.setattr("teledrive_webdav.game.playtime.os.fsync", lambda _fd: (_ for _ in ()).throw(OSError("injected fsync")))
     with pytest.raises(OSError):
         PlaytimeQueue(queue_path)
     assert store.all()
@@ -443,7 +443,7 @@ def test_repeated_unauthorized_pauses_instead_of_forcing_a_bot_login_each_retry(
 
 
 def test_corrupt_playtime_files_are_quarantined_instead_of_aborting_startup(tmp_path):
-    from playtime import open_playtime_state
+    from teledrive_webdav.game.playtime import open_playtime_state
 
     queue_path = tmp_path / "playtime-queue.jsonl"
     running_path = tmp_path / "playtime-running.json"
@@ -462,7 +462,7 @@ def test_corrupt_playtime_files_are_quarantined_instead_of_aborting_startup(tmp_
 
 
 def test_healthy_playtime_files_are_opened_untouched(tmp_path):
-    from playtime import open_playtime_state
+    from teledrive_webdav.game.playtime import open_playtime_state
 
     (tmp_path / "playtime-queue.jsonl").write_bytes(b'{"id":"a"}\n')
     _store, queue = open_playtime_state(tmp_path)

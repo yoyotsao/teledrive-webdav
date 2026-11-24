@@ -53,7 +53,7 @@ echo       bridge is up.
 set /a tries=0
 :waitmount
 set /a tries+=1
-"%PY%" mountctl.py check >nul 2>&1
+"%PY%" -m teledrive_webdav.windows.mountctl check >nul 2>&1
 if not errorlevel 1 goto mounted
 if %tries% GEQ 20 (
   echo [error] drive did not appear. See ^<cache_dir^>

@@ -17,7 +17,7 @@ def test_bridge_is_launched_without_a_window_and_without_blocking_stdio(monkeypa
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     launch_bridge.launch("C:/repo", python="py.exe")
 
-    assert seen["cmd"] == ["py.exe", "bridge.py"]
+    assert seen["cmd"] == ["py.exe", "-m", "teledrive_webdav.dav.bridge"]
     assert seen["kw"]["cwd"] == "C:/repo"
     assert seen["kw"]["creationflags"] & launch_bridge.CREATE_NO_WINDOW
     for stream in ("stdin", "stdout", "stderr"):

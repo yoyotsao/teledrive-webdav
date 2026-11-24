@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from gamelaunch import GameLauncher, LaunchError, ProcessInfo, ProcessRef, RunningSession
+from teledrive_webdav.game.gamelaunch import GameLauncher, LaunchError, ProcessInfo, ProcessRef, RunningSession
 
 
 class FakeState:

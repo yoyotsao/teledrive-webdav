@@ -7,8 +7,8 @@ The dumps below use rclone's real frame names; if an upgrade renames them,
 these tests are what should break first.
 """
 
-import mountwatch
-from mountwatch import MountWatch, count_pacer
+from teledrive_webdav.windows import mountwatch
+from teledrive_webdav.windows.mountwatch import MountWatch, count_pacer
 
 IDLE = """goroutine 1 [chan receive, 92 minutes]:
 github.com/rclone/rclone/cmd/mountlib.(*MountPoint).Wait(0xfc57748c380)

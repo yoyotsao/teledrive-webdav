@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tgio import (
+from teledrive_webdav.telegram.tgio import (
     SessionAuthorizationError,
     SessionClientError,
     SessionIdentityError,

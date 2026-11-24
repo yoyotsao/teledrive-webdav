@@ -22,12 +22,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import gamestage  # noqa: E402
-import tgio  # noqa: E402
-import tgupload  # noqa: E402
-import upload_engine  # noqa: E402
-from transfer_models import TransferRequest  # noqa: E402
-from media_thumbnail import ThumbnailError, ThumbnailResult  # noqa: E402
+from teledrive_webdav.game import gamestage  # noqa: E402
+from teledrive_webdav.telegram import tgio  # noqa: E402
+from teledrive_webdav.telegram import tgupload  # noqa: E402
+from teledrive_webdav.upload import upload_engine  # noqa: E402
+from teledrive_webdav.upload.transfer_models import TransferRequest  # noqa: E402
+from teledrive_webdav.telegram.media_thumbnail import ThumbnailError, ThumbnailResult  # noqa: E402
 
 PIL = pytest.importorskip("PIL.Image")
 

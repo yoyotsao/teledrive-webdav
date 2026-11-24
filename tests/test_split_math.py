@@ -11,7 +11,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tgio import (  # noqa: E402
+from teledrive_webdav.telegram.tgio import (  # noqa: E402
     SEGMENT_SIZE,
     SeekableRemoteFile,
     SlicedReader,
@@ -19,7 +19,7 @@ from tgio import (  # noqa: E402
     map_range,
     plan_segments,
 )
-from transfer_models import RemotePart  # noqa: E402
+from teledrive_webdav.upload.transfer_models import RemotePart  # noqa: E402
 
 
 def routed(message_id, size, account_id=0, file_id=None):
@@ -273,7 +273,7 @@ def test_sliced_reader_maps_onto_the_window(remote):
 
 
 def test_contiguous_groups_runs():
-    from tgio import _contiguous
+    from teledrive_webdav.telegram.tgio import _contiguous
 
     assert list(_contiguous([])) == []
     assert list(_contiguous([3])) == [(3, 3)]
@@ -392,7 +392,7 @@ def test_a_full_width_streamed_read_stays_in_the_cache():
     pays for the network a second time. Uses the real constants: this is a
     relationship between two of them, not a number.
     """
-    import tgio
+    from teledrive_webdav.telegram import tgio
 
     width = tgio.STREAM_BLOCK_SIZE
     blob = bytes((i % 251) for i in range(width * 2))

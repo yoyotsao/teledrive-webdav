@@ -12,10 +12,10 @@ from wsgiref.util import setup_testing_defaults
 
 import pytest
 
-from config import Config, load_config
-import gamestate
-from gamelaunch import GameLauncher, MemorySessionStore, ProcessInfo, ProcessRef
-from gamestate import GameRpc
+from teledrive_webdav.core.config import Config, load_config
+from teledrive_webdav.game import gamestate
+from teledrive_webdav.game.gamelaunch import GameLauncher, MemorySessionStore, ProcessInfo, ProcessRef
+from teledrive_webdav.game.gamestate import GameRpc
 
 
 ALLOWED_ORIGIN = "https://teledrive.example"

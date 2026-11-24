@@ -7,9 +7,9 @@ from types import SimpleNamespace
 
 import pytest
 
-import bridge
-from fetchlocal import LocalFetcher
-from gamestate import GameState, GameStateError
+from teledrive_webdav.dav import bridge
+from teledrive_webdav.windows.fetchlocal import LocalFetcher
+from teledrive_webdav.game.gamestate import GameState, GameStateError
 
 
 class Resolver:

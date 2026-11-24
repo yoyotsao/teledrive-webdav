@@ -7,11 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
-import gamestate
-import savedata
-from config import Config
-from gamestate import GameRpc
-from savedata import SavedataError, detect, import_savedata
+from teledrive_webdav.game import gamestate
+from teledrive_webdav.game import savedata
+from teledrive_webdav.core.config import Config
+from teledrive_webdav.game.gamestate import GameRpc
+from teledrive_webdav.game.savedata import SavedataError, detect, import_savedata
 from test_game_rpc import ALLOWED_ORIGIN, Session, request, token
 
 

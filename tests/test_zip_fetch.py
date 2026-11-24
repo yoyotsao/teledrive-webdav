@@ -13,8 +13,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import zipfetch  # noqa: E402
-import zipfs  # noqa: E402
+from teledrive_webdav.game import zipfetch  # noqa: E402
+from teledrive_webdav.dav import zipfs  # noqa: E402
 
 MEMBERS = {
     "readme.txt": b"hello",
@@ -248,8 +248,8 @@ def test_completion_log_has_every_field_and_no_credentials(rig, caplog):
 
 
 def test_fetch_segments_routes_archive_root_whole_and_subfolder_per_member(tmp_path, monkeypatch):
-    import bridge
-    from fetchlocal import LocalFetcher
+    from teledrive_webdav.dav import bridge
+    from teledrive_webdav.windows.fetchlocal import LocalFetcher
 
     rig = Rig(tmp_path, make_zip())
     cfg = SimpleNamespace(local_dir=rig.local)

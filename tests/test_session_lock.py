@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from telegram_sessions import SessionDirectoryLock, SessionLockError
+from teledrive_webdav.telegram.telegram_sessions import SessionDirectoryLock, SessionLockError
 
 
 def _try_lock(directory: str, queue) -> None:

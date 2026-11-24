@@ -19,8 +19,8 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import tdapi  # noqa: E402
-from tdapi import ApiError, TeleDriveClient  # noqa: E402
+from teledrive_webdav.core import tdapi  # noqa: E402
+from teledrive_webdav.core.tdapi import ApiError, TeleDriveClient  # noqa: E402
 
 
 class Reply:
