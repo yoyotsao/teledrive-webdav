@@ -26,10 +26,13 @@ import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import tgupload
-from media_thumbnail import PREVIEW_BOX, PREVIEW_MAX_BYTES, capture_thumbnail
+from media_thumbnail import PREVIEW_BOX, PREVIEW_MAX_BYTES, ThumbnailError, capture_thumbnail
+
+#: Tries per file before uploading it without a preview.
+PREVIEW_ATTEMPTS = 3
 from telegram_sessions import safe_resolve_existing
 from transfer_models import PreparedAlbumItem, RemotePart, UploadedPart
 
@@ -676,6 +679,7 @@ class TelegramWorker:
                 return hit[0]
         doc = await self._fetch_document(message_id)
         _assert_media_id(doc, expected_file_id, expected_size)
+        _tag_message(doc, message_id)
         with self._docs_lock:
             self._docs[key] = (doc, now)
         return doc
@@ -804,6 +808,7 @@ class TelegramWorker:
                         _assert_media_id(media, part.file_id, part.size)
                     except RemoteIdentityError:
                         continue
+                    _tag_message(media, part.message_id)
                     self._docs[(part.message_id, str(part.file_id))] = (media, now)
 
     async def _thumbnail_bytes(self, doc) -> Optional[bytes]:
@@ -1008,21 +1013,39 @@ class TelegramWorker:
         try:
             return await self._chunk_untimed(client, doc, offset)
         finally:
-            self._note_chunk(time.monotonic() - t0)
+            self._note_chunk(time.monotonic() - t0, doc)
 
-    def _note_chunk(self, seconds: float) -> None:
-        """Log chunk latency every 10s: in-flight depth = chunks/s x mean latency."""
-        st = self.__dict__.setdefault("_chunk_stats", [0, 0.0, 0.0, time.monotonic()])
+    def _note_chunk(self, seconds: float, doc=None) -> None:
+        """Log chunk latency every 10s: in-flight depth = chunks/s x mean latency.
+
+        Also says who the reads were for — per account (this worker), per file
+        DC, and the busiest files — because "the line is slow" is not
+        actionable until you know whether it is one stream, a sweep, or a
+        cross-DC file.
+        """
+        st = self.__dict__.setdefault("_chunk_stats", [0, 0.0, 0.0, time.monotonic(), {}, {}])
         st[0] += 1
         st[1] += seconds
         st[2] = max(st[2], seconds)
+        dc = getattr(doc, "dc_id", None)
+        st[4][dc] = st[4].get(dc, 0) + 1
+        key = getattr(doc, "id", None)
+        per = st[5].get(key)
+        if per is None:
+            per = st[5][key] = [_doc_label(doc), dc, 0, 0.0]
+        per[2] += 1
+        per[3] += seconds
         now = time.monotonic()
         if now - st[3] >= 10:
+            dcs = " ".join(f"dc{d}={n}" for d, n in sorted(st[4].items(), key=lambda kv: -kv[1]))
+            top = sorted(st[5].values(), key=lambda p: -p[2])[:3]
+            files = " | ".join(f"{p[0]} dc{p[1]} n={p[2]} mean={p[3] / p[2] * 1000:.0f}ms" for p in top)
             log.info(
-                "chunk timing: %s chunks in %.0fs mean=%.0fms max=%.0fms",
-                st[0], now - st[3], st[1] / st[0] * 1000, st[2] * 1000,
+                "chunk timing: account=%s %s chunks in %.0fs mean=%.0fms max=%.0fms [%s] files=%s top: %s",
+                getattr(self, "_expected_user_id", "?"), st[0], now - st[3],
+                st[1] / st[0] * 1000, st[2] * 1000, dcs, len(st[5]), files,
             )
-            st[:] = [0, 0.0, 0.0, now]
+            st[:] = [0, 0.0, 0.0, now, {}, {}]
 
     async def _chunk_untimed(self, client, doc, offset: int) -> bytes:
         """One REQUEST_SIZE read. Short only at end of file."""
@@ -1326,12 +1349,24 @@ def make_preview(
     """Adapt classified media thumbnails to Telethon's document-thumb tuple.
 
     ``not_media`` and ``undecodable`` files deliberately upload without a
-    preview. A ``ThumbnailError`` is allowed to propagate: it means a decoder
-    accepted media but failed to produce a usable frame, which must not be
-    silently registered as an ordinary no-thumbnail upload.
+    preview. A ``ThumbnailError`` (a decoder accepted the media but gave no
+    usable frame — e.g. ffmpeg timing out on a large BD ``.m2ts``) is retried
+    ``PREVIEW_ATTEMPTS`` times; after that the file uploads without a preview.
+    A missing preview must never fail the upload: the failure used to burn
+    all five queue attempts and leave the file ``abandoned``.
     """
     mime = mime_type or mimetypes.guess_type(str(path))[0] or ""
-    result = capture_thumbnail(path, mime, ffmpeg)
+    name = getattr(path, "name", path)
+    for attempt in range(1, PREVIEW_ATTEMPTS + 1):
+        try:
+            result = capture_thumbnail(path, mime, ffmpeg)
+            break
+        except ThumbnailError as exc:
+            if attempt == PREVIEW_ATTEMPTS:
+                log.warning("no preview for %s after %s attempts, uploading without one: %s",
+                            name, attempt, exc)
+                return None
+            log.info("preview attempt %s for %s failed: %s", attempt, name, exc)
     if result.kind != "ready":
         if result.error:
             log.info("no preview for %s: %s", getattr(path, "name", path), result.error)
@@ -1408,6 +1443,40 @@ def _photo_size_bytes(size) -> Optional[int]:
     if progressive:
         return int(progressive[-1])
     return None
+
+
+#: message id -> the drive path last opened over it, for ``chunk timing`` only.
+#: Keyed by message id alone: a diagnostic label, not a routing table.
+READ_LABELS: Dict[int, str] = {}
+
+
+def note_read_label(message_id, label: str) -> None:
+    if len(READ_LABELS) > 4096:
+        READ_LABELS.clear()
+    try:
+        READ_LABELS[int(message_id)] = label
+    except (TypeError, ValueError):
+        pass
+
+
+def _tag_message(doc, message_id) -> None:
+    try:
+        doc._td_msg = int(message_id)
+    except (AttributeError, TypeError, ValueError):  # pragma: no cover - slotted fakes
+        pass
+
+
+def _doc_label(doc) -> str:
+    """A short, log-safe name for a document or photo (for ``chunk timing``)."""
+    path = READ_LABELS.get(getattr(doc, "_td_msg", None))
+    if path:
+        return path if len(path) <= 70 else "..." + path[-67:]
+    for attr in getattr(doc, "attributes", None) or ():
+        name = getattr(attr, "file_name", None)
+        if name:
+            return name if len(name) <= 40 else name[:37] + "..."
+    kind = "doc" if hasattr(doc, "attributes") else "photo"
+    return f"{kind}:{getattr(doc, 'id', '?')}"
 
 
 def _media_size(media) -> Optional[int]:
@@ -1693,11 +1762,23 @@ class SeekableRemoteFile(io.RawIOBase):
         while pos < end:
             index = pos // self._block_size
             block = blocks.get(index)
-            if not block:
-                break  # short read: the file ends earlier than the table claims
             inner = pos - index * self._block_size
-            take = min(end - pos, len(block) - inner)
+            take = min(end - pos, len(block) - inner) if block else 0
             if take <= 0:
+                # Telegram's copy ends before the size the backend recorded
+                # (seen on chat-import photos: 62,285 served vs 67,857 listed).
+                # Returning short makes rclone call it a broken transfer and
+                # retry forever, and the reader that asked — a warmshell, a
+                # player — waits in the kernel for bytes that do not exist.
+                # Short reads only happen at Telegram's end of file (failures
+                # raise), so padding cannot paper over a network error.
+                if not getattr(self, "_pad_warned", False):
+                    self._pad_warned = True
+                    log.warning(
+                        "%s: Telegram has %s bytes, listed size is %s; padding with zeros",
+                        self._name or "file", pos, self._total,
+                    )
+                out += bytes(end - pos)
                 break
             out += block[inner : inner + take]
             pos += take

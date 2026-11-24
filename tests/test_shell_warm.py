@@ -18,6 +18,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import fileid  # noqa: E402
 import warmup  # noqa: E402
 
 
@@ -164,7 +165,9 @@ def test_a_killed_batch_still_reports_what_it_warmed(tmp_path, monkeypatch, capl
     assert fake.killed
     # And it names what the shell was still holding, which is the one thing the
     # old flat-timeout message could never say.
-    assert "H:\\stuck.jpg" in caplog.text
+    # by id, never by name
+    assert fileid.tag("stuck.jpg") in caplog.text
+    assert "stuck" not in caplog.text
 
 
 def test_cleanup_has_a_deadline_when_killed_warmshell_never_exits(

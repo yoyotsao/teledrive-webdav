@@ -65,7 +65,7 @@ def _worker(messages):
 def test_returned_file_id_is_checked_before_getfile():
     worker = _worker({5: _Message(5, "700")})
 
-    with pytest.raises(RuntimeError, match="expected 701.*got 700") as raised:
+    with pytest.raises(RuntimeError, match="file mismatch") as raised:
         worker.read(5, "701", 0, 1)
 
     assert type(raised.value).__name__ == "RemoteIdentityError"
@@ -101,7 +101,7 @@ def test_document_cache_key_includes_expected_file_id():
     worker = _worker({5: _Message(5, "700")})
 
     assert worker.get_document(5, "700").id == 700
-    with pytest.raises(RuntimeError, match="expected 701.*got 700"):
+    with pytest.raises(RuntimeError, match="file mismatch"):
         worker.get_document(5, "701")
 
     assert (5, "700") in worker._docs
@@ -146,9 +146,9 @@ def test_a_different_file_is_still_refused_when_the_size_disagrees():
     worker = _worker({5: _sized(5, "700", 1_000_000)})
 
     for recorded in (999_999, 1_000_000 + 512 * 1024):
-        with pytest.raises(RuntimeError, match="expected 9001.*got 700"):
+        with pytest.raises(RuntimeError, match="file mismatch"):
             worker.get_document(5, "9001", expected_size=recorded)
-    with pytest.raises(RuntimeError, match="expected 9001.*got 700"):
+    with pytest.raises(RuntimeError, match="file mismatch"):
         worker.read(5, "9001", 0, 1, expected_size=1_000_000 + 512 * 1024)
     assert worker._client.getfile_calls == []
 

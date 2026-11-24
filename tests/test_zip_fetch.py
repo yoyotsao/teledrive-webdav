@@ -293,3 +293,13 @@ def test_cleanup_failure_does_not_mask_the_real_extract_error(tmp_path, monkeypa
     monkeypatch.setattr(zipfetch.shutil, "copyfileobj", lambda *a, **k: (_ for _ in ()).throw(OSError(22, "Invalid argument")))
     lines = rig.run()
     assert lines[-1].startswith("ERROR") and "Invalid argument" in lines[-1], lines
+
+
+def test_big5_archive_extracts_under_the_decoded_names(tmp_path):
+    from test_zipfs import legacy_zip
+
+    members = {"www/audio/se/射精音5.rpgmvo": b"a", "www/img/許可.png": b"b"}
+    rig = Rig(tmp_path, legacy_zip({k.encode("big5"): v for k, v in members.items()}))
+    lines = rig.run()
+    assert lines[-1] == f"OK {rig.base}", lines
+    assert_extracted(rig, members)

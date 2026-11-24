@@ -89,6 +89,10 @@ class SegmentTask:
         return SegmentDescriptor(self.index, self.offset, self.size)
 
 
+def _percent(done: int, total: int) -> float:
+    return round(100.0 * done / total, 1) if total else 100.0
+
+
 class SchedulerExecutionError(RuntimeError):
     pass
 
@@ -673,7 +677,13 @@ class SegmentScheduler:
         with self._condition:
             logical = sum(task.logical_uploaded_bytes for task in self._tasks.values())
             physical = self._physical_transferred_bytes
+            total = sum(task.size for task in self._tasks.values())
             return {
+                "total_bytes": total,
+                "percent": _percent(logical, total),
+                "segments_total": len(self._tasks),
+                "segments_done": sum(
+                    1 for task in self._tasks.values() if task.state is SegmentState.COMPLETED),
                 "logical_uploaded_bytes": logical,
                 "physical_transferred_bytes": physical,
                 "migration_overhead_bytes": max(0, physical - logical),
@@ -692,6 +702,10 @@ class SegmentScheduler:
                     "account_id": task.current_account_id,
                     "migration_count": task.migration_count,
                     "logical_uploaded_bytes": task.logical_uploaded_bytes,
+                    "size": task.size,
+                    "percent": _percent(task.logical_uploaded_bytes, task.size),
+                    "segment_number": task.index + 1,  # for "1 of N"; segment_index is 0-based
+                    "segments_total": len(self._tasks),
                     "detail": (
                         "重新分派上傳帳號，該區段將從頭重傳"
                         if task.migration_count else ""

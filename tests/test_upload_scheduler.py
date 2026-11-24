@@ -22,6 +22,7 @@ import pytest
 import gamestage
 import upload_engine
 import uploadstage
+from fileid import path_id
 from gamestage import WRITER_STALE_SECONDS
 from telegram_accounts import TelegramAccountPool
 from transfer_models import (
@@ -441,7 +442,8 @@ def test_status_reports_stage_attempts_and_a_redacted_error(stager):
     stager.engine.fail_register.add("x.bin")
     stager.stage_file("x.bin")
     stager.process_due([("x.bin",)])
-    entry = next(p for p in stager.status()["pending"] if p["path"] == "x.bin")
+    entry = next(p for p in stager.status()["pending"] if p["id"] == "0x%016x" % path_id("x.bin"))
+    assert "path" not in entry
     assert entry["stage"] == "failed"
     assert entry["attempts"] == 1
     assert "registration failed" in entry["detail"]

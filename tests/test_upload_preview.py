@@ -115,14 +115,31 @@ def test_make_preview_adapts_a_ready_media_thumbnail(tmp_path, monkeypatch):
     assert seen == [(path, "video/mp4", "configured-ffmpeg")]
 
 
-def test_make_preview_does_not_hide_decodable_media_capture_errors(tmp_path, monkeypatch):
+def test_make_preview_gives_up_after_three_failures_without_failing_upload(tmp_path, monkeypatch):
+    calls = []
+
     def fail(*_):
+        calls.append(1)
         raise ThumbnailError("no thumbnail")
 
     monkeypatch.setattr(tgio, "capture_thumbnail", fail)
 
-    with pytest.raises(ThumbnailError, match="no thumbnail"):
-        tgio.make_preview(tmp_path / "clip.mp4", "video/mp4", "configured-ffmpeg")
+    assert tgio.make_preview(tmp_path / "clip.mp4", "video/mp4", "configured-ffmpeg") is None
+    assert len(calls) == 3
+
+
+def test_make_preview_retries_a_transient_capture_error(tmp_path, monkeypatch):
+    results = [ThumbnailError("timed out"), ThumbnailResult("ready", b"jpeg", 640, 360)]
+
+    def flaky(*_):
+        item = results.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    monkeypatch.setattr(tgio, "capture_thumbnail", flaky)
+
+    assert tgio.make_preview(tmp_path / "clip.mp4", "video/mp4", "ffmpeg") == (b"jpeg", 640, 360)
 
 
 # --------------------------------------------------------------------------- #

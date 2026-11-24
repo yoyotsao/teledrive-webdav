@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, List, Optional
 
+import fileid
 import zipfetch
 from config import ext_path
 from upload_engine import redact
@@ -246,7 +247,8 @@ class LocalFetcher:
                     return
                 os.replace(ext_path(tmp), ext_path(item.dest))
             except Exception as exc:
-                log.exception("fetch of %s failed", item.dest)
+                log.exception("fetch of %s failed",
+                              fileid.tag_local(item.dest, self.cfg.cache_dir.parent) or fileid.UNKNOWN_TAG)
                 # 取消時保留 .part，讓下一次工作明確重抓此 item；其他錯誤不留半成品。
                 if cancel is None or not cancel.is_set():
                     try:

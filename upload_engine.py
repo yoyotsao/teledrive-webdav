@@ -11,10 +11,12 @@ from collections import deque
 from contextlib import contextmanager
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from pathlib import Path
 from threading import BoundedSemaphore, Lock, Thread
 from typing import Callable, Dict, Mapping, Optional, Sequence
 from uuid import uuid4
 
+import fileid
 from config import ext_path
 from tgio import SegmentReader
 from tgupload import AttemptRevoked, SMALL_FILE_MAX, decide_protocol
@@ -42,6 +44,9 @@ class TransferMetrics:
     """
 
     protocol: str = ""
+    #: The file's ``fileid`` tag and which try this is: a retry has the same id.
+    log_tag: str = "id=?"
+    attempt: int = 1
     bytes: int = 0
     parts: int = 0
     hash_ms: float = 0.0
@@ -131,6 +136,71 @@ def guess_mime_type(name: str) -> str:
     if suffix in _MIME_OVERRIDES:
         return _MIME_OVERRIDES[suffix]
     return mimetypes.guess_type(name)[0] or "application/octet-stream"
+
+
+def _tag_hex(tag: str) -> Optional[str]:
+    """``id=0x...`` -> ``0x...`` for JSON, or None when the file has no id yet."""
+    return tag[3:] if tag.startswith("id=0x") else None
+
+
+def fmt_bytes(n: float) -> str:
+    """``56.7MiB`` / ``512B``: a size with its unit, so nobody converts raw bytes."""
+    for unit, shift in (("GiB", 30), ("MiB", 20), ("KiB", 10)):
+        if n >= 1 << shift:
+            return f"{n / (1 << shift):.1f}{unit}"
+    return f"{int(n)}B"
+
+
+def fmt_secs(ms: float) -> str:
+    """Milliseconds as seconds with a unit: ``0.05s`` / ``17.7s``."""
+    seconds = ms / 1000.0
+    return f"{seconds:.2f}s" if seconds < 10 else f"{seconds:.1f}s"
+
+
+def describe_upload(request: "TransferRequest") -> str:
+    """What an upload is, for the line that announces it: kind, size magnitude,
+    and the protocol/part count the engine will pick. Never the name."""
+    ext = Path(request.upload_name).suffix.lower() or "(none)"
+    album = bool(request.allow_album) and album_eligible(request.mime_type, request.logical_size)
+    decision = decide_protocol(request.logical_size, album_eligible=album)
+    return (f"ext={ext} size={fmt_bytes(request.logical_size)} "
+            f"protocol={decision.name} parts={len(decision.segments)}")
+
+
+class FloodLogGate:
+    """At most one log line per key per ``interval`` seconds, and how many it held back.
+
+    A premium FLOOD_WAIT repeats every ~17s for as long as a file is uploading,
+    from every part in flight: measured at ~400 lines an hour for one file. The
+    first is logged at once; after that one summary per window says how many
+    were skipped, so the log still shows it is happening and for how long.
+    """
+
+    MAX_KEYS = 256
+
+    def __init__(self, interval: float = 60.0):
+        self.interval = interval
+        self._seen: dict = {}
+        self._lock = Lock()
+
+    def admit(self, key: str, now: float):
+        """None when held back; else ``(held, window_seconds)`` for this line."""
+        with self._lock:
+            entry = self._seen.get(key)
+            if entry is None:
+                if len(self._seen) >= self.MAX_KEYS:
+                    self._seen.clear()
+                self._seen[key] = (now, 0)
+                return (0, 0.0)
+            last, held = entry
+            if now - last < self.interval:
+                self._seen[key] = (last, held + 1)
+                return None
+            self._seen[key] = (now, 0)
+            return (held, now - last)
+
+
+_FLOOD_LOG = FloodLogGate()
 
 
 def album_eligible(mime_type: str, size: int) -> bool:
@@ -540,7 +610,7 @@ class UploadEngine:
         from gamestage import sample_hash
 
         if request.logical_size <= 0:
-            raise ValueError(f"{request.upload_name} is empty (0 bytes) or has an invalid size")
+            raise ValueError(f"{request.log_tag} is empty (0 bytes) or has an invalid size")
         actual_size = request.source.stat().st_size
         if actual_size != request.logical_size:
             raise CoverageError(f"source has {actual_size} bytes, expected {request.logical_size}")
@@ -640,6 +710,7 @@ class UploadEngine:
                 with self._metrics_lock:
                     self._metrics[id(request)] = TransferMetrics(
                         protocol="?", bytes=request.logical_size,
+                        log_tag=request.log_tag, attempt=request.attempt,
                     )
                 inflight.append((request, self._submit_inspection(request, hash_pool, check_pool)))
             if not inflight:
@@ -676,7 +747,7 @@ class UploadEngine:
                 errors.append(exc)
                 detail = redact(exc)
                 self._discard_metrics(request)
-                log.warning("transfer failed name=%s %s", request.upload_name, detail)
+                log.warning("transfer failed %s attempt=%d %s", request.log_tag, request.attempt, detail)
                 notify(request, QueueStage.FAILED, detail)
                 return
             metrics = self._take_metrics(request)
@@ -735,7 +806,7 @@ class UploadEngine:
                         errors.append(exc)
                         detail = redact(exc)
                         self._discard_metrics(request)
-                        log.warning("transfer failed name=%s %s", request.upload_name, detail)
+                        log.warning("transfer failed %s attempt=%d %s", request.log_tag, request.attempt, detail)
                         notify(request, QueueStage.FAILED, detail)
             finally:
                 for queue in queues.values():
@@ -893,34 +964,41 @@ class UploadEngine:
         if kind == "premium_flood":
             cycle = payload["cycle"]
             pacer = payload["pacer"]
+            admitted = _FLOOD_LOG.admit(
+                f"{getattr(scheduler, 'log_tag', '')}:{cycle.lease.task_id}", time.monotonic())
+            if admitted is None:
+                return
+            held, window = admitted
             task = scheduler.task(cycle.lease.task_id)
             remaining_ratio = (task.size - task.logical_uploaded_bytes) / task.size
             live_speed = scheduler.speed_tracker.live_speed(cycle.lease)
             mode = getattr(pacer, "mode", "unknown")
             penalty = getattr(pacer, "paused_until", getattr(pacer, "penalty_until", 0.0))
             log.info(
-                "premium flood file_job_id=%s task_id=%s segment_index=%d attempt_id=%d "
+                "premium flood %s file_job_id=%s task_id=%s segment_index=%d attempt_id=%d "
                 "account_id=%d wait_seconds=%g penalty_until=%.3f pacer_mode=%s rate=%.2f "
                 "live_speed=%.2f logical_bytes=%d remaining_ratio=%.6f "
                 "account_accepted_parts=%d account_accepted_bytes=%d "
-                "task_accepted_parts=%d task_accepted_bytes=%d",
-                scheduler.file_job_id, cycle.lease.task_id, task.index, cycle.lease.attempt_id,
+                "task_accepted_parts=%d task_accepted_bytes=%d%s",
+                getattr(scheduler, "log_tag", "id=?"), scheduler.file_job_id,
+                cycle.lease.task_id, task.index, cycle.lease.attempt_id,
                 cycle.lease.account_id, cycle.wait_seconds, float(penalty or 0.0), mode,
                 float(getattr(pacer, "rate", 0.0) or 0.0), live_speed,
                 task.logical_uploaded_bytes, remaining_ratio,
                 cycle.account_accepted_parts, cycle.account_accepted_bytes,
                 cycle.task_accepted_parts, cycle.task_accepted_bytes,
+                f" (+{held} more in the last {window:.0f}s)" if held else "",
             )
             return
         if kind == "migration":
             commit = payload["commit"]
             task = scheduler.task(commit.task_id)
             log.info(
-                "segment migration file_job_id=%s task_id=%s segment_index=%d "
+                "segment migration %s file_job_id=%s task_id=%s segment_index=%d "
                 "old_attempt_id=%d new_attempt_id=%d from_account_id=%d to_account_id=%d "
                 "snapshot_speed=%.2f snapshot_age=%.2f current_speed=%.2f "
                 "remaining_ratio=%.6f score=%.6f abandoned_bytes=%d migration_count=%d",
-                scheduler.file_job_id, commit.task_id, task.index,
+                getattr(scheduler, "log_tag", "id=?"), scheduler.file_job_id, commit.task_id, task.index,
                 commit.old_attempt_id, commit.new_attempt_id, commit.from_account_id,
                 commit.to_account_id, commit.target_snapshot_speed, commit.target_snapshot_age,
                 commit.current_speed, commit.remaining_ratio, commit.score,
@@ -933,6 +1011,7 @@ class UploadEngine:
         return [
             {
                 "file_job_id": scheduler.file_job_id,
+                "id": _tag_hex(getattr(scheduler, "log_tag", "")),
                 "segments": scheduler.status(),
                 **scheduler.metrics_snapshot(),
             }
@@ -952,6 +1031,7 @@ class UploadEngine:
         # for ownership/generation; these values merely avoid widening every
         # SchedulerAction with file-system objects.
         scheduler.execution_request = request
+        scheduler.log_tag = request.log_tag
         scheduler.execution_preview = preview
         scheduler._diagnostic_sink = (
             lambda kind, payload, current=scheduler:
@@ -1166,10 +1246,10 @@ class UploadEngine:
                 parent_id=request.parent_id,
             )
         except BaseException as exc:  # noqa: BLE001 - logged, then re-raised
-            log.warning("registration failed name=%s %s", request.upload_name, redact(exc))
+            log.warning("registration failed %s attempt=%d %s", request.log_tag, request.attempt, redact(exc))
             raise
         self.api.invalidate(request.parent_id)
-        log.info("transfer complete protocol=empty bytes=0 name=%s", request.upload_name)
+        log.info("transfer complete %s attempt=%d protocol=empty size=0B", request.log_tag, request.attempt)
 
     def register_result(self, result: TransferResult) -> None:
         """Settle every part registration, then say where the time went.
@@ -1192,7 +1272,7 @@ class UploadEngine:
                 if metrics is not None and metrics.protocol == "duplicate":
                     self._assert_registered(request, result.fingerprint)
         except BaseException as exc:  # noqa: BLE001 - logged, then re-raised
-            log.warning("registration failed name=%s %s", request.upload_name, redact(exc))
+            log.warning("registration failed %s attempt=%d %s", request.log_tag, request.attempt, redact(exc))
             raise
         self.api.invalidate(request.parent_id)
         self._log_complete(metrics)
@@ -1202,18 +1282,39 @@ class UploadEngine:
         if metrics is None:
             return
         metrics.total_ms = (time.monotonic() - metrics.started) * 1000.0
-        log.info(
-            "transfer complete protocol=%s bytes=%d parts=%d hash_ms=%.0f check_ms=%.0f "
-            "thumb_ms=%.0f slot_ms=%.0f upload_ms=%.0f message_ms=%.0f register_ms=%.0f "
-            "total_ms=%.0f accounts=%s logical_uploaded_bytes=%d physical_transferred_bytes=%d "
-            "migration_overhead_bytes=%d migration_count=%d rate=%.2f ceiling=%s",
-            metrics.protocol, metrics.bytes, metrics.parts, metrics.hash_ms, metrics.check_ms,
-            metrics.thumb_ms, metrics.slot_ms, metrics.upload_ms, metrics.message_ms,
-            metrics.register_ms, metrics.total_ms, metrics.account_ids,
-            metrics.logical_uploaded_bytes, metrics.physical_transferred_bytes,
-            metrics.migration_overhead_bytes, metrics.migration_count, metrics.rate,
-            metrics.ceiling,
-        )
+        # key=value so it stays greppable, but with units on the values and the
+        # always-equal / always-zero fields left out unless they carry something.
+        fields = [
+            metrics.log_tag,
+            f"attempt={metrics.attempt}",
+            f"protocol={metrics.protocol}",
+            f"size={fmt_bytes(metrics.bytes)}",
+            f"parts={metrics.parts}",
+            f"total={fmt_secs(metrics.total_ms)}",
+            f"hash={fmt_secs(metrics.hash_ms)}",
+            f"check={fmt_secs(metrics.check_ms)}",
+        ]
+        if metrics.thumb_ms:
+            fields.append(f"thumb={fmt_secs(metrics.thumb_ms)}")
+        if metrics.slot_ms:
+            fields.append(f"slot={fmt_secs(metrics.slot_ms)}")
+        fields += [
+            f"upload={fmt_secs(metrics.upload_ms)}",
+            f"message={fmt_secs(metrics.message_ms)}",
+            f"register={fmt_secs(metrics.register_ms)}",
+        ]
+        if metrics.parts == 1 and metrics.upload_ms > 0 and metrics.physical_transferred_bytes > 0:
+            # One segment, so upload_ms is wall clock: a speed means something.
+            # For a split file the stages are summed work and would mislead.
+            fields.append(f"speed={fmt_bytes(metrics.physical_transferred_bytes / (metrics.upload_ms / 1000.0))}/s")
+        fields.append(f"accounts={len(metrics.account_ids)}")
+        fields.append(f"limiter_rate={metrics.rate:.2f}/s")
+        if metrics.ceiling is not None:
+            fields.append(f"ceiling={metrics.ceiling:g}/s")
+        if metrics.migration_count or metrics.migration_overhead_bytes:
+            fields.append(f"migrated={metrics.migration_count}")
+            fields.append(f"extra_sent={fmt_bytes(metrics.migration_overhead_bytes)}")
+        log.info("transfer complete %s", " ".join(fields))
 
     def _register_parts(self, request, parts, fingerprint, group, total) -> None:
         with ThreadPoolExecutor(max_workers=self._register_concurrency) as executor:
@@ -1248,7 +1349,7 @@ class UploadEngine:
                     and (row.get("parent_id") or None) == (request.parent_id or None)):
                 return
         raise CoverageError(
-            f"{request.upload_name} registered but no row answers to that name "
+            f"{request.log_tag} registered but no row answers to that name "
             f"under its parent; the drive stores one name per Telegram document"
         )
 

@@ -29,20 +29,21 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlsplit
 
-from wsgidav.dav_error import HTTP_FORBIDDEN, HTTP_INTERNAL_ERROR, DAVError
+from wsgidav.dav_error import HTTP_FORBIDDEN, HTTP_INTERNAL_ERROR, HTTP_SERVICE_UNAVAILABLE, DAVError
 from wsgidav.dav_provider import DAVCollection, DAVNonCollection, DAVProvider
 from wsgidav.wsgidav_app import WsgiDAVApp
 
 import zipfs
 from config import Config, ext_path as _ext, load_config
 from gamestate import GameRpc
-from tdapi import ApiError, Entry, JsonStore, ShardedJsonStore, TeleDriveClient
+from rejectedputs import RejectedPuts
+from tdapi import ApiError, BackendUnavailable, Entry, JsonStore, ShardedJsonStore, TeleDriveClient
 from telegram_accounts import TelegramAccountPool
 from telegram_sessions import SessionDirectoryLock
-from tgio import REQUEST_SIZE, STREAM_BLOCK_SIZE, SeekableRemoteFile
+from tgio import REQUEST_SIZE, STREAM_BLOCK_SIZE, SeekableRemoteFile, note_read_label
 from transfer_models import RemotePart
 
 log = logging.getLogger("bridge")
@@ -220,17 +221,43 @@ class Resolver:
         self._thumb_lock = threading.Lock()
         self._thumb_warming = set()  # parent_ids with a prefetch in flight
         self._last_demand = 0.0      # monotonic time of the last foreground request
+        self.placeholders = PlaceholderListings(
+            store=cfg.cache_dir / "placeholders.json", probe=self.probe_listing
+        )
+        self.placeholders.resume()
 
     # -- helpers ---------------------------------------------------------- #
 
-    def open_remote(self, entry: Entry) -> SeekableRemoteFile:
+    def probe_listing(self, rel_path: str) -> None:
+        """Raise unless the folder at ``rel_path`` can be listed from the backend now.
+
+        Fresh, straight to the backend: the ordinary path sits out a cooldown
+        after a failure, and a fresh listing refills the caches on success.
+        A path that no longer resolves to a folder counts as answered -- rclone
+        should drop its empty copy either way.
+        """
+        segments = [s for s in rel_path.split("/") if s]
+        loc = self.resolve(segments)
+        if loc.kind == ROOT:
+            self.api.list_dir(None, fresh=True)
+        elif loc.kind == GAME:
+            game = self.api.resolve([self.cfg.game_folder])
+            if game is not None:
+                self.api.list_dir(game.file_id, fresh=True)
+        elif loc.kind == FOLDER:
+            self.api.list_dir(loc.entry.file_id, fresh=True)
+
+    def open_remote(self, entry: Entry, label: Optional[str] = None) -> SeekableRemoteFile:
         """A fresh seekable reader over a cloud file (split parts concatenated)."""
         if entry.is_empty:
             return io.BytesIO(b"")  # no Telegram message behind it
         self.note_demand()
+        parts = self.api.parts_for(entry)
+        for part in parts:  # so ``chunk timing`` can say which file is being read
+            note_read_label(getattr(part, "message_id", None), label or entry.name)
         return SeekableRemoteFile(
             self.pool,
-            self.api.parts_for(entry),
+            parts,
             name=entry.name,
             head=self.cached_head(entry),
         )
@@ -783,7 +810,7 @@ class RemoteFileResource(_ReadOnlyFile):
         super().__init__(path, environ, size, entry.mtime, f"{entry.file_id}-{size}", entry.mime)
 
     def get_content(self):
-        return self.resolver.open_remote(self.entry)
+        return self.resolver.open_remote(self.entry, label=self.path)
 
     # Overwriting an existing plain file: there is no backend "replace" call,
     # so this is a new write of the same name into the same parent — the
@@ -865,7 +892,163 @@ class ZipFileResource(_ReadOnlyFile):
         raise DAVError(HTTP_FORBIDDEN, PACKED_MESSAGE)
 
 
-class _ReadOnlyCollection(DAVCollection):
+def _rclone_forget(rel_path: str) -> bool:
+    import mountctl
+
+    return mountctl._rc("vfs/forget", params={"dir": rel_path}) is not None
+
+
+class PlaceholderListings:
+    """Folders answered with an empty listing while the backend was down.
+
+    With no earlier copy, a 503 is quick from here but not through rclone: its
+    pacer is shared by the whole mount and climbs to 2s between its 10 retries,
+    and Windows retries the readdir 3 times -- 60-70s of spinning, with every
+    other request on H: slowed to one per 2s meanwhile (measured 2026-11-15).
+    So browsing gets an empty folder at once, and once the folder lists again
+    rclone is told to forget its copy of that emptiness (it would otherwise
+    keep it for --dir-cache-time, an hour).
+
+    The list is kept in ``meta/placeholders.json`` as well: a restart in the
+    middle of an outage would otherwise forget which folders rclone is holding
+    an empty answer for.
+    """
+
+    def __init__(self, forget: Callable[[str], object] = _rclone_forget, interval: float = 35.0,
+                 store: Optional[Path] = None, probe: Optional[Callable[[str], object]] = None):
+        self.forget = forget
+        self.interval = interval
+        self.probe = probe
+        self._store = store
+        self._lock = threading.Lock()
+        self._pending: set = set(self._load())
+        self._thread: Optional[threading.Thread] = None
+
+    def _load(self) -> List[str]:
+        if self._store is None:
+            return []
+        try:
+            data = json.loads(self._store.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        return [p for p in data if isinstance(p, str)] if isinstance(data, list) else []
+
+    def _save_locked(self) -> None:
+        if self._store is None:
+            return
+        try:
+            tmp = self._store.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+            tmp.write_text(json.dumps(sorted(self._pending)), encoding="utf-8")
+            os.replace(tmp, self._store)
+        except OSError as exc:
+            log.warning("could not save the placeholder list: %s", exc)
+
+    def resume(self) -> None:
+        """Pick up where a previous process left off."""
+        with self._lock:
+            if self._pending:
+                self._start_locked()
+
+    def _start_locked(self) -> None:
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = threading.Thread(target=self._run, name="placeholders", daemon=True)
+            self._thread.start()
+
+    def note(self, rel_path: str) -> None:
+        with self._lock:
+            first = rel_path not in self._pending
+            if first:
+                self._pending.add(rel_path)
+                self._save_locked()
+            self._start_locked()
+        if first:
+            log.warning("listing /%s: backend unavailable and no earlier copy; showing it empty for now", rel_path)
+
+    def pending(self) -> List[str]:
+        with self._lock:
+            return sorted(self._pending)
+
+    def _run(self) -> None:
+        while True:
+            time.sleep(self.interval)
+            with self._lock:
+                items = sorted(self._pending)
+                if not items:
+                    self._thread = None
+                    return
+            for rel_path in items:
+                try:
+                    if self.probe is not None:
+                        self.probe(rel_path)
+                except Exception:
+                    continue
+                try:
+                    if self.forget(rel_path) is False:
+                        continue  # rclone did not take it; try again next round
+                except Exception:
+                    continue
+                with self._lock:
+                    self._pending.discard(rel_path)
+                    self._save_locked()
+                log.info("listing /%s answers again; told rclone to re-list it", rel_path)
+
+
+def _unavailable(path: str, exc: Exception) -> DAVError:
+    """A backend failure as 503: never 404, which rclone caches as "deleted".
+
+    rclone's webdav backend retries 500 and 503 the same way (low_level_retries,
+    pacer sleeps capped at 2s) and ignores Retry-After, so the status code does
+    not shorten the retries -- answering quickly does. What 503 buys over 404 is
+    that the folder does not vanish from rclone's dir cache during an outage.
+    """
+    log.warning("%s unavailable: %s", path, exc)
+    return DAVError(HTTP_SERVICE_UNAVAILABLE, "TeleDrive backend unavailable", src_exception=exc)
+
+
+class _IsolatedMembers(DAVCollection):
+    """One child that cannot be built drops out; it does not 500 the listing.
+
+    wsgidav's default get_member_list asserts every member is non-None, so a
+    single unreadable row, bad zip or locked staging file used to turn the
+    whole PROPFIND into a 500 -- which rclone retries while holding the
+    folder's dir lock, freezing every Explorer window (2026-11-13).
+    A 503 from a child still propagates: dropping a child because the backend
+    is down would tell rclone it was deleted.
+    """
+
+    def get_member_list(self):
+        try:
+            names = self.get_member_names()
+        except BackendUnavailable as exc:
+            placeholders = getattr(getattr(self, "resolver", None), "placeholders", None)
+            # Browsing only. A COPY or DELETE walks the subtree through here too,
+            # and "looks empty right now" must never feed a destructive decision.
+            if placeholders is None or self.environ.get("REQUEST_METHOD") != "PROPFIND":
+                raise _unavailable(self.path, exc) from None
+            placeholders.note(self.path.strip("/"))
+            return []
+        except ApiError as exc:
+            raise _unavailable(self.path, exc) from None
+        members = []
+        for name in names:
+            try:
+                member = self.get_member(name)
+            except DAVError as exc:
+                if exc.value == HTTP_SERVICE_UNAVAILABLE:
+                    raise
+                log.warning("listing %s: %r left out (%s)", self.path, name, exc)
+                continue
+            except Exception as exc:
+                log.warning("listing %s: %r left out (%s: %s)", self.path, name, type(exc).__name__, exc)
+                continue
+            if member is None:
+                log.warning("listing %s: %r did not resolve; left out", self.path, name)
+                continue
+            members.append(member)
+        return members
+
+
+class _ReadOnlyCollection(_IsolatedMembers):
     def get_creation_date(self):
         return self._mtime
 
@@ -941,7 +1124,7 @@ class RootCollection(_ReadOnlyCollection):
         )
 
 
-class GameCollection(DAVCollection):
+class GameCollection(_IsolatedMembers):
     """/game — the only writable path.
 
     Members are the union of packed archives (shown as folders, .zip hidden),
@@ -1042,12 +1225,21 @@ class ZipDirCollection(_ReadOnlyCollection):
         super().__init__(path, environ)
         self._node = node
         self._view = view
+        self._unreadable = False
         self._mtime = (node.mtime if node is not None else None) or mtime or time.time()
 
     @property
     def node(self):
-        if self._node is None:
-            self._node = self._view.lookup([])
+        if self._node is None and not self._unreadable:
+            try:
+                self._node = self._view.lookup([])
+            except Exception as exc:
+                # A .zip on the drive that is not a zip. Raising here is a 500
+                # on PROPFIND, which rclone retries forever while holding the
+                # parent's dir lock -- every Explorer window on H: freezes.
+                # An empty folder plus one warning is the answer that ends it.
+                log.warning("cannot read zip directory of %s: %s", self.path, exc)
+                self._unreadable = True
         return self._node
 
     def get_member_names(self):
@@ -1096,7 +1288,7 @@ class _StagingCopyMove:
             raise DAVError(HTTP_FORBIDDEN, str(exc))
 
 
-class StagingCollection(_StagingCopyMove, DAVCollection):
+class StagingCollection(_StagingCopyMove, _IsolatedMembers):
     def __init__(self, path, environ, stager, local: Path, top: str):
         super().__init__(path, environ)
         self.stager = stager
@@ -1316,14 +1508,15 @@ class TeleDriveProvider(DAVProvider):
 
     def get_resource_inst(self, path: str, environ: dict):
         segments = split_dav_path(path)
+        # A failure here is not "no such path": returning None would be a 404,
+        # and rclone caches that as the folder having been deleted.
         try:
             loc = self.resolver.resolve(segments)
         except ApiError as exc:
-            log.warning("resolve %s failed: %s", path, exc)
-            return None
-        except Exception:
+            raise _unavailable(path, exc) from None
+        except Exception as exc:
             log.exception("resolve %s crashed", path)
-            return None
+            raise DAVError(HTTP_INTERNAL_ERROR, src_exception=exc) from None
 
         res = self.resolver
         if loc.kind == ROOT:
@@ -1336,8 +1529,7 @@ class TeleDriveProvider(DAVProvider):
             try:
                 return RemoteFileResource(path, environ, res, loc.entry)
             except ApiError as exc:
-                log.warning("cannot size %s: %s", path, exc)
-                return None
+                raise _unavailable(path, exc) from None
         if loc.kind == ZIPDIR:
             return ZipDirCollection(
                 path, environ, loc.node, view=loc.view,
@@ -1473,6 +1665,11 @@ class RpcApp:
             {
                 **(self.stager.status() if self.stager else {}),
                 "uploads": self.upload_stager.status() if self.upload_stager else {},
+                # Folders answered from a stale listing because the backend failed them.
+                "stale_listings": getattr(self.resolver.api, "stale_listing_count", lambda: 0)(),
+                # rclone's own health, which the bridge cannot see from its side
+                # of the HTTP connection (mountwatch.py).
+                "mount": watch.status() if (watch := getattr(self.resolver, "mount_watch", None)) else None,
                 **self.resolver.pool.status(),
             },
             default=str,
@@ -1620,7 +1817,7 @@ def build_app(cfg: Config, resolver: Resolver, stager, fetcher, upload_stager=No
         "logging": {"enable": False, "enable_loggers": []},
     }
     dav_app = WsgiDAVApp(dav_config)
-    guarded = WriteGuard(dav_app, cfg.game_folder)
+    guarded = RejectedPuts(WriteGuard(dav_app, cfg.game_folder), cfg.rejected_dir)
     return Dispatcher(guarded, RpcApp(cfg, resolver, fetcher, stager, upload_stager,
                                       running_provider=running_provider,
                                       session_store=session_store,
@@ -1857,6 +2054,17 @@ def main(argv=None) -> int:
         threading.Thread(
             target=lambda: mountctl.ensure_mounted(cfg), name="automount", daemon=True
         ).start()
+    # Watches rclone's pacer whether or not we mounted it: 2026-11-01 it leaked
+    # its tokens after a week and only "H: is slow" gave it away.
+    import mountctl
+    import mountwatch
+
+    resolver.mount_watch = mountwatch.MountWatch(
+        fetch=lambda: mountwatch.fetch_dump(mountctl.RC_ADDR),
+        auto_recover=cfg.auto_recover_mount,
+        recover=lambda: mountwatch.remount_when_quiet(cfg, resolver),
+    )
+    resolver.mount_watch.start()
     _install_console_close_handler(server)
     try:
         server.start()

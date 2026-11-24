@@ -44,6 +44,11 @@ bridge 只用現有 public API，沒有為它新增任何會讀寫二進位資�
   rotating，8 MB × 3，同時仍印到 console）。
   要確認一個改動在真的 Telegram 上生效，讀這個檔比問使用者貼 console 快，
   而且 crash 之後還在。
+  **log 與 `/rpc/status` 不寫檔名／路徑，檔案一律是 `id=0x<16 位十六進位>`**（rclone 的穩定檔案 ID，
+  與 rclone.log、`fsutil file queryFileID`、thumbcache 是同一個數字）。
+  `python fileid.py tag "H:\路徑"` 離線算出某個檔的 ID；`python fileid.py info 0x…`
+  （或 bridge 開著時 `GET /rpc/fileinfo?id=0x…`）回報它是什麼類型的檔、在哪、什麼狀態，
+  **不含名字**，可以直接貼出去。
 
 ## 檔案
 
@@ -61,15 +66,22 @@ bridge 只用現有 public API，沒有為它新增任何會讀寫二進位資�
 | `zipfs.py` | 讀 zip central directory → 虛擬目錄樹；單一 entry 的 range 讀取 |
 | `gamestage.py` | `/game` staging + debounce 打包（`ZIP_STORED`）+ 清理；打包完就交給 `upload_engine`。另外持有 `sample_hash` 與 `_preview_file`（engine 會回頭呼叫） |
 | `uploadstage.py` | `/game` 以外任意路徑的一般檔案寫入：落地 + debounce + **整批**交給 engine + 註冊 + 只在註冊落地後才刪暫存；佇列狀態持久化在 `meta/upload-queue.json` |
+| `rejectedputs.py` | 包在 `WriteGuard` 外的 WSGI 中介層：同一路徑的 PUT 失敗 3 次、且第一次失敗已過 30 分鐘，下一次就收進 `<cache_dir>\rejected\` 並回 201，之後 15 分鐘對那條路徑的 `Depth: 0` PROPFIND 回一份假的檔案屬性（rclone 上傳後會回頭確認） |
+| `savedata.py` | `/rpc/game/savedata/*`：存檔位置偵測（引擎識別 + 附帶存檔搜尋）與匯入（範圍白名單、拒絕連結／junction、覆蓋前備份），規則對齊桌面版 `detect.rs` / `import.rs` |
 | `fetchlocal.py` | 「儲存在本地」：伺服端複製邏輯 + 右鍵 verb 用的進度顯示 CLI |
 | `warmup.py` | 走遍整棵樹批次填滿縮圖與屬性快取、跑 Windows 縮圖快取，可續跑；`BackgroundWarmup` 讓 bridge 自己跑 |
 | `install_menu.py` | 註冊/移除 Explorer 右鍵 verb |
 | `install_thumb.py` | 註冊/移除 shell handler，逐副檔名記錄被取代的既有 CLSID |
 | `shellthumb/` | C++ shell 擴充：`IThumbnailProvider` + `IPropertyStore`，同一份 DLL 兩個 CLSID；`warmshell.exe` 把縮圖灌進 Windows thumbcache，`bench.exe` / `isolate.exe` 量測 |
+| `fileid.py` | 檔案 ID：`path_id`（`stableIno` 的移植）、`tag`／`tag_dav`／`tag_drive`／`tag_local`、CLI `tag`／`info`。**ID 的定義只有一個**：FNV-64a(rclone VFS path) 清最高位，Python 與 Go（`fs.StableID`）各有同一組向量測試 |
+| `fileinfo.py` | `fileid.py info` 與 `/rpc/fileinfo` 的查詢：只讀 `meta/dirs/`、`meta/zips/`、`uploads/`、`staging/` 快取，不打 backend；輸出刻意不含名字、`file_hash`、backend id、message id、telegram user id、精確大小 |
+| `logscrub.py` | 輸出端防漏網：`ScrubbingFormatter`（**是 Formatter 不是 Filter**，filter 看不到 traceback）把例外訊息／traceback 裡的本機路徑、`H:\` 路徑、bridge URL 換成 ID；`install_excepthooks`、cheroot `error_log` 也走 logging |
 | `config.py` | 讀 `config.ini`，空值回退環境變數，再回退 `env_file`；由單一 `cache_dir` 推導所有路徑；並發參數做範圍檢查（0 或負數直接 `ConfigError`，不是靜靜跑一個壞值） |
-| `mountctl.py` | 擁有 `rclone mount`：`ensure`（冪等，bridge 啟動後自己呼叫）、`stop`（`rclone rc core/quit`，**永不強殺**）、`check`/`status`。rclone 以 detached 行程啟動，bridge 重啟不會帶走 `H:`；log 在 `meta/rclone.log` |
+| `mountctl.py` | 擁有 `rclone mount`：`ensure`（冪等，bridge 啟動後自己呼叫）、`stop`（`rclone rc core/quit`，**永不強殺**）、`check`/`status`。rclone 以 detached 行程啟動，bridge 重啟不會帶走 `H:`；log 在 `meta/rclone.log`。優先用 `tools/rclone-stableino/rclone.exe`，找不到才退回 PATH 並 warning；固定 `-o VolumeSerialNumber` |
+| `mountwatch.py` | 每 5 分鐘讀 rclone 的 goroutine dump（`127.0.0.1:5572/debug/pprof`），連續 3 次「有人在 `pacer.beginCall` 等 token、沒人在 call 裡、也沒有補 token 的計時 goroutine」就判定 pacer 名額漏光（11-01 那次）：`bridge.log` ERROR + `/rpc/status` 的 `mount.pacer_exhausted`。`[bridge] auto_recover_mount`（預設關）才會在沒有 writeback、一分鐘沒人瀏覽時 `core/quit` 再掛回 |
+| `tools/rclone-stableino/` | 自己編的 rclone：patch 讓檔案 ID 在重新掛載前後不變（見「踩過的坑」thumbcache 那條），並讓 rclone 自己的 log 也只印 `id=0x…`（`stable_id.go` 的 `fs.StableID` 是兩者共用的定義，`stable_log.go` 改寫 `object` 與訊息本文裡的 bridge URL／VFS 快取路徑）。`build.py` 下載釘住版本的原始碼（`src/`，不進 git）、套 patch（對不上就失敗）、跑 patch 的 Go 測試、`go build -tags cmount` 出 **`rclone.new.exe`**（執行中的 `rclone.exe` 被掛載開著、覆寫不了）：`stop.bat` 之後換名成 `rclone.exe` 再 `start.bat`。升級 rclone 改 `RCLONE_VERSION` 重跑，並跑一輪「現場驗證」確認 `rclone.log` 沒有檔名 |
 | `start.bat` | 啟動 bridge（已在跑就沿用），等 `H:` 掛好。掛載由 bridge 自己做（`[bridge] auto_mount`），磁碟代號只在 `config.ini` 一處 |
-| `stop.bat` | 固定順序：warmshell → `rclone core/quit` → bridge。任一步失敗就停在原地，不碰後面的（半停的系統還能讀完，被殺的不行） |
+| `stop.bat` | 固定順序：bridge → `rclone core/quit` → 殘留 warmshell。**warmshell 不能排第一**：卡在掛載碟讀取（kernel `PageIn`）的 warmshell 殺不掉，要 rclone 退出、讀取失敗才會死，先等它就是死結（11-17 那個卡了 49 小時，rclone 在等 bridge 給不出的位元組）。rclone 永不強殺；還沒交出去的寫入留在 VFS 快取，下次掛載再送 |
 | `restart.bat` | 只重啟 bridge（rclone 與 `H:` 不動），改完 Python 後的收尾 |
 
 `config.ini` 只有 `cache_dir` 一個路徑設定，底下的 `meta/` `rclone/` `local/` `staging/` `uploads/`
@@ -202,7 +214,8 @@ file/part，bridge 一律讀不到**，跨帳號的 split file 只是最明顯�
 
 ### 帳號
 
-`config.ini` 只指定 `primary_user_id` 與 `session_dir`。`session_dir` 必須在 application root 外，
+`config.ini` 只指定 `primary_user_id`；session 目錄不是設定，固定是 `<cache_dir>\sessions`
+（`config.session_dir_for`，舊的 `session_dir` 鍵會被忽略並 warning）。
 其中**直接子檔案** `<positive telegram user id>.session` 就是完整帳號 registry；primary 由
 `primary_user_id` 指定，其餘帳號按數字 ID 排序。沒有 `accounts_file`、label 或 plaintext
 StringSession runtime fallback。
@@ -312,13 +325,22 @@ migration log 記 old/new generation、from/to account、snapshot speed/age、cu
 一個邏輯檔案跑完會在 `bridge.log` 留一行：
 
 ```
-transfer complete protocol=split bytes=629145601 parts=2 hash_ms=812 check_ms=530
-  thumb_ms=0 slot_ms=3 upload_ms=118442 message_ms=402 register_ms=1104
-  total_ms=61230 accounts=(1, 2) rate=4.00 ceiling=None
+transfer complete id=0x10d7044f056484c4 attempt=1 protocol=split size=600.0MiB parts=2
+  total=61.2s hash=0.81s check=0.53s slot=0.00s upload=118.4s message=0.40s register=1.10s
+  accounts=2 limiter_rate=4.00/s
 ```
 
+（實際是一行。）**key=value 與欄位名不變**（grep、測試、AI 讀都靠它），但值帶單位：
+`size=` 是 `600.0MiB`、時間是 `61.2s`，不用自己換算。`thumb=`／`slot=` 為 0 時不印；
+`migrated=N extra_sent=…` 只在發生過帳號搬移時才印（沒搬移時 logical／physical 本來就相等）；
+`speed=` 只在單一 segment 時印（split 的各階段是加總的工作量，除下去會誤導）；
+`ceiling=` 只在限速器學到上限時印；`accounts=` 只印**數量**，不印 Telegram user id。
+`uploading id=… ext=.wav size=56.7MiB protocol=big parts=1` 是開始上傳那一行，
+傳輸中就能看出是什麼檔。同一個檔的 `premium flood` 每 60 秒最多一行，被擋掉的次數併在行尾
+`(+N more in the last Ns)`。
+
 **各階段是「花掉的工作量」而不是 `total_ms` 的切片**：split 的 segment 是並行的，
-所以 `upload_ms` 可以比 wall clock 還大。那個讀法才有用——它說的是這個檔吃掉了
+所以 `upload=` 可以比 wall clock（`total=`）還大。那個讀法才有用——它說的是這個檔吃掉了
 帳號多少額度。這一行印在**註冊之後**，因為一個檔要位元組在 Telegram 上、
 row 在 drive 裡，才算完成；中途失敗印的是 `transfer failed`，錯誤先過 `redact`。
 
@@ -545,6 +567,33 @@ GET /files    0.52s ┘
 | TTL 內重訪 | 0.02 s | 0.02 s（TTL 從 60 秒變 1 小時） |
 
 ## 踩過的坑
+
+- **官方 rclone 每次重新掛載，都會把 `H:` 的 Windows 縮圖快取整個作廢。** 症狀是「暖過的資料夾
+  又是冷的」，看起來像 Windows 自己把縮圖釋放掉，其實不是：`thumbcache_256.db` 裡有 19.6 萬筆、
+  從來沒被清過。原因是 rclone 把 VFS 的記憶體流水號（`vfs.newInode()`）當 `st_ino` 交出去，
+  WinFsp 把它變成檔案的 IndexNumber，而 shell 的 thumbcache 以這個 ID 當 key。流水號每次掛載
+  （以及 `rc vfs/forget`）都重新發，於是每一張暖過的縮圖都對不上，只能留在 db 裡當死重量。
+  實測 2026-11-14（`SIIGBF_INCACHEONLY` 探針，只查不產生）：同一張圖 forget 前 HIT、forget 後
+  ID 140446 → 140747、MISS；`vfs/refresh` 不換 ID，所以 1 小時的 dir cache 到期**不會**觸發。
+  修法是 `tools/rclone-stableino/`：`cmd/cmount/fs.go` 那行（原註解就是
+  `// FIXME do we need to set the inode number?`）改成路徑的 FNV-64 雜湊，再固定
+  `-o VolumeSerialNumber`。測試碟上驗證：暖 → 卸載 → 重新掛載仍 HIT，forget 也 HIT；
+  真的 `H:` 上 `user-9016` forget 前後都是 26/28 HIT。剩下 2 張（2607×3636 的大圖）重暖之後
+  一張變 HIT、一張仍 MISS，ID 不同的話是整個資料夾一起 MISS，所以判斷跟 ID 無關，**未查**。
+  **11-13 22:52 那次重新掛載作廢了之前所有的暖身**，換成這份 rclone 之後要讓 warmup 重新走一輪。
+
+- **bridge 拒絕的 PUT，rclone 會一直重試下去，跑久了就會拖垮整個 `H:`。** VFS writeback
+  沒有重試上限（快取裡那份是唯一副本），4xx 跟 500 一樣算失敗，最長每 5 分鐘再送一次。
+  `uploadstage.path_for` 曾經照抄 `/game` 的「`.` 開頭的名字保留給程式用」規則，所以
+  `._x.jpg`（macOS AppleDouble）、`.DS_Store` 全部回 500：實測 266 個檔重試到 `try #151`、
+  累計 24,104 個錯誤、`rclone.log` 長到 163 MB。同一時間 Explorer 開沒快取過的資料夾要轉很久——
+  rclone 的 goroutine dump（`curl 127.0.0.1:5572/debug/pprof/goroutine?debug=2`）顯示每條
+  `Getattr` 都卡在同一個目錄鎖上，拿著鎖的那條在 `pacer.beginCall` 等發請求的名額，
+  而在等名額的有 5 條、正在用名額的 0 條。**名額漏掉跟這條重試迴圈有關，目前只是從 stack 推出來的，沒有證實。**
+  bridge 自己 PROPFIND 一直是毫秒級，所以「bridge 秒回、`H:` 卡住」先看 rclone 的 stack。
+  修法分兩層：`uploadstage` 不再擋 `.` 開頭的名字（`/game` 仍然擋，那邊有 `.pack`/`.convert`），
+  另外 `rejectedputs.py` 替 rclone 放棄（見檔案表）。被收進 `rejected\` 的檔案不會上傳，
+  只會出現在 log 的 `WARNING rejectedputs`。
 
 - **`cryptg` 不是可選的。** 少了它 Telethon 退回純 Python AES-IGE，解密本身就把下載壓在
   ~0.15 MiB/s，連線開再多都沒用。啟動 log 要看到 `cryptg detected`。
@@ -869,9 +918,16 @@ GET /files    0.52s ┘
 
 ## rclone 掛載參數
 
-`start.bat` 裡已經帶好，重點：
+`mountctl.mount_command` 裡已經帶好，重點：
+
+- **rclone 本身是自己編的那份**（`tools/rclone-stableino/`）。官方版把記憶體流水號當檔案 ID，
+  每次重新掛載就把 Windows 的縮圖快取整個作廢，見「踩過的坑」thumbcache 那條。
+- **rclone.log 也只認檔案 ID**：同一份 patch 讓 `logSlogWithObject` 把 `object` 換成 `id=0x…`、把訊息本文裡的 `http://127.0.0.1:<port>/…` 與 `<cache-dir>fs\…` 路徑換成 ID。盡力而為：別的訊息若用別種形狀帶出路徑會漏；升級 rclone 時跑一輪現場驗證確認。
+- `-o VolumeSerialNumber=9b15860e`：同一個理由，磁碟序號也是檔案身分的一部分，不給的話 WinFsp 每次掛載自己挑。
 
 - `--vfs-cache-mode full` + `--vfs-cache-max-size 160G`：sparse，只存讀到的區段，**容量驅動**淘汰。
+  上限與 `--vfs-cache-min-free-space` 由 `config.ini` 的 `[bridge] vfs_cache_max_size` /
+  `vfs_cache_min_free_space` 決定（`config.rclone_size` 驗證格式）；只在掛載時讀，要 `stop.bat` + `start.bat`。
 - `--vfs-cache-max-age 8760h`：實質停用**時間**淘汰。age 到期就丟等於把還會用的資料重抓一次，
   白費頻寬又吃 SSD TBW。這個使用型態沒有別的資料競爭快取，上次用過的東西數月後很可能還在。
   SSD 壽命非問題：約 0.6 TB/年寫入，512 GB 消費級 NVMe TBW 約 300 TB。
@@ -891,7 +947,8 @@ GET /files    0.52s ┘
 | 端點 | 用途 |
 |---|---|
 | `GET /rpc/health` | 連線狀態、telegram user id |
-| `GET /rpc/status` | `/game` 的 `units`、一般路徑的 `uploads`（stage / attempts / 已用帳號 / 已 redact 的錯誤）、每個帳號的 `accounts`（online / linked / limiter 的 rate / ceiling / window / floods）與 `eligible_upload_ids`。**這裡不會出現任何憑證**，貼進 issue 是安全的 |
+| `GET /rpc/status` | `/game` 的 `units`、一般路徑的 `uploads`（stage / attempts / 已用帳號 / 已 redact 的錯誤）、每個帳號的 `accounts`（online / linked / limiter 的 rate / ceiling / window / floods）與 `eligible_upload_ids`。**這裡不會出現任何憑證，檔案以 `id`（`0x…`）而不是路徑／名稱表示，錯誤文字經過 scrub**，貼進 issue 是安全的 |
+| `GET /rpc/fileinfo` | `id=0x…` → 這個檔是什麼類型、在哪、什麼狀態（見 `fileinfo.py`），不含名字；查不到 404，不打 backend |
 | `POST /rpc/forget` | 清 metadata 快取（rclone 那層另外用 `rclone rc vfs/forget`） |
 | `POST /rpc/fetch-local` | `path=<Windows 路徑>`，串流回進度 |
 | `GET /rpc/thumb` | `path=<Windows 路徑>` → Telegram 預覽圖（JPEG）；沒有就 404 讓 DLL 走 fallback |
@@ -928,8 +985,11 @@ bridge 用 `GET <api>/folders` 向 TeleDrive 驗證 token（成功結果最多�
 | `GET /rpc/game/state?paths=…`（可重複） | 每個 canonical 路徑（`game/…`）的 `status`（`running` / `downloading` / `ready` / `incomplete` / `absent`）、進度位元組、`elapsed_seconds`、`error`、`capabilities` |
 | `POST /rpc/game/fetch` `{path}` | 背景下載（202）；已在下載就回現況。 |
 | `DELETE /rpc/game/fetch?path=…` | 取消下載；沒有進行中的下載回 409 `download_not_active`。 |
-| `GET /rpc/game/exes?path=…` | 已下載遊戲內可選的執行檔（相對路徑）。 |
-| `POST /rpc/game/launch` `{path, exe_relpath, game_id, locale_emulator}` | 啟動並開始計時，回 `session_id`。未下載完成 409 `bridge_game_not_ready`；已在跑 409 `bridge_game_running`。 |
+| `GET /rpc/game/exes?path=…` | 已下載遊戲內可選的執行檔（相對路徑）：`.exe`，以及排在後面的 `.bat`/`.cmd`（MTool 機翻包的「與工具一同啟動.bat」）。 |
+| `POST /rpc/game/launch` `{path, exe_relpath, game_id, locale_emulator}` | 啟動並開始計時，回 `session_id`。未下載完成 409 `bridge_game_not_ready`；已在跑 409 `bridge_game_running`。`.bat`/`.cmd` 以 `cmd.exe /d /c` 執行、cwd 是 bat 所在目錄、不帶任何請求參數，`locale_emulator` 直接忽略（LE 包不了 bat）。 |
+
+| `GET /rpc/game/savedata/detect?path=…[&exe_relpath=…]` | 存檔位置偵測：`engine`、`candidates`（遊戲目錄內給絕對路徑，使用者目錄給 `%APPDATA%\…` 形式）、`bundled`（遊戲包內附帶存檔，相對路徑 `/` 分隔；名稱含 `backup` 的目錄連同子樹排除，例如 MTool 的 `Tool/gameSaveBackup`）。非 `ready` 回 409 `game_not_ready`，`exe_relpath` 越界 400 `invalid_exe_relpath`。 |
+| `POST /rpc/game/savedata/import` `{path, source_relpath, target, game_id}` | 把附帶存檔目錄的**內容**合併複製進 `target`（同名覆蓋、不刪多出的檔）。所有檢查都在寫入前：`invalid_source` / `invalid_target` / `target_not_allowed`（只允許遊戲包內或 `%APPDATA%`、`%LOCALAPPDATA%`、`LocalLow`、`Documents`、`Saved Games` **之下**）/ `paths_overlap` / `target_not_directory` / `conflict`（來源含連結或檔案↔目錄衝突）/ `game_running`。`target` 非空時先備份到 `<cache_dir>\savedata-backups\<game_id>\<時間戳>\`（每個 game 留 20 份），備份失敗 500 `backup_failed` 不匯入。 |
 
 路徑必須是 `<game_folder>/…` 且不含 `.`、`..`。`ready` 的判準是遊戲根目錄下的 `.reina-complete` 標記
 （下載完整成功才寫）；有內容但沒有標記是 `incomplete`，之後重新 fetch 會跳過已存在的檔案續傳。
@@ -941,6 +1001,7 @@ bridge 用 `GET <api>/folders` 向 TeleDrive 驗證 token（成功結果最多�
 |---|---|---|
 | `reina-games.json` | canonical 路徑 → 本機遊戲根目錄的對應（下載完成時寫入，原子替換） | 對應失效或不在 `local/` 之下時，會退回由路徑重新推導；不是快取，別亂刪 |
 | `playtime-running.json` | 執行中會話：`session_id`、`game_id`、裝置、開始時間、根目錄、PID + 建立時間、`last_seen` | 每次變更 fsync + 原子替換 |
+| `savedata-backups/<game_id>/<YYYYMMDD_HHMMSS>/` | 存檔匯入前目標目錄的完整複本 | 每個 `game_id` 只留最近 20 份；還原要手動複製回去 |
 | `playtime-queue.jsonl` | 已結束、待補送的遊玩記錄（每行一筆 `{id, game_id, device, start, end, seconds}`） | 見下 |
 
 會話結束時**先 append 進 queue（fsync）再從 running store 移除**（queue-first），所以任何時刻掛掉都不會丟記錄；
@@ -954,6 +1015,9 @@ bridge 用 `GET <api>/folders` 向 TeleDrive 驗證 token（成功結果最多�
 所以「遊玩時間沒出現」通常是 queue 還在排隊，先看 `bridge.log` 的 `playtime send deferred` / `retained`，
 再數 `playtime-queue.jsonl` 行數。
 
+**bat 啟動的計時不能看子程序。** 拿到的是 `cmd.exe`，`inject.exe` 拉起 `Game.exe`、`start` 開完 MTool 之後幾秒就結束；計時靠的是既有的「遊戲根目錄底下、開始時間之後建立的程序」掃描。但 MTool（`Tool
+w.exe`）在遊戲關掉之後通常還開著，所以 bat session 帶一個持久化的 `ignore` 目錄清單（`<root>\Tool`、`<bat 目錄>\Tool`）：那底下的程序不算數，也不沿著它把子孫帶進來；`recover_sessions()` 套同一條規則。monitor 還沒判定結束之前（兩次空 poll）狀態維持 `running`，不會在 cmd 結束到下一次 poll 之間閃回 `ready`。`.exe` 啟動不受影響（`Tool\` 底下照樣算）。
+
 啟動時 `recover_sessions()` 會逐筆檢查 running store：已在 queue 的直接清掉；程序仍活著
 （PID + 建立時間一致，或根目錄底下、開始時間之後建立的程序）就接回繼續計時；都找不到就用 `last_seen` 結算進 queue。
 
@@ -964,7 +1028,13 @@ bridge 用 `GET <api>/folders` 向 TeleDrive 驗證 token（成功結果最多�
 `/rpc/game/state` 是否有 `downloading`。仍只用 `restart.bat`（不動 rclone）。進行中的下載會在重啟時中斷，
 重啟後該遊戲是 `incomplete`，要在網頁重新按下載。
 
-### 憑證不外洩（redaction）
+### 憑證與檔名都不外洩（redaction）
+
+**檔名與資料夾結構也是隱私**（它們說明這個人存了什麼），而 log 是最常離開這台機器的東西。
+`bridge.log`、`rclone.log`、`/rpc/status` 因此不寫 drive 上的檔名／路徑／Telegram message id，
+一律用 `fileid` 的 `id=0x…`。新的 log／status／例外字串要提到檔案，走 `fileid.tag*()`，
+不允許「為了好讀印檔名」；`tests/test_log_privacy.py` 的全域守門會在新增的 log 把檔名帶回來時失敗。
+`ScrubbingFormatter` 只是防漏網（例外訊息、traceback），它認不出裸檔名，所以不能取代逐處替換。
 
 JWT 與 Telegram session 不得出現在任何日誌、`/rpc/status`、錯誤回應或文件。bridge 只在記憶體使用 JWT；
 token 快取以 SHA-256 為鍵；錯誤訊息一律先 `redact`；`/rpc/game/*` 的 401/403/503 只回固定的 `code`。
@@ -1009,11 +1079,17 @@ token 快取以 SHA-256 為鍵；錯誤訊息一律先 `redact`；`/rpc/game/*` 
 | `tests/test_upload_scheduler.py` | 串流階段（指紋 ≤ 2、check ≤ 8、第三個檔在算指紋時第二個已在上傳、第一個還在註冊）、durable 佇列（失敗只留下受影響的來源、第 5 次 abandoned 且保留、重啟收養每一個暫存檔並沿用 attempts、原子寫入、狀態不含憑證） |
 | `tests/test_transfer_status.py` | 一份 pool 一份 engine 貫穿全程：`/game` 打包後送出的是 `.zip` + `application/zip` + 不進 album、直接丟進 `/game` 的檔案保留自己的型別、`/rpc/status` 列出帳號與 limiter 且不含憑證、只有 primary 回答 bot challenge、停止時每個帳號都停、sweep 的縮圖與屬性按帳號路由 |
 | `tests/test_transfer_logging.py` | 完成日誌帶齊每一個計時欄位且數字讀得出來、去重的那筆報 0 上傳時間、失敗只記一行且 session/JWT 被 redact、兩份 example 設定檔不含任何憑證值 |
+| `tests/test_fileid.py` | ID 的 Go 向量（含全形、結尾空白、NFD）、`tag_dav`／`tag_drive`／`tag_local` 的每一種對應與不認得的路徑、CLI `tag` |
+| `tests/test_log_privacy.py` | `ScrubbingFormatter`（`OSError` 訊息與 `log.exception` traceback、`.venv` 路徑保留、經 console queue 只有一個時間戳、`threading.excepthook`、cheroot）、`/rpc/status` 只有 id 且 `detail` 被 scrub、**全域守門**（標記檔名跑過上傳成功／失敗、`/game` 打包、listing 失敗，log／stderr／status 一次都不能出現）、`chunk timing` 依 mean 排序、`id=?` 不退回 message id、打包完成印 `from=`/`to=` |
+| `tests/test_fileinfo.py` | `lookup` 對一般／`/game` 暫存／已打包 zip／zip 成員／split 的欄位、輸出不含名字／hash／backend id／message id／user id／精確大小、查不到不打 backend、`/rpc/fileinfo` |
 | `tests/test_log_noise.py` | 日誌可讀性：單一 call site 的洪水收成一行並報出壓了幾筆、同一個 logger 的其他診斷不被延遲（這就是不用 `setLevel(WARNING)` 的理由）、direct 的洪水擋不住第一行 indirect |
 | `tests/test_shell_warm.py` | shell warm 的記帳：逐檔 stderr 回報的解析（含非 ASCII 路徑）、被 kill 的批次仍報得出暖成幾個與還卡在哪一個、卡住就停掉這一輪而不是把後面幾十批排在後面、期限按檔數算、沒掛載就不去問 shell |
+| `tests/test_listing_resilience.py` | 後端失敗或逾時：有舊副本（記憶體或 `meta/dirs/`）就在期限內回舊列表、沒有就 `BackendUnavailable`、`fresh` 不吃舊資料也不改磁碟、single-flight、背景 refresh 的節流、stale warning 只記一次 |
+| `tests/test_mount_watch.py` | pacer 卡死的判定（照 rclone 真實 frame 名稱組的 dump；`created by` 行不算、補 token 的計時 goroutine 代表沒卡）、連續 3 次才算、中間恢復歸零、rc 連不上不算證據、`auto_recover_mount` 關閉時絕不碰掛載、開啟時每次事件只試一次 |
 | `tests/test_upload_pace.py` | `tgupload.UploadGate`：distinct-event guard、window/rate 的 AIMD、rate cap 從量測值算出且爬回不再綁得住時拆掉、注入假時鐘 |
 | `tests/test_upload_parts.py` | `plan_parts`、`_PartReader` 的隨機讀取、`send_part` 的 flood/斷線重試（繞過 `client._call`）、`upload_file_parts` 的 segment-relative index、bytes↔offset、永久失敗時取消手足 task |
-| `tests/test_bridge_e2e.py` | 真的用 HTTP 跑整個 bridge（PROPFIND / GET / Range / 403 / MKCOL+PUT → 打包 → 上傳 → 再瀏覽 / `/rpc/*` / fetch-local / warmup sweep 的續跑與禮讓 / split part 的精確大小非灌水 / 一般路徑的 MKCOL、PUT 新檔、覆寫、去重、`/rpc/status` 的 `uploads` 欄位 / DELETE 對暫存內容取消上傳、對已上傳的真實檔案與資料夾呼叫 backend 軟刪除且連同子樹進垃圾桶、ZIP 內部虛擬節點維持 403 / COPY 對已上傳內容一致 403（檔案與資料夾兩種 resource 都不因遞迴列出整棵樹而 500）、對還在暫存的內容（`/game` 與一般路徑）做出真正的本機複製、跨 `/game` 邊界複製一律 403 / 父目錄已在 staging 時的 PUT 與 MKCOL 一次 backend 都不打），只有 MTProto 與 backend 是假的 |
+| `tests/test_savedata.py` | 存檔偵測：七種引擎的判斷順序與候選、Ren'Py `save_directory`／Unity `app.info` 讀取與不安全名稱、`exe_relpath` 決定偵測根且不得越界、附帶存檔的單層包裝展開／名稱含 backup 的目錄連同子樹排除／深度上限／空目錄丟棄／`engine_hint`／剔除與候選相同的目錄；匯入：合併不刪、備份與 20 份上限、環境變數目標、每一種拒絕都不寫任何檔、junction 一律拒絕、備份失敗不匯入；RPC 的 `game_not_ready` / `game_running` / 403 |
+| `tests/test_bridge_e2e.py` | 真的用 HTTP 跑整個 bridge（PROPFIND / GET / Range / 403 / MKCOL+PUT → 打包 → 上傳 → 再瀏覽 / `/rpc/*` / fetch-local / warmup sweep 的續跑與禮讓 / split part 的精確大小非灌水 / 一般路徑的 MKCOL、PUT 新檔、覆寫、去重、`/rpc/status` 的 `uploads` 欄位 / DELETE 對暫存內容取消上傳、對已上傳的真實檔案與資料夾呼叫 backend 軟刪除且連同子樹進垃圾桶、ZIP 內部虛擬節點維持 403 / COPY 對已上傳內容一致 403（檔案與資料夾兩種 resource 都不因遞迴列出整棵樹而 500）、對還在暫存的內容（`/game` 與一般路徑）做出真正的本機複製、跨 `/game` 邊界複製一律 403 / 父目錄已在 staging 時的 PUT 與 MKCOL 一次 backend 都不打 / 後端失敗時列過的資料夾仍 207、沒列過的瀏覽時回空列表並在恢復後叫 rclone `vfs/forget`（COPY 等走訪仍 503，從不 404/500）、單一子項建構失敗或 resolve 不到只少那一項），只有 MTProto 與 backend 是假的 |
 
 掛載後仍需手動走一遍（測試無法代替）：
 

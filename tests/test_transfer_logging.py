@@ -23,11 +23,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import upload_engine  # noqa: E402
 from transfer_models import TransferRequest  # noqa: E402
 
+# thumb/slot are left out when zero and migrated/extra_sent when nothing moved;
+# speed only for a single segment (see _log_complete).
 TIMING_FIELDS = (
-    "protocol=", "bytes=", "parts=", "hash_ms=", "check_ms=", "thumb_ms=",
-    "slot_ms=", "upload_ms=", "message_ms=", "register_ms=", "total_ms=",
-    "accounts=", "logical_uploaded_bytes=", "physical_transferred_bytes=",
-    "migration_overhead_bytes=", "migration_count=", "rate=", "ceiling=",
+    "id=", "attempt=", "protocol=", "size=", "parts=", "total=", "hash=", "check=",
+    "upload=", "message=", "register=", "accounts=", "limiter_rate=", "ceiling=",
 )
 
 
@@ -133,9 +133,12 @@ def test_completion_log_contains_every_web_timing_field(rig, caplog):
     for field in TIMING_FIELDS:
         assert field in line, f"{field} missing from {line}"
     assert "protocol=small" in line
-    assert "bytes=1024" in line and "parts=1" in line
-    assert "accounts=(5,)" in line or "accounts=[5]" in line
-    assert "rate=3.50" in line and "ceiling=8.0" in line
+    assert "size=1.0KiB" in line and "parts=1" in line
+    assert "accounts=1" in line  # a count, never the raw Telegram user id
+    assert "limiter_rate=3.50/s" in line and "ceiling=8/s" in line
+    assert "(5," not in line and "5)" not in line
+    # nothing moved or was zero: those fields are not printed
+    assert "migrated=" not in line and "thumb=" not in line and "slot=" not in line
 
 
 def test_a_reused_duplicate_reports_no_upload_time(rig, caplog):
@@ -151,8 +154,9 @@ def test_a_reused_duplicate_reports_no_upload_time(rig, caplog):
     line = _line(caplog, "transfer complete")
     # The check still cost a round trip; the bytes did not move.
     assert "protocol=duplicate" in line
-    assert "upload_ms=0" in line and "message_ms=0" in line
-    assert "accounts=(42,)" in line
+    assert "upload=0.00s" in line and "message=0.00s" in line
+    assert "speed=" not in line  # no bytes moved, so no speed
+    assert "accounts=1" in line and "42" not in line
 
 
 def test_a_failure_is_logged_once_with_the_error_redacted(rig, caplog):
@@ -173,6 +177,32 @@ def test_a_failure_is_logged_once_with_the_error_redacted(rig, caplog):
     assert "RuntimeError" in caplog.text
 
 
+def test_a_migrated_upload_reports_how_much_was_sent_twice():
+    metrics = upload_engine.TransferMetrics(
+        protocol="big", log_tag="id=0xabc", bytes=100 * 2**20, parts=1, upload_ms=20000.0,
+        logical_uploaded_bytes=100 * 2**20, physical_transferred_bytes=130 * 2**20,
+        migration_count=1, migration_overhead_bytes=30 * 2**20, account_ids=(1, 2),
+    )
+    import logging as _logging
+
+    records = []
+
+    class Grab(_logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = Grab()
+    upload_engine.log.addHandler(handler)
+    upload_engine.log.setLevel(_logging.INFO)
+    try:
+        upload_engine.UploadEngine._log_complete(metrics)
+    finally:
+        upload_engine.log.removeHandler(handler)
+    line = records[0]
+    assert "migrated=1" in line and "extra_sent=30.0MiB" in line
+    assert "accounts=2" in line and "speed=6.5MiB/s" in line  # 130 MiB over 20s
+
+
 def test_timing_fields_are_numbers_a_reader_can_add_up(rig, caplog):
     caplog.set_level(logging.INFO, logger="upload_engine")
 
@@ -182,13 +212,17 @@ def test_timing_fields_are_numbers_a_reader_can_add_up(rig, caplog):
     fields = dict(
         pair.split("=", 1) for pair in line.split() if "=" in pair
     )
-    stages = ("hash_ms", "check_ms", "thumb_ms", "slot_ms", "upload_ms",
-              "message_ms", "register_ms")
-    for name in stages + ("total_ms",):
-        assert float(fields[name]) >= 0.0
+    stages = ("hash", "check", "upload", "message", "register")
+
+    def seconds(name):
+        assert fields[name].endswith("s"), f"{name} has no unit: {fields[name]}"
+        return float(fields[name][:-1])
+
+    for name in stages + ("total",):
+        assert seconds(name) >= 0.0
     # total is the wall clock of the whole thing, so it cannot be less than any
-    # single stage it contains.
-    assert float(fields["total_ms"]) >= max(float(fields[name]) for name in stages)
+    # single stage it contains (up to the 2-decimal rounding of the printout).
+    assert seconds("total") + 0.01 >= max(seconds(name) for name in stages)
 
 
 def test_the_example_configuration_carries_no_credentials():
@@ -212,3 +246,27 @@ def test_the_example_configuration_carries_no_credentials():
         for key, value in parser.items(section):
             if key in secrets:
                 assert value.strip() == "", f"{section}.{key} carries a value"
+
+
+def test_no_speed_is_printed_when_no_bytes_were_measured():
+    # album uploads do not record physical bytes: "speed=0B/s" would be a lie
+    metrics = upload_engine.TransferMetrics(
+        protocol="album", log_tag="id=0xabc", bytes=300_000, parts=1, upload_ms=340.0,
+        physical_transferred_bytes=0,
+    )
+    seen = []
+
+    class Grab(logging.Handler):
+        def emit(self, record):
+            seen.append(record.getMessage())
+
+    handler = Grab()
+    upload_engine.log.addHandler(handler)
+    previous = upload_engine.log.level
+    upload_engine.log.setLevel(logging.INFO)
+    try:
+        upload_engine.UploadEngine._log_complete(metrics)
+    finally:
+        upload_engine.log.removeHandler(handler)
+        upload_engine.log.setLevel(previous)
+    assert "speed=" not in seen[0] and "upload=0.34s" in seen[0]

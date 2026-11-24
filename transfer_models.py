@@ -70,6 +70,10 @@ class TransferRequest:
     parent_id: Optional[str]
     logical_size: int
     allow_album: bool = True
+    #: What the logs call this file: its ``fileid`` tag, never its name.
+    log_tag: str = "id=?"
+    #: Which try this is (1-based), since a retry has the same path and so the same id.
+    attempt: int = 1
 
 
 @dataclass(frozen=True)

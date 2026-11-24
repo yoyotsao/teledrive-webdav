@@ -18,6 +18,7 @@ import zipfile
 from pathlib import Path
 from typing import Callable, Iterator, Optional
 
+import fileid
 from config import ext_path
 from upload_engine import redact
 
@@ -93,6 +94,12 @@ def _extract_one(zf: zipfile.ZipFile, node, dest: Path) -> None:
         except OSError:
             pass  # never let cleanup hide the error that got us here
         raise
+
+
+def _log_tag(resolver, entry) -> str:
+    """Log name of a zip under the game folder: its drive path, as an id."""
+    folder = getattr(getattr(resolver, "cfg", None), "game_folder", "game")
+    return fileid.game_tag(entry.name, folder)
 
 
 def fetch_archive(
@@ -182,7 +189,7 @@ def fetch_archive(
             finally:
                 source.close()
         except Exception as exc:
-            log.exception("download of %s failed", entry.name)
+            log.exception("download of %s failed", _log_tag(resolver, entry))
             yield f"ERROR {entry.name}: {exc}"
             return
         if have + downloaded != total:
@@ -231,7 +238,7 @@ def fetch_archive(
             if not targets:
                 base.mkdir(parents=True, exist_ok=True)
     except Exception as exc:
-        log.exception("extract of %s failed", entry.name)
+        log.exception("extract of %s failed", _log_tag(resolver, entry))
         yield f"ERROR {entry.name}: {exc}"
         return
     extract_ms = int((time.monotonic() - t1) * 1000)

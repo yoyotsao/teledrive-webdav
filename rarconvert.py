@@ -28,7 +28,9 @@ import threading
 from pathlib import Path
 from typing import Callable, Dict, List
 
+import fileid
 from config import ext_path as _ext
+from upload_engine import redact
 
 log = logging.getLogger("rarconvert")
 
@@ -38,6 +40,11 @@ PROGRESS_EVERY = 256 * 1024 * 1024
 
 def _is_rar(name: str) -> bool:
     return name.lower().endswith(".rar")
+
+
+def _gt(name: str) -> str:
+    """Log name of something directly under ``/game``: its drive path, as an id."""
+    return fileid.game_tag(name)
 
 
 def _zip_name(rar_name: str) -> str:
@@ -96,10 +103,10 @@ class RarConverter:
                     state[str(entry.file_id)] = {"name": entry.name}
                     self._save(state)
                     self.stager.touch(entry.name)
-                    log.info("rar convert: %s staged for conversion to %s",
-                             entry.name, _zip_name(entry.name))
+                    log.info("rar convert: from=%s to=%s staged for conversion",
+                             _gt(entry.name), _gt(_zip_name(entry.name)))
             except Exception as exc:  # one bad archive must not stop the rest
-                log.warning("rar convert: download of %s failed: %s", entry.name, exc)
+                log.warning("rar convert: download of %s failed: %s", _gt(entry.name), redact(exc))
 
     def _pending(self, children: Dict, state: Dict) -> List:
         out = []
@@ -119,7 +126,7 @@ class RarConverter:
         for file_id, record in list(state.items()):
             name = record["name"]
             if file_id not in by_id:
-                log.info("rar convert: %s is gone from /game; forgetting it", name)
+                log.info("rar convert: %s is gone from /game; forgetting it", _gt(name))
                 state.pop(file_id)
                 changed = True
                 continue
@@ -131,13 +138,13 @@ class RarConverter:
             try:
                 readable = self._zip_has_files(zip_entry)
             except Exception as exc:
-                log.warning("rar convert: cannot read %s yet: %s", zip_entry.name, exc)
+                log.warning("rar convert: cannot read %s yet: %s", _gt(zip_entry.name), redact(exc))
                 readable = False
             if not readable:
                 continue
             self.api.trash(file_id, game_id)
-            log.info("rar convert: %s replaced by %s; original moved to trash",
-                     name, zip_entry.name)
+            log.info("rar convert: from=%s to=%s original moved to trash",
+                     _gt(name), _gt(zip_entry.name))
             state.pop(file_id)
             changed = True
         if changed:
@@ -157,9 +164,9 @@ class RarConverter:
             done = 0
         if done:
             log.info("rar convert: resuming %s at %.1f of %.1f GiB",
-                     entry.name, done / 2**30, size / 2**30)
+                     _gt(entry.name), done / 2**30, size / 2**30)
         else:
-            log.info("rar convert: downloading %s (%.1f GiB)", entry.name, size / 2**30)
+            log.info("rar convert: downloading %s (%.1f GiB)", _gt(entry.name), size / 2**30)
         reader = self._open_reader(entry)
         try:
             reader.seek(done)
@@ -178,7 +185,7 @@ class RarConverter:
                     done += len(data)
                     if done >= next_note:
                         log.info("rar convert: %s %.1f/%.1f GiB",
-                                 entry.name, done / 2**30, size / 2**30)
+                                 _gt(entry.name), done / 2**30, size / 2**30)
                         next_note += PROGRESS_EVERY
         finally:
             close = getattr(reader, "close", None)
@@ -186,7 +193,7 @@ class RarConverter:
                 close()
         if done != size:
             log.warning("rar convert: %s ended at %s of %s bytes; will retry next pass",
-                        entry.name, done, size)
+                        _gt(entry.name), done, size)
             return False
         os.replace(_ext(part), _ext(Path(self.cfg.staging_dir) / entry.name))
         return True

@@ -36,6 +36,7 @@ import tgio  # noqa: E402
 import tgupload  # noqa: E402
 import upload_engine  # noqa: E402
 from config import Config  # noqa: E402
+from fileid import path_id  # noqa: E402
 from fetchlocal import LocalFetcher  # noqa: E402
 from gamestage import GameStager  # noqa: E402
 from tdapi import TeleDriveClient  # noqa: E402
@@ -985,7 +986,7 @@ def test_the_same_bytes_under_a_second_name_are_uploaded_again(rig):
 def test_upload_status_reports_pending_then_clears(rig):
     rig.request("PUT", "/photos/pending.bin", data=b"waiting")
     status = rig.request("GET", "/rpc/status").json()
-    assert any(p["path"] == "photos/pending.bin" for p in status["uploads"]["pending"])
+    assert any(p["id"] == "0x%016x" % path_id("photos/pending.bin") for p in status["uploads"]["pending"])
 
     _upload_now(rig, "photos", "pending.bin")
 
@@ -1569,14 +1570,25 @@ def test_copy_general_pending_upload_across_game_boundary_is_forbidden(rig):
     assert "escaped.bin" not in rig.names("/game")
 
 
-def test_copy_pending_upload_to_unsafe_destination_segment_is_forbidden(rig):
+def test_copy_pending_upload_to_dot_named_destination_is_a_normal_copy(rig):
+    # Outside /game a leading dot is an ordinary name: uploads/ has no dot-named
+    # work directories to protect (that rule belongs to GameStager only).
     rig.request("PUT", "/photos/pending.bin", data=b"waiting")
 
-    # Destination with a leading-dot segment (.hidden) is unsafe; at root level so parent exists
     resp = rig.request(
         "COPY", "/photos/pending.bin", headers={"Destination": rig.base + "/.hidden"}
     )
-    assert resp.status_code == 403, resp.status_code
+    assert resp.status_code in (201, 204), resp.status_code
+    assert (rig.cfg.upload_dir / ".hidden").read_bytes() == b"waiting"
+
+
+def test_put_dot_named_file_outside_game_is_staged(rig):
+    # macOS AppleDouble files (._x.jpg) used to be refused with a 500, and
+    # rclone's writeback retries a refused PUT forever.
+    resp = rig.request("PUT", "/photos/._x.jpg", data=b"appledouble")
+    assert resp.status_code in (201, 204), resp.status_code
+    assert (rig.cfg.upload_dir / "photos" / "._x.jpg").read_bytes() == b"appledouble"
+    assert "._x.jpg" in rig.names("/photos")
 
 
 # --------------------------------------------------------------------------- #
@@ -1625,7 +1637,7 @@ def test_status_lists_staging_units(rig):
     rig.request("MKCOL", "/game/Watch")
     rig.request("PUT", "/game/Watch/a.bin", data=b"x")
     data = rig.request("GET", "/rpc/status").json()
-    assert [u["name"] for u in data["units"]] == ["Watch"]
+    assert [u["id"] for u in data["units"]] == ["0x%016x" % path_id("game/Watch")]
     assert data["units"][0]["state"] == "staging"
 
 
@@ -2224,3 +2236,126 @@ def test_a_failed_put_inside_game_removes_its_partial_file(rig):
     assert not (rig.cfg.staging_dir / "Torn" / "a.bin").exists()
     out.close()
 
+
+
+# --------------------------------------------------------------------------- #
+# Explorer-freeze resilience (docs/superpowers/specs/2026-11-14-...): a failing
+# backend or one bad child must never turn a listing into a 500 or a 404.
+# rclone retries 500 and 503 alike, but caches 404 as "folder deleted".
+# --------------------------------------------------------------------------- #
+
+
+def _break_listings(rig, monkeypatch):
+    import tdapi
+
+    real = rig.backend.call
+
+    def call(method, path, params, payload):
+        if method == "GET" and path in ("/folders", "/files"):
+            raise tdapi.ApiError(530, "origin unreachable")
+        return real(method, path, params, payload)
+
+    monkeypatch.setattr(rig.backend, "call", call)
+
+
+def test_listed_folder_still_answers_when_the_backend_fails(rig, monkeypatch):
+    assert rig.names("/photos") == ["shot.png", "small.txt"]
+    _break_listings(rig, monkeypatch)
+    resp = rig.propfind("/photos")
+    assert resp.status_code == 207
+    assert rig.names("/photos") == ["shot.png", "small.txt"]
+
+
+def test_never_listed_folder_is_503_not_404_when_the_backend_fails(rig, monkeypatch):
+    _break_listings(rig, monkeypatch)
+    started = time.monotonic()
+    assert rig.propfind("/photos").status_code == 503
+    assert rig.request("GET", "/photos/small.txt").status_code == 503
+    assert time.monotonic() - started < 5
+
+
+def test_one_child_that_cannot_be_built_leaves_the_rest_of_the_listing(rig, monkeypatch):
+    real = rig.resolver.resolve
+
+    def resolve(segments):
+        if segments and segments[-1] == "shot.png":
+            raise RuntimeError("simulated broken row")
+        return real(segments)
+
+    monkeypatch.setattr(rig.resolver, "resolve", resolve)
+    assert rig.propfind("/photos").status_code == 207
+    assert rig.names("/photos") == ["small.txt"]
+
+
+def test_child_that_resolves_to_nothing_is_left_out_not_a_500(rig, monkeypatch):
+    real = rig.resolver.resolve
+
+    def resolve(segments):
+        if segments and segments[-1] == "shot.png":
+            return bridge.Loc(bridge.MISSING)
+        return real(segments)
+
+    monkeypatch.setattr(rig.resolver, "resolve", resolve)
+    assert rig.propfind("/photos").status_code == 207
+    assert rig.names("/photos") == ["small.txt"]
+
+
+def test_never_listed_folder_lists_empty_then_is_forgotten_in_rclone_on_recovery(rig, monkeypatch):
+    """A 503 is fast here but not in rclone: its shared pacer climbs to 2s
+    between 10 retries and Windows retries the readdir 3 times -- 60-70s of
+    spinning, measured 2026-11-15, with every other request on H: slowed too.
+    An empty placeholder answers at once; recovery tells rclone to re-list."""
+    forgotten = []
+    rig.resolver.placeholders.forget = forgotten.append
+    rig.resolver.placeholders.interval = 0.05
+    assert rig.propfind("/").status_code == 207  # root known, /photos never listed
+    _break_listings(rig, monkeypatch)
+    resp = rig.propfind("/photos")
+    assert resp.status_code == 207
+    assert rig.names("/photos") == []
+    assert rig.resolver.placeholders.pending() == ["photos"]
+    monkeypatch.undo()  # the backend answers again
+    deadline = time.monotonic() + 3
+    while not forgotten and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert forgotten == ["photos"]
+    assert rig.resolver.placeholders.pending() == []
+    assert rig.names("/photos") == ["shot.png", "small.txt"]
+
+
+def test_placeholder_is_for_browsing_only_not_for_a_subtree_walk(rig, monkeypatch):
+    """An empty answer must never feed a destructive decision."""
+    assert rig.propfind("/").status_code == 207
+    _break_listings(rig, monkeypatch)
+    assert rig.request("COPY", "/photos", headers={"Destination": "/photos2"}).status_code in (403, 503)
+    assert rig.resolver.placeholders.pending() == []
+
+
+def test_game_listing_is_empty_not_500_when_the_backend_fails_with_no_copy(rig, monkeypatch):
+    rig.resolver.placeholders.forget = lambda path: None
+    _break_listings(rig, monkeypatch)
+    assert rig.propfind("/game").status_code == 207
+
+
+def test_placeholders_survive_a_bridge_restart(rig, monkeypatch):
+    """Restarting mid-outage used to drop the list, leaving the folder empty on
+    H: for rclone's whole --dir-cache-time (an hour)."""
+    rig.resolver.placeholders.forget = lambda path: None
+    rig.resolver.placeholders.interval = 3600  # this instance never gets to it
+    assert rig.propfind("/").status_code == 207
+    _break_listings(rig, monkeypatch)
+    assert rig.names("/photos") == []
+    monkeypatch.undo()
+
+    forgotten = []
+    reborn = bridge.PlaceholderListings(
+        forget=forgotten.append, interval=0.05,
+        store=rig.cfg.cache_dir / "placeholders.json", probe=rig.resolver.probe_listing,
+    )
+    assert reborn.pending() == ["photos"]
+    reborn.resume()
+    deadline = time.monotonic() + 3
+    while not forgotten and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert forgotten == ["photos"]
+    assert bridge.PlaceholderListings(store=rig.cfg.cache_dir / "placeholders.json").pending() == []

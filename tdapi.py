@@ -40,6 +40,17 @@ log = logging.getLogger("tdapi")
 PAGE_SIZE = 10000
 TIMEOUT = 60
 
+# Listings sit on Explorer's critical path: rclone holds the folder's lock while
+# it waits for us, so every second spent here is a second the whole drive (and,
+# through the shared explorer.exe, every Explorer window) is frozen. These bound
+# that wait; on expiry the last known listing answers instead (see list_dir).
+LIST_DEADLINE = 8.0
+LIST_CONNECT_TIMEOUT = LIST_DEADLINE  # TLS handshakes count here, and ran past 5s on 2026-11-14
+# After a folder's listing failed, answer it from the stale copy without waiting
+# for this long, then retry in the background on the next request.
+STALE_RETRY_SECONDS = 30.0
+LIST_WORKERS = 8
+
 # Bumped whenever the shape stored in meta/dirs/ changes, so an old file is
 # re-listed instead of being read as if it meant the same thing.
 DIR_CACHE_VERSION = 2
@@ -53,6 +64,20 @@ class ApiError(RuntimeError):
     def __init__(self, status: int, message: str):
         super().__init__(f"HTTP {status}: {message}")
         self.status = status
+
+
+def _unreachable(exc: BaseException) -> bool:
+    """The backend as a whole could not answer, not one folder refused."""
+    if isinstance(exc, (concurrent.futures.TimeoutError, TimeoutError, requests.RequestException)):
+        return True
+    return isinstance(exc, ApiError) and exc.status >= 500
+
+
+class BackendUnavailable(ApiError):
+    """A listing the backend could not answer in time, with no earlier copy to fall back on."""
+
+    def __init__(self, message: str):
+        super().__init__(503, message)
 
 
 @dataclass(frozen=True)
@@ -359,6 +384,23 @@ class TeleDriveClient:
         self._auth_lock = threading.Lock()
         self._dir_cache: Dict[Optional[str], Tuple[float, List[Entry]]] = {}
         self._dir_lock = threading.Lock()
+        # Listing fetches: one in flight per folder, on reused threads so each
+        # keeps its keep-alive session (a new thread is a new TLS handshake).
+        self._list_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=LIST_WORKERS, thread_name_prefix="listing")
+        # The /files half of each listing. A separate pool (a task waiting on its
+        # own pool can deadlock it), persistent for the same reason as above:
+        # a throwaway thread per listing paid a fresh TLS handshake every time,
+        # and on 2026-11-14 those alone ran past the connect timeout.
+        self._files_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=LIST_WORKERS, thread_name_prefix="listing-files")
+        self._list_inflight: Dict[Optional[str], concurrent.futures.Future] = {}
+        self._list_failed_at: Dict[Optional[str], float] = {}
+        # When any listing last failed because the backend could not be reached.
+        # A path is resolved one level at a time, so without this every level
+        # waited out its own deadline: 3 levels, 24s (2026-11-15, real H:).
+        self._backend_down_at: Optional[float] = None
+        self._list_stale: set = set()
         cfg.cache_dir.mkdir(parents=True, exist_ok=True)
         self._split_cache = JsonStore(cfg.cache_dir / "split_parts.json")
         self._token_path = cfg.cache_dir / "token.txt"
@@ -458,7 +500,7 @@ class TeleDriveClient:
             log.info("obtained JWT from %s via @%s", self.cfg.base_url, bot)
             return token
 
-    def _call(self, method: str, path: str, *, params=None, payload=None,
+    def _call(self, method: str, path: str, *, params=None, payload=None, timeout=None,
               _auth_retry=True, _conn_retry=True):
         token = self._token or self.login()
         url = f"{self.cfg.api_base}{path}"
@@ -469,7 +511,7 @@ class TeleDriveClient:
                 params=params,
                 json=payload,
                 headers={"Authorization": f"Bearer {token}"},
-                timeout=TIMEOUT,
+                timeout=timeout or TIMEOUT,
             )
         except requests.exceptions.ConnectionError:
             # A pooled keep-alive socket the backend had already closed. uvicorn
@@ -489,13 +531,13 @@ class TeleDriveClient:
             log.info("backend connection dropped on %s %s — retrying once", method, path)
             # Only the connection budget is spent: a fresh socket that then comes
             # back 401 still deserves its one re-login.
-            return self._call(method, path, params=params, payload=payload,
+            return self._call(method, path, params=params, payload=payload, timeout=timeout,
                               _auth_retry=_auth_retry, _conn_retry=False)
         if resp.status_code == 401 and _auth_retry:
             # Expired or backend-restarted JWT: log in once more, then retry.
             log.info("JWT rejected — re-authenticating")
             self.login(force=True)
-            return self._call(method, path, params=params, payload=payload,
+            return self._call(method, path, params=params, payload=payload, timeout=timeout,
                               _auth_retry=False, _conn_retry=_conn_retry)
         if resp.status_code >= 400:
             raise ApiError(resp.status_code, resp.text[:300])
@@ -505,11 +547,12 @@ class TeleDriveClient:
 
     # -- listings --------------------------------------------------------- #
 
-    def _list_paginated(self, path: str, params: dict) -> List[dict]:
+    def _list_paginated(self, path: str, params: dict, timeout=None) -> List[dict]:
         rows: List[dict] = []
         page = 1
         while True:
-            data = self._call("GET", path, params={**params, "page": page, "page_size": PAGE_SIZE})
+            data = self._call("GET", path, params={**params, "page": page, "page_size": PAGE_SIZE},
+                              timeout=timeout)
             batch = data.get("files") or []
             rows.extend(batch)
             total = int(data.get("total") or 0)
@@ -538,30 +581,131 @@ class TeleDriveClient:
         question and go stale at the same rate, so a second TTL would be a
         distinction without a difference. Web-UI changes still need
         ``/rpc/forget`` (and ``rclone rc vfs/forget``) exactly as before.
-        """
-        now = time.monotonic()
-        stamped = time.time()
-        if not fresh:
-            with self._dir_lock:
-                hit = self._dir_cache.get(parent_id)
-            if hit and now - hit[0] < self.cfg.dir_cache_seconds:
-                return hit[1]
-            rows = self._dir_from_disk(parent_id, stamped)
-            if rows is not None:
-                entries = [_to_entry(r) for r in rows]
-                with self._dir_lock:
-                    self._dir_cache[parent_id] = (now, entries)
-                return entries
 
+        When the backend fails or misses ``list_deadline_seconds``, the last known
+        listing answers instead — expired memory copy first, then ``meta/dirs/``
+        at any age — because waiting is not neutral here: rclone holds the folder
+        lock for as long as this takes, and every Explorer window queues behind
+        it. Measured 2026-11-14: one stalled ``/files`` froze ``H:\\pixiv`` for
+        over 80s while the bridge answered other paths in 10ms. With no earlier
+        copy at all, ``BackendUnavailable`` (503) is raised promptly.
+
+        ``fresh`` (the warm-up sweep) never takes a stale answer: its job is to
+        notice change, so it fails honestly and the walk skips that subtree.
+        """
+        deadline = self._list_deadline()
+        if fresh:
+            return self._fetch_listing(parent_id).result(timeout=deadline)
+
+        now = time.monotonic()
+        with self._dir_lock:
+            hit = self._dir_cache.get(parent_id)
+        if hit and now - hit[0] < self.cfg.dir_cache_seconds:
+            return hit[1]
+        rows = self._dir_from_disk(parent_id, time.time())
+        if rows is not None:
+            entries = [_to_entry(r) for r in rows]
+            with self._dir_lock:
+                self._dir_cache[parent_id] = (now, entries)
+            return entries
+
+        stale = hit[1] if hit else None
+        if stale is None:
+            old = self._dir_from_disk(parent_id, time.time(), any_age=True)
+            stale = [_to_entry(r) for r in old] if old is not None else None
+        with self._dir_lock:
+            failed_at = self._list_failed_at.get(parent_id)
+            down_at = self._backend_down_at
+        recently_failed = failed_at is not None and now - failed_at < STALE_RETRY_SECONDS
+        backend_down = down_at is not None and now - down_at < STALE_RETRY_SECONDS
+        if recently_failed:
+            # Don't make anyone wait on a backend that just failed this folder.
+            if stale is None:
+                raise BackendUnavailable(f"listing of {parent_id} failed moments ago")
+            return stale
+        future = self._fetch_listing(parent_id)
+        if (failed_at is not None or backend_down) and stale is not None:
+            # Still failing as far as we know: refresh behind the stale answer.
+            if backend_down:
+                self._note_stale(parent_id, "backend unreachable moments ago")
+            return stale
+        if backend_down:
+            # Another folder just timed out against this backend; asking again
+            # in the foreground would only make this level wait out its own deadline.
+            raise BackendUnavailable(f"listing of {parent_id}: backend unreachable moments ago")
+        try:
+            return future.result(timeout=deadline)
+        except Exception as exc:
+            with self._dir_lock:
+                self._list_failed_at[parent_id] = time.monotonic()
+                if _unreachable(exc):
+                    self._backend_down_at = time.monotonic()
+            reason = "timed out" if isinstance(exc, concurrent.futures.TimeoutError) else exc
+            if stale is None:
+                raise BackendUnavailable(f"listing of {parent_id}: {reason}") from None
+            self._note_stale(parent_id, reason)
+            return stale
+
+    def _list_deadline(self) -> float:
+        return float(getattr(self.cfg, "list_deadline_seconds", LIST_DEADLINE))
+
+    def _fetch_listing(self, parent_id: Optional[str]) -> concurrent.futures.Future:
+        """One backend listing per folder in flight; later callers share it.
+
+        Runs on the listing pool, so a caller that gives up at the deadline does
+        not cancel it: a late answer still lands in both caches and serves the
+        next request.
+        """
+        with self._dir_lock:
+            future = self._list_inflight.get(parent_id)
+            if future is not None:
+                return future
+            future = self._list_pool.submit(self._list_into_cache, parent_id)
+            self._list_inflight[parent_id] = future
+
+        def done(fut, parent_id=parent_id):
+            with self._dir_lock:
+                if self._list_inflight.get(parent_id) is fut:
+                    del self._list_inflight[parent_id]
+                exc = fut.exception()
+                if exc is not None:
+                    self._list_failed_at[parent_id] = time.monotonic()
+                    if _unreachable(exc):
+                        self._backend_down_at = time.monotonic()
+                    return
+                self._list_failed_at.pop(parent_id, None)
+                self._backend_down_at = None
+                recovered = parent_id in self._list_stale
+                self._list_stale.discard(parent_id)
+            if recovered:
+                log.info("listing of %s answers again; stale copy retired", parent_id)
+
+        future.add_done_callback(done)
+        return future
+
+    def _list_into_cache(self, parent_id: Optional[str]) -> List[Entry]:
         params = {} if parent_id is None else {"parent_id": parent_id}
-        folders, files = self._list_both(params)
+        stamped = time.time()
+        folders, files = self._list_both(params, timeout=(LIST_CONNECT_TIMEOUT, self._list_deadline()))
         entries = [_to_entry(r) for r in folders] + [_to_entry(r) for r in files]
         with self._dir_lock:
-            self._dir_cache[parent_id] = (now, entries)
+            self._dir_cache[parent_id] = (time.monotonic(), entries)
         self._dir_to_disk(parent_id, folders + files, stamped)
         return entries
 
-    def _list_both(self, params: dict) -> Tuple[List[dict], List[dict]]:
+    def _note_stale(self, parent_id: Optional[str], reason) -> None:
+        with self._dir_lock:
+            first = parent_id not in self._list_stale
+            self._list_stale.add(parent_id)
+        if first:
+            log.warning("listing of %s failed (%s); answering from the last known copy", parent_id, reason)
+
+    def stale_listing_count(self) -> int:
+        """Folders currently answered from a stale copy because the backend failed them."""
+        with self._dir_lock:
+            return len(self._list_stale)
+
+    def _list_both(self, params: dict, timeout=None) -> Tuple[List[dict], List[dict]]:
         """``/folders`` and ``/files`` at the same time rather than one after the other.
 
         They are independent GETs against a backend that answers in about half a
@@ -570,14 +714,18 @@ class TeleDriveClient:
         (2 items and 84 items cost the same), which is how you can tell it is
         round trips and not volume.
 
-        One extra thread per listing rather than a pool: a pool sized for this
-        would serialise the wsgidav worker threads against each other, and a
-        thread costs microseconds against a half-second call.
+        ``/files`` goes to a persistent pool so its thread — and that thread's
+        keep-alive session — is reused. It used to be one throwaway thread per
+        listing, which made every listing a new TLS handshake (0.4-2.7s, and
+        past 5s on a bad night). Callers are already the listing pool, bounded
+        by LIST_WORKERS, so this pool cannot queue behind itself.
         """
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            pending = pool.submit(self._list_paginated, "/files", params)
-            folders = self._list_paginated("/folders", params)
-            return folders, pending.result()
+        pending = self._files_pool.submit(self._list_paginated, "/files", params, timeout)
+        try:
+            folders = self._list_paginated("/folders", params, timeout)
+        finally:
+            files = pending.result()  # wait either way: never leave it running unowned
+        return folders, files
 
     # -- the listing cache on disk ---------------------------------------- #
 
@@ -587,7 +735,8 @@ class TeleDriveClient:
             key = hashlib.sha1(key.encode("utf-8")).hexdigest()
         return self.cfg.cache_dir / "dirs" / f"{key}.json"
 
-    def _dir_from_disk(self, parent_id: Optional[str], stamped: float) -> Optional[List[dict]]:
+    def _dir_from_disk(self, parent_id: Optional[str], stamped: float, *,
+                       any_age: bool = False) -> Optional[List[dict]]:
         """The rows for one folder off disk, or None if missing, old or foreign.
 
         One file per folder, like ``thumbs/``, not one shared JSON: a listing is
@@ -606,7 +755,7 @@ class TeleDriveClient:
             age = stamped - float(blob.get("at") or 0)
         except (TypeError, ValueError):
             return None
-        if age < 0 or age > self.cfg.dir_cache_seconds:
+        if not any_age and (age < 0 or age > self.cfg.dir_cache_seconds):
             return None
         rows = blob.get("rows")
         return rows if isinstance(rows, list) else None
@@ -634,10 +783,10 @@ class TeleDriveClient:
             if prev is None:
                 out[entry.name] = entry
             elif entry.mtime > prev.mtime:
-                log.warning("duplicate name %r under %s — using the newer row %s", entry.name, parent_id, entry.file_id)
+                log.warning("duplicate name under %s — using the newer row %s", parent_id, entry.file_id)
                 out[entry.name] = entry
             else:
-                log.warning("duplicate name %r under %s — ignoring older row %s", entry.name, parent_id, entry.file_id)
+                log.warning("duplicate name under %s — ignoring older row %s", parent_id, entry.file_id)
         return out
 
     def resolve(
@@ -712,7 +861,7 @@ class TeleDriveClient:
             return []
         if not (entry.is_split and entry.split_group_id):
             if entry.message_id is None:
-                raise ApiError(404, f"{entry.name} has no Telegram message")
+                raise ApiError(404, "entry has no Telegram message")
             return _clip_remote_parts(
                 [RemotePart(int(entry.message_id), entry.size, entry.telegram_user_id, entry.file_id)],
                 entry.real_size,
@@ -789,7 +938,10 @@ class TeleDriveClient:
         return self._call("GET", "/files/check-hash", params={"hash": file_hash})
 
     def linked_account_ids(self) -> set[int]:
-        body = self._call("GET", "/accounts")
+        # Asked at startup, before the DAV server listens: the default 60s (twice,
+        # with the connection retry) outlasted restart.bat's wait when the
+        # backend was unreachable. The caller survives a failure here.
+        body = self._call("GET", "/accounts", timeout=(LIST_CONNECT_TIMEOUT, LIST_DEADLINE))
         return {int(row["telegram_user_id"]) for row in body.get("accounts", [])}
 
     def create_folder(self, name: str, parent_id: Optional[str] = None) -> Entry:

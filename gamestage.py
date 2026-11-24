@@ -25,6 +25,7 @@ import hashlib
 import logging
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import threading
@@ -34,10 +35,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
+import fileid
 from config import ext_path as _ext
+from logscrub import scrub_text
 from tgio import make_preview
 from transfer_models import TransferRequest
-from upload_engine import guess_mime_type
+from upload_engine import describe_upload, guess_mime_type
 
 log = logging.getLogger("gamestage")
 
@@ -69,6 +72,23 @@ class ArchiveExtractError(RuntimeError):
     """7-Zip could not extract an archive staged for conversion."""
 
 
+def _rmtree_force(path: Path) -> None:
+    """Remove a tree whose files may be read-only.
+
+    7-Zip restores the read-only attribute stored in a RAR, and on Windows
+    ``rmtree(ignore_errors=True)`` then fails on every file *silently*, which
+    left each converted ``<stem>.extract`` behind in ``.pack``.
+    """
+    def _writable_retry(func, target, _exc):
+        try:
+            os.chmod(target, stat.S_IWRITE)
+            func(target)
+        except OSError:
+            log.warning("could not remove a leftover file")
+
+    shutil.rmtree(_ext(path), onerror=_writable_retry)
+
+
 def extract_archive(archive: Path, dest: Path, seven_zip: str) -> None:
     """Extract ``archive`` into ``dest`` with 7-Zip, or raise ArchiveExtractError.
 
@@ -87,8 +107,8 @@ def extract_archive(archive: Path, dest: Path, seven_zip: str) -> None:
         errors="replace",
     )
     if proc.returncode != 0:
-        detail = " ".join((proc.stderr or proc.stdout or "").split())[:300]
-        raise ArchiveExtractError(f"7-Zip exited with {proc.returncode}: {detail}")
+        # 7-Zip's own text names archive members, so it is not repeated here.
+        raise ArchiveExtractError(f"7-Zip exited with {proc.returncode}")
 
 
 def sample_hash(path: Path) -> str:
@@ -104,6 +124,12 @@ def sample_hash(path: Path) -> str:
             remaining -= len(chunk)
             digest.update(chunk)
     return f"{digest.hexdigest()}:{size}"
+
+
+
+def _gtag(name: str) -> str:
+    """Log name of something directly under ``/game``: its drive path, as an id."""
+    return fileid.game_tag(name)
 
 
 @dataclass
@@ -131,6 +157,10 @@ class GameStager:
         self._thread: Optional[threading.Thread] = None
         self.cfg.staging_dir.mkdir(parents=True, exist_ok=True)
         self.cfg.pack_dir.mkdir(parents=True, exist_ok=True)
+        # An extraction is never resumable (_convert wipes it first), so any
+        # left by a crash or by the read-only bug is dead weight.
+        for stale in self.cfg.pack_dir.glob("*.extract"):
+            _rmtree_force(stale)
         self._adopt_leftovers()
 
     # -- staging paths ---------------------------------------------------- #
@@ -216,7 +246,7 @@ class GameStager:
             if unit is None:
                 unit = Unit(name=top)
                 self._units[top] = unit
-                log.info("staging started: %s", top)
+                log.info("staging started: %s", _gtag(top))
             unit.last_write = time.monotonic()
             if unit.state in ("done", "failed"):
                 unit.state = "staging"
@@ -268,7 +298,7 @@ class GameStager:
                     newest = now
             idle = max(0.0, now - newest)
             self._units[name] = Unit(name=name, last_write=time.monotonic() - idle)
-            log.info("adopted leftover staging unit %s (idle %.0fs)", name, idle)
+            log.info("adopted leftover staging unit %s (idle %.0fs)", _gtag(name), idle)
 
     # -- background loop -------------------------------------------------- #
 
@@ -286,12 +316,14 @@ class GameStager:
         with self._lock:
             units = [
                 {
-                    "name": u.name,
+                    "id": fileid.hex_id("game/" + u.name),
                     "state": u.state,
                     "idle_seconds": round(now - u.last_write, 1),
                     "attempts": u.attempts,
                     "writers": u.writers,
-                    "detail": u.detail,
+                    "detail": scrub_text(
+                        u.detail, self.cfg.cache_dir.parent,
+                        getattr(self.cfg, "mount_drive", "H:")),
                 }
                 for u in self._units.values()
             ]
@@ -336,12 +368,17 @@ class GameStager:
         source = self.cfg.staging_dir / top
         packed: Optional[Path] = None
         try:
-            log.info("packing %s", top)
+            log.info("packing %s", _gtag(top))
             packed, upload_name, temporary, archived = self._pack(top, source)
             self._set_state(top, "uploading")
-            self._upload_and_register(packed, upload_name, archived=archived)
+            with self._lock:
+                prior = self._units.get(top)
+                attempt = (prior.attempts if prior else 0) + 1
+            self._upload_and_register(packed, upload_name, archived=archived, attempt=attempt)
             self._set_state(top, "done")
-            log.info("uploaded %s — clearing staging", upload_name)
+            # The name changes here (folder -> .zip, .rar -> .zip) and so does
+            # the id; this is the one line that ties the two together.
+            log.info("uploaded from=%s to=%s — clearing staging", _gtag(top), _gtag(upload_name))
             # rmtree on a *file* fails silently under ignore_errors, which left
             # every top-level file in staging to be adopted and re-uploaded on
             # the next tick.
@@ -354,14 +391,14 @@ class GameStager:
             with self._lock:
                 self._units.pop(top, None)
         except Exception as exc:
-            log.exception("packing/upload of %s failed", top)
+            log.exception("packing/upload of %s failed", _gtag(top))
             with self._lock:
                 unit = self._units.get(top) or Unit(name=top)
                 unit.attempts += 1
                 unit.detail = f"{type(exc).__name__}: {exc}"
                 if unit.attempts >= MAX_ATTEMPTS:
                     unit.state = "abandoned"
-                    log.error("giving up on %s after %s attempts — staging kept", top, unit.attempts)
+                    log.error("giving up on %s after %s attempts — staging kept", _gtag(top), unit.attempts)
                 else:
                     unit.state = "failed"
                     unit.retry_after = time.monotonic() + RETRY_SECONDS
@@ -409,7 +446,7 @@ class GameStager:
             # failed transiently (_process keeps the zip in that case,
             # see the exception handler there) — reuse it instead of
             # re-zipping a potentially 60 GB tree.
-            log.info("reusing existing pack %s from a previous attempt", target.name)
+            log.info("reusing existing pack %s from a previous attempt", _gtag(target.name))
             return True
         target.unlink()
         return False
@@ -421,17 +458,17 @@ class GameStager:
         if self._reusable(target):
             return target, f"{stem}.zip", True, True
         extracted = self.cfg.pack_dir / f"{stem}.extract"
-        shutil.rmtree(_ext(extracted), ignore_errors=True)
+        _rmtree_force(extracted)
         extracted.mkdir(parents=True)
         try:
-            log.info("extracting %s with 7-Zip", source.name)
+            log.info("extracting %s with 7-Zip", _gtag(source.name))
             extract_archive(source, extracted, self.cfg.seven_zip)
             self._write_zip(extracted, target)
         except BaseException:
             target.unlink(missing_ok=True)
             raise
         finally:
-            shutil.rmtree(_ext(extracted), ignore_errors=True)
+            _rmtree_force(extracted)
         return target, f"{stem}.zip", True, True
 
     def _write_zip(self, source: Path, target: Path) -> None:
@@ -454,11 +491,12 @@ class GameStager:
                         count += 1
                     except OSError as exc:
                         raise OSError(f"cannot read {full}: {exc}") from exc
-        log.info("packed %s files into %s (%.1f GiB)", count, target.name, target.stat().st_size / 2**30)
+        log.info("packed %s files into %s (%.1f GiB)", count, _gtag(target.name), target.stat().st_size / 2**30)
 
     # -- uploading -------------------------------------------------------- #
 
-    def _upload_and_register(self, archive: Path, upload_name: str, *, archived: bool) -> None:
+    def _upload_and_register(self, archive: Path, upload_name: str, *, archived: bool,
+                             attempt: int = 1) -> None:
         """Hand the finished archive to the one engine every write shares.
 
         Dedup, protocol choice, account routing and registration all live
@@ -475,7 +513,9 @@ class GameStager:
             parent_id=game.file_id,
             logical_size=archive.stat().st_size,
             allow_album=not archived,
+            log_tag=_gtag(upload_name), attempt=attempt,
         )
+        log.info("uploading %s %s", request.log_tag, describe_upload(request))
         self.engine.register_result(self.engine.transfer(request))
 
 
@@ -502,7 +542,7 @@ def _preview_file(image: Optional[Path], mime_type: str = "", ffmpeg: Optional[s
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
-        log.info("preview for %s: %sx%s, %s bytes", image.name, width, height, len(data))
+        log.debug("preview %sx%s, %s bytes", width, height, len(data))
         yield Path(name), width, height
     finally:
         try:

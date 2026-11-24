@@ -37,10 +37,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import fileid
 from config import ext_path as _ext
+from logscrub import scrub_text
 from gamestage import MAX_ATTEMPTS, RETRY_SECONDS, TICK_SECONDS, WRITER_STALE_SECONDS
 from transfer_models import QueueStage, TransferRequest
-from upload_engine import guess_mime_type, redact
+from upload_engine import describe_upload, guess_mime_type, redact
 
 log = logging.getLogger("uploadstage")
 
@@ -50,6 +52,12 @@ STATE_VERSION = 1
 #: Stages a file can sit in between debounce windows. Anything else is a
 #: transient in-flight stage that a restart re-derives from the source itself.
 _RESTING = (QueueStage.STAGING, QueueStage.FAILED, QueueStage.ABANDONED)
+
+
+def _tag(key: Sequence[str]) -> str:
+    """The log name of a staged upload: its drive path, as an id."""
+    return fileid.tag("/".join(key))
+
 
 
 @dataclass
@@ -93,9 +101,17 @@ class UploadStager:
     # -- staging paths ------------------------------------------------- #
 
     def path_for(self, segments: Sequence[str]) -> Optional[Path]:
-        """Local staging path for a full destination path, or None if unsafe."""
+        """Local staging path for a full destination path, or None if unsafe.
+
+        Unlike ``GameStager.path_for`` a leading dot is a normal name here:
+        /game reserves dot names for its own work directories (``.pack``,
+        ``.convert``) inside ``staging/``, but ``uploads/`` has none. Copying that
+        rule over refused every ``._foo.jpg`` / ``.DS_Store`` written to H:, and
+        rclone's writeback retries a refused PUT forever (try #151 on 266 files
+        when found), which is what the ``rejectedputs`` middleware now also caps.
+        """
         segments = list(segments)
-        if not segments or any(s in ("", ".", "..") or "/" in s or "\\" in s or s.startswith(".") for s in segments):
+        if not segments or any(s in ("", ".", "..") or "/" in s or "\\" in s for s in segments):
             return None
         path = self.cfg.upload_dir.joinpath(*segments)
         try:
@@ -155,7 +171,7 @@ class UploadStager:
             if pending is None:
                 pending = PendingUpload(segments=key, parent_id=parent_id)
                 self._pending[key] = pending
-                log.info("upload staged: %s", "/".join(key))
+                log.info("upload staged: %s", _tag(key))
             if parent_id is not None:
                 pending.parent_id = parent_id
             pending.last_write = time.monotonic()
@@ -323,7 +339,7 @@ class UploadStager:
                     unit.stage = stage if stage in _RESTING else QueueStage.STAGING
                 self._pending[segments] = unit
                 log.info("adopted leftover upload %s (idle %.0fs, %s)",
-                         unit.path, idle, unit.stage.value)
+                         fileid.tag(unit.path), idle, unit.stage.value)
         self._save()
 
     # -- background loop -------------------------------------------------- #
@@ -337,18 +353,23 @@ class UploadStager:
     def stop(self) -> None:
         self._stop.set()
 
+    def _scrub(self, text: str) -> str:
+        """Error text for ``/rpc/status``: local paths in it become ids."""
+        return scrub_text(
+            text, self.cfg.cache_dir.parent, getattr(self.cfg, "mount_drive", "H:"))
+
     def status(self) -> dict:
         now = time.monotonic()
         with self._lock:
             pending = [
                 {
-                    "path": p.path,
+                    "id": fileid.hex_id(p.path),
                     "stage": p.stage.value,
                     "idle_seconds": round(now - p.last_write, 1),
                     "attempts": p.attempts,
                     "accounts": list(p.accounts),
                     "writers": p.writers,
-                    "detail": p.detail,
+                    "detail": self._scrub(p.detail),
                 }
                 for p in self._pending.values()
             ]
@@ -419,7 +440,7 @@ class UploadStager:
                     continue
                 requests[str(request.source)] = key
                 dispatched.append(key)
-                log.info("uploading %s", "/".join(key))
+                log.info("uploading %s %s", _tag(key), describe_upload(request))
                 if request.logical_size == 0:
                     # Telegram rejects empty documents: metadata only, no engine.
                     self._set_stage(key, QueueStage.REGISTERING)
@@ -471,7 +492,7 @@ class UploadStager:
             try:
                 future.result()
             except Exception as exc:
-                log.exception("registering %s failed", "/".join(key))
+                log.exception("registering %s failed", _tag(key))
                 with lock:
                     failures.setdefault(key, redact(exc))
 
@@ -495,6 +516,7 @@ class UploadStager:
         return TransferRequest(
             source=path, upload_name=unit.name, mime_type=mime_type,
             parent_id=unit.parent_id, logical_size=size,
+            log_tag=_tag(key), attempt=unit.attempts + 1,
         )
 
     def _complete(self, key: Tuple[str, ...]) -> None:
@@ -504,11 +526,11 @@ class UploadStager:
             path.unlink(missing_ok=True)
         with self._lock:
             self._pending.pop(key, None)
-        log.info("uploaded %s — clearing staging", "/".join(key))
+        log.info("uploaded %s — clearing staging", _tag(key))
         self._save()
 
     def _record_failure(self, key: Tuple[str, ...], detail: str) -> None:
-        label = "/".join(key)
+        label = _tag(key)
         with self._lock:
             unit = self._pending.get(key)
             if unit is None:

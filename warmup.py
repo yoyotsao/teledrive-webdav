@@ -33,9 +33,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
+import fileid
 from config import load_config
 from tdapi import Entry, TeleDriveClient
-from tgio import TelegramWorker
+from tgio import TelegramWorker, note_read_label
 
 log = logging.getLogger("warmup")
 
@@ -177,7 +178,20 @@ def walk(
     """
     if before is not None and before() is False:
         return
-    for entry in api.list_dir(parent_id, fresh=fresh):
+    # One retry, then skip this subtree for this pass. Without this a single
+    # read timeout among thousands of listings raised all the way out and the
+    # whole pass — shell warm included — was thrown away (three passes in a
+    # row on 2026-11-14). A skipped subtree is simply tried again next pass.
+    try:
+        entries = api.list_dir(parent_id, fresh=fresh)
+    except Exception:
+        try:
+            entries = api.list_dir(parent_id, fresh=fresh)
+        except Exception as exc:
+            log.warning("warm-up: skipping %s this pass, listing failed twice: %s",
+                        fileid.tag((path or "").strip("/")), exc)
+            return
+    for entry in entries:
         if entry.is_dir:
             walk(api, entry.file_id, f"{path}/{entry.name}", out, before, fresh)
         elif entry.message_id is not None:
@@ -332,6 +346,11 @@ class Warmer:
         log.info("shell warm skipped: %s is not mounted", drive or "the mount")
         return False
 
+    def _dtag(self, path: str) -> str:
+        """Log name of a path on the mount: its id, never the path."""
+        drive = getattr(self.resolver.cfg, "mount_drive", "") or "H:"
+        return fileid.tag_drive(path, drive) or fileid.UNKNOWN_TAG
+
     def _warm_group(self, group: List[str]) -> Tuple[int, bool]:
         """One warmshell run. Returns ``(warmed, wedged)``.
 
@@ -404,10 +423,10 @@ class Warmer:
             unfinished = [p for p in group if p not in reported]
             log.warning("shell warm: killed after %.0fs, %s of %s warmed, still open: %s",
                         time.monotonic() - started, warmed, len(group),
-                        unfinished[0] if unfinished else "nothing")
+                        self._dtag(unfinished[0]) if unfinished else "nothing")
         elif warmed < len(group):
             log.warning("shell warm: %s of %s in this batch produced nothing (%s ...)",
-                        len(group) - warmed, len(group), group[0])
+                        len(group) - warmed, len(group), self._dtag(group[0]))
         return warmed, wedged
 
     def shell_warm(self, files: List[tuple]) -> int:
@@ -455,6 +474,8 @@ class Warmer:
                 break
             pairs = todo[at : at + BATCH]
             chunk = [e for _, e in pairs]
+            for path, entry in pairs:  # so tgio's logs can name each file by id
+                note_read_label(entry.message_id, fileid.tag(path.strip("/")))
             try:
                 self.resolver.thumbs_for(chunk)
                 self.resolver.props_for(chunk, demand=False)

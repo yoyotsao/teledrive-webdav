@@ -36,6 +36,14 @@ winget install WinFsp.WinFsp
 
 裝完**關掉 PowerShell 再開一個新的**（讓 PATH 生效）。
 
+再編一份自己的 rclone（約 2 分鐘，需要 Go）。少了這一步也能掛載，但每次重新掛載
+`H:` 的縮圖都會變回冷的：
+
+```powershell
+winget install GoLang.Go
+python tools\rclone-stableino\build.py
+```
+
 ### 2. 建立 config.ini 與私有 session 目錄
 
 ```powershell
@@ -44,14 +52,13 @@ copy config.example.ini config.ini
 notepad config.ini
 ```
 
-Telegram 最小設定如下；`session_dir` 必須是 **repo 外**的既有私有目錄：
+Telegram 最小設定如下；帳號 session 固定放在 `<cache_dir>\sessions`，沒有獨立的路徑設定：
 
 ```ini
 [telegram]
 api_id = 123456
 api_hash = your_api_hash
 primary_user_id = 123456789
-session_dir = D:\TeleDriveSessions
 ```
 
 第一次還不知道 `primary_user_id` 時可以先留空，下一步登入成功後把輸出的 user ID 填回來。一般還會調整：
@@ -65,7 +72,7 @@ session_dir = D:\TeleDriveSessions
 ### 3. 建立 Telegram SQLite session
 
 ```powershell
-python sessionctl.py login --config config.ini --session-dir D:\TeleDriveSessions
+python sessionctl.py login --config config.ini
 ```
 
 它會互動式詢問手機、驗證碼與 2FA；成功後只留下 `<telegram_user_id>.session`。要加入次要帳號就重跑一次，所有帳號都放同一個目錄，新增後重啟 bridge 即可。第一個／主要帳號不是看檔名順序，而是由 `primary_user_id` 明確指定。
@@ -73,7 +80,7 @@ python sessionctl.py login --config config.ini --session-dir D:\TeleDriveSession
 `.session` 是**未加密的 bearer credential**：拿到檔案的人等同拿到登入權限。不要放進 repo、同步碟或備份公開區。若舊的 StringSession 已經外洩，應先在 Telegram 撤銷該登入再用 `sessionctl login` 建新 session；不要把已外洩憑證遷移過來。只有確認舊 plaintext 從未外洩時，才可用：
 
 ```powershell
-python sessionctl.py migrate --config config.ini --session-dir D:\TeleDriveSessions
+python sessionctl.py migrate --config config.ini
 ```
 
 ### 大檔 premium flood 自動接手
@@ -254,6 +261,19 @@ Windows 的縮圖與屬性處理是**依副檔名**註冊的，沒有「只對�
 
 正常速度是**每秒 10 張以上**。進一個從沒開過的資料夾，第一個檔案可能要等十秒左右
 （在解析路徑），之後就順了。
+
+### `H:` 卡住，連 C:、D: 的檔案總管視窗也一起轉圈
+
+所有檔案總管視窗預設共用同一個 `explorer.exe`，所以一個卡住的 `H:` 資料夾會把其他視窗一起拖住。
+
+- **先開這個（只做一次）**：資料夾選項 →「檢視」→ 勾選「**在不同的處理程序中啟動資料夾視窗**」。
+  `H:` 卡住時，其他已經開著的視窗比較不會被一起拖住。只能緩解：導覽窗格和「本機」
+  還是會去問每一顆磁碟。
+- 後端或網路暫時斷掉時，**開過的資料夾會顯示上一次的內容**（可能不是最新的），
+  沒開過的資料夾會先顯示成**空的**（不是真的空，只是暫時讀不到），恢復後一分鐘內會自己重新列出來。
+- 開 `http://127.0.0.1:8081/rpc/status` 看兩個欄位：`stale_listings` 大於 0 表示有資料夾
+  正在用舊內容回答（後端連不上）；`mount.pacer_exhausted` 是 `true` 表示是 rclone
+  自己卡住了（跑了好幾天之後偶爾會發生），沒有東西在上傳時跑 `stop.bat` 再 `start.bat`。
 
 ### 影片點開沒反應 / 播不動
 

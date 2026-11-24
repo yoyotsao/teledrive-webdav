@@ -248,3 +248,34 @@ def test_a_missing_seven_zip_is_a_clear_error(tmp_path):
     archive.write_bytes(b"Rar!")
     with pytest.raises(gamestage.ArchiveExtractError, match="7-Zip not found"):
         gamestage.extract_archive(archive, tmp_path, str(tmp_path / "nope" / "7z.exe"))
+
+
+def test_read_only_extracted_files_do_not_leave_the_extraction_behind(game, monkeypatch):
+    """7-Zip keeps a RAR's read-only attribute; rmtree must still remove it."""
+    import os
+    import stat
+
+    def extract(archive, dest, seven_zip):
+        member = Path(dest) / "Game" / "run.exe"
+        member.parent.mkdir(parents=True)
+        member.write_bytes(b"MZ")
+        os.chmod(member, stat.S_IREAD)
+
+    monkeypatch.setattr(gamestage, "extract_archive", extract)
+    (game.cfg.staging_dir / "Title.rar").write_bytes(b"Rar!\x1a\x07\x01\x00")
+    game.stager.touch("Title.rar")
+
+    game.stager._process("Title.rar")
+
+    assert list(game.cfg.pack_dir.iterdir()) == []
+
+
+def test_stale_extractions_are_swept_on_startup(game):
+    stale = game.cfg.pack_dir / "Old.extract" / "Game"
+    stale.mkdir(parents=True)
+    (stale / "ro.bin").write_bytes(b"x")
+    __import__("os").chmod(stale / "ro.bin", __import__("stat").S_IREAD)
+
+    gamestage.GameStager(game.cfg, game.stager.api, game.engine)
+
+    assert list(game.cfg.pack_dir.iterdir()) == []
