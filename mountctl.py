@@ -36,11 +36,21 @@ log = logging.getLogger("mountctl")
 
 RC_ADDR = "127.0.0.1:5572"
 
+# rclone built by tools\rclone-stableino\build.py. Stock rclone hands Windows an
+# in-memory counter as each file's ID, which restarts on every mount, and the
+# shell's thumbcache is keyed on that ID — so every remount orphaned every
+# thumbnail ever cached for the drive. See CLAUDE.md.
+STABLE_RCLONE = Path(__file__).resolve().parent / "tools" / "rclone-stableino" / "rclone.exe"
 
-def _rc(command: str, timeout: float = 3.0) -> Optional[dict]:
+# Pinned for the same reason: the volume serial is part of a file's identity to
+# the shell, and WinFsp picks a new one per mount when none is given.
+VOLUME_SERIAL = "9b15860e"
+
+
+def _rc(command: str, timeout: float = 3.0, params: Optional[dict] = None) -> Optional[dict]:
     """Call rclone's remote-control API; None when nothing is answering."""
     req = urllib.request.Request(
-        f"http://{RC_ADDR}/{command}", data=b"{}", method="POST",
+        f"http://{RC_ADDR}/{command}", data=json.dumps(params or {}).encode(), method="POST",
         headers={"Content-Type": "application/json"},
     )
     try:
@@ -53,6 +63,17 @@ def _rc(command: str, timeout: float = 3.0) -> Optional[dict]:
 
 def rclone_running() -> bool:
     return _rc("rc/noop") is not None
+
+
+def rclone_exe() -> Optional[str]:
+    """The stable-inode build when it exists, else rclone from PATH (with a warning)."""
+    if STABLE_RCLONE.exists():
+        return str(STABLE_RCLONE)
+    exe = shutil.which("rclone")
+    if exe is not None:
+        log.warning("using stock rclone: Windows thumbnails will not survive a remount "
+                    "(build tools\\rclone-stableino\\build.py)")
+    return exe
 
 
 def drive_present(cfg: Config) -> bool:
@@ -69,14 +90,18 @@ def mount_command(cfg: Config, exe: str) -> List[str]:
         "--network-mode",
         "--cache-dir", str(cfg.rclone_dir),
         "--vfs-cache-mode", "full",
-        "--vfs-cache-max-size", "160G",
+        "--vfs-cache-max-size", cfg.vfs_cache_max_size,
         "--vfs-cache-max-age", "8760h",
-        "--vfs-cache-min-free-space", "20G",
+        "--vfs-cache-min-free-space", cfg.vfs_cache_min_free_space,
         "--dir-cache-time", "1h",
         "--vfs-read-chunk-size", "32M",
         "--vfs-read-chunk-size-limit", "512M",
         "--transfers", "4",
         "--no-checksum",
+        # rclone's Windows default (0666) has no execute bit, so every .exe on
+        # the mount fails with "Access is denied". Games run straight from H:.
+        "--file-perms", "0777",
+        "-o", f"VolumeSerialNumber={VOLUME_SERIAL}",
         # vfs/forget needs --rc-no-auth, --rc alone is refused with 403.
         "--rc", "--rc-addr", RC_ADDR, "--rc-no-auth",
     ]
@@ -86,7 +111,7 @@ def ensure_mounted(cfg: Config, wait: float = 120.0) -> bool:
     """Start the mount unless it is already there. True when the drive is up."""
     if rclone_running():
         return True
-    exe = shutil.which("rclone")
+    exe = rclone_exe()
     if exe is None:
         log.error("rclone is not on PATH (winget install Rclone.Rclone WinFsp.WinFsp)")
         return False

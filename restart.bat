@@ -31,7 +31,7 @@ if errorlevel 1 (
 )
 
 echo [2/3] starting the bridge...
-start "TeleDrive bridge" /min "%PY%" bridge.py
+"%PY%" scripts\launch_bridge.py
 
 echo [3/3] waiting for it to answer...
 set /a tries=0
@@ -43,7 +43,7 @@ if %tries% GEQ 30 (
   echo [error] bridge did not come up. See ^<cache_dir^>\bridge.log
   goto :fail
 )
-"%SystemRoot%\System32\timeout.exe" /t 2 /nobreak >nul
+"%SystemRoot%\System32\PING.EXE" -n 3 127.0.0.1 >nul
 goto wait
 :ready
 echo       bridge is up.
@@ -60,7 +60,7 @@ if %tries% GEQ 20 (
 clone.log
   goto :fail
 )
-"%SystemRoot%\System32\timeout.exe" /t 2 /nobreak >nul
+"%SystemRoot%\System32\PING.EXE" -n 3 127.0.0.1 >nul
 goto waitmount
 :mounted
 echo       drive is mounted.

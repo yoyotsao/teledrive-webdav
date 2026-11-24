@@ -23,7 +23,7 @@ if not errorlevel 1 (
   echo [1/2] bridge is already running.
 ) else (
   echo [1/2] starting bridge...
-  start "TeleDrive bridge" /min "%PY%" bridge.py
+  "%PY%" scripts\launch_bridge.py
 )
 
 echo [2/2] waiting for the bridge and the mount...
@@ -39,7 +39,7 @@ if %tries% GEQ 40 (
   echo [error] not ready. See ^<cache_dir^>\bridge.log and rclone.log
   goto :fail
 )
-"%SystemRoot%\System32\timeout.exe" /t 2 /nobreak >nul
+"%SystemRoot%\System32\PING.EXE" -n 3 127.0.0.1 >nul
 goto wait
 :ready
 echo       bridge is up and the drive is mounted.

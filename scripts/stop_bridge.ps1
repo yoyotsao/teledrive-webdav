@@ -4,7 +4,11 @@ param(
     [int]$TimeoutSeconds = 5,
     # Stop only the warmers. stop.bat unmounts between the two halves so that
     # rclone can flush pending writes through a bridge that is still serving.
-    [switch]$WarmersOnly
+    [switch]$WarmersOnly,
+    # Stop only the bridge and leave any warmshell to the caller. stop.bat uses
+    # this: a warmshell blocked in a read on the drive cannot exit until rclone
+    # leaves, so requiring it gone first deadlocks the whole shutdown.
+    [switch]$BridgeOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -36,6 +40,7 @@ try {
         exit 5
     }
 
+    if (-not $BridgeOnly) {
     try {
         $warmers = @(
             Get-CimInstance Win32_Process -Filter "Name = 'warmshell.exe'"
@@ -119,6 +124,7 @@ try {
 
     if ($WarmersOnly) {
         exit 0
+    }
     }
 
     # Keep the launch mutex until every bridge process is gone.  A warmer that
