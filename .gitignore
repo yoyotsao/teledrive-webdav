@@ -33,3 +33,6 @@ probe.bin
 # Generated reports about the current state of the drive, not source
 truncated.csv
 padded.csv
+
+# rclone source fetched by tools/rclone-stableino/build.py
+tools/rclone-stableino/src/
