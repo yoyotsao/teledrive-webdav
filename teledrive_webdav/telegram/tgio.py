@@ -739,7 +739,7 @@ class TelegramWorker:
                 async with gate:
                     return key, await self._thumbnail_bytes(doc)
             except Exception as exc:
-                log.warning("thumbnail for message %s failed: %s", part.message_id, exc)
+                log.warning("thumbnail for %s failed: %s", label_for(part.message_id), exc)
                 return key, None
 
         pairs = await asyncio.gather(*[one(part) for part in parts])
@@ -769,7 +769,7 @@ class TelegramWorker:
                     part.message_id, part.file_id, expected_size=part.size
                 )
             except Exception as exc:
-                log.warning("media info for message %s failed: %s", part.message_id, exc)
+                log.warning("media info for %s failed: %s", label_for(part.message_id), exc)
                 continue
             # Recorded even when empty. An entry here means "the document was
             # read and it has nothing to report", which is a cacheable answer;
@@ -895,7 +895,7 @@ class TelegramWorker:
         except Exception as exc:
             if not _is_file_reference_error(exc):
                 raise
-            log.warning("file_reference expired for message %s — refetching", message_id)
+            log.warning("file_reference expired for %s — refetching", label_for(message_id))
             doc = self.get_document(
                 message_id, expected_file_id, refresh=True, expected_size=expected_size
             )
@@ -918,7 +918,7 @@ class TelegramWorker:
 
     def refresh_document(self, message_id: int, expected_file_id: str, expected_size: Optional[int] = None) -> None:
         """Re-fetch the Document so a new file_reference is used (after expiry)."""
-        log.warning("file_reference expired for message %s — refetching", message_id)
+        log.warning("file_reference expired for %s — refetching", label_for(message_id))
         self.get_document(message_id, expected_file_id, refresh=True, expected_size=expected_size)
 
     async def _read(self, doc, offset: int, length: int) -> bytes:
@@ -1275,7 +1275,7 @@ class TelegramWorker:
         for item in items:
             message = by_document.get(str(item.document_id))
             if message is None:
-                raise RemoteIdentityError(f"album returned no message for document {item.document_id}")
+                raise RemoteIdentityError("album returned no message for one of its documents")
             document = message.media.document
             parts.append(UploadedPart(
                 index=0, message_id=int(message.id), file_id=str(document.id),
@@ -1674,6 +1674,8 @@ class SeekableRemoteFile(io.RawIOBase):
         self._pool = pool
         self._table, self._total = build_part_table(parts)
         self._name = name
+        # Log-safe stand-in for the name, which is what the person stored.
+        self._label = label_for(parts[0].message_id) if parts else "id=?"
         # Bytes from the start of the file that the caller already has on disk.
         # Overlaid on the block cache rather than seeded into it, because a head
         # is whatever length the caller chose and a partial block would make
@@ -1780,7 +1782,7 @@ class SeekableRemoteFile(io.RawIOBase):
                     self._pad_warned = True
                     log.warning(
                         "%s: Telegram has %s bytes, listed size is %s; padding with zeros",
-                        self._name or "file", pos, self._total,
+                        self._label, pos, self._total,
                     )
                 out += bytes(end - pos)
                 break

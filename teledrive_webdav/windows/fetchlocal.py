@@ -129,7 +129,7 @@ class LocalFetcher:
 
         loc = self.resolver.resolve(segments)
         if loc.kind == bridge.MISSING:
-            raise FileNotFoundError(f"not found: {'/'.join(segments)}")
+            raise FileNotFoundError(f"not found: {fileid.tag('/'.join(segments))}")
         return self._plan(loc, segments)
 
     def destination_for(self, segments: List[str]) -> Path:

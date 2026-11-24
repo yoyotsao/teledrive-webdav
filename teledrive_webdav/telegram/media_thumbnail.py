@@ -101,9 +101,9 @@ def _capture_video(path: Path, configured_ffmpeg: str | None) -> ThumbnailResult
             shell=False,
         )
     except subprocess.TimeoutExpired as exc:
-        raise ThumbnailError(f"ffmpeg timed out while capturing {path.name}") from exc
+        raise ThumbnailError("ffmpeg timed out while capturing a frame") from exc
     except OSError as exc:
-        raise ThumbnailError(f"could not run ffmpeg for {path.name}: {exc}") from exc
+        raise ThumbnailError(f"could not run ffmpeg: {exc}") from exc
 
     stderr = completed.stderr.decode("utf-8", "replace").strip()
     if completed.returncode:
@@ -111,7 +111,7 @@ def _capture_video(path: Path, configured_ffmpeg: str | None) -> ThumbnailResult
             return ThumbnailResult("undecodable", error=stderr or "ffmpeg could not decode media")
         raise ThumbnailError(_ffmpeg_failure(path, stderr))
     if not completed.stdout:
-        raise ThumbnailError(f"ffmpeg produced no thumbnail for {path.name}")
+        raise ThumbnailError("ffmpeg produced no thumbnail")
 
     try:
         from PIL import Image
@@ -123,7 +123,7 @@ def _capture_video(path: Path, configured_ffmpeg: str | None) -> ThumbnailResult
     except ImportError:
         return ThumbnailResult("undecodable", error="Pillow is not installed")
     except Exception as exc:
-        raise ThumbnailError(f"ffmpeg produced an invalid thumbnail for {path.name}: {exc}") from exc
+        raise ThumbnailError(f"ffmpeg produced an invalid thumbnail: {exc}") from exc
 
 
 def _encode_jpeg(image) -> bytes:

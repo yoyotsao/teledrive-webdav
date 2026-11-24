@@ -287,7 +287,7 @@ class Resolver:
     @staticmethod
     def _remote_part(entry: Entry) -> RemotePart:
         if entry.message_id is None:
-            raise ValueError(f"{entry.name} has no Telegram message")
+            raise ValueError("entry has no Telegram message")
         return RemotePart(
             int(entry.message_id), entry.size, entry.telegram_user_id, entry.file_id
         )
@@ -688,7 +688,7 @@ class Resolver:
                 if len(candidates) > 1:
                     log.warning(
                         "multiple case-insensitive ZIP candidates for %s; selecting newest",
-                        top,
+                        fileid.tag(f"{self.cfg.game_folder}/{top}"),
                     )
                 zip_entry = candidates[-1]
         if zip_entry is not None and not zip_entry.is_dir:
