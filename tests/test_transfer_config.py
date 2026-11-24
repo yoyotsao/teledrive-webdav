@@ -17,7 +17,6 @@ def write_config(tmp_path: Path, extra: str = "") -> Path:
         "api_id = 123\n"
         "api_hash = hash\n"
         "primary_user_id = 123\n"
-        "session_dir = sessions\n"
         f"{extra}",
         encoding="utf-8",
     )
@@ -59,7 +58,7 @@ def test_uploaded_part_requires_storage_identity():
 def test_config_relative_session_path_and_blank_ffmpeg(tmp_path):
     path = write_config(tmp_path, "\n[upload]\nffmpeg =\n")
     cfg = load_config(path)
-    assert cfg.session_dir == tmp_path / "sessions"
+    assert cfg.session_dir == tmp_path / "data" / "sessions"
     assert cfg.ffmpeg == ""
 
 
@@ -85,3 +84,16 @@ def test_upload_debounce_can_be_set_and_must_be_positive(tmp_path, monkeypatch):
     assert cfg.upload_debounce_seconds == 3.0
     with pytest.raises(ConfigError):
         load_config(write_config(tmp_path, "[upload]\ndebounce_seconds = 0\n"))
+
+
+@pytest.mark.parametrize("raw,expected", [(None, True), ("false", False), ("off", False), ("true", True)])
+def test_auto_mount_is_read_from_config_ini(tmp_path, monkeypatch, raw, expected):
+    """It used to be the dataclass default only: auto_mount = false did nothing."""
+    monkeypatch.delenv("TELEGRAM_API_ID", raising=False)
+    monkeypatch.delenv("TELEGRAM_API_HASH", raising=False)
+    extra = "" if raw is None else f"[bridge]\nauto_mount = {raw}\n"
+    assert load_config(write_config(tmp_path, extra)).auto_mount is expected
+
+
+def test_auto_recover_mount_defaults_off(tmp_path, monkeypatch):
+    assert load_minimal_config(tmp_path, monkeypatch).auto_recover_mount is False

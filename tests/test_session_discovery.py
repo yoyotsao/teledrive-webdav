@@ -108,18 +108,18 @@ def _write_new_config(tmp_path: Path, extra: str = "") -> Path:
         "api_id = 123\n"
         "api_hash = hash\n"
         "primary_user_id = 42\n"
-        "session_dir = sessions\n"
         f"{extra}",
         encoding="utf-8",
     )
     return path
 
 
-def test_config_resolves_relative_session_dir_against_config(tmp_path, monkeypatch):
+def test_session_dir_is_derived_from_cache_dir(tmp_path, monkeypatch):
     monkeypatch.delenv("TELEGRAM_SESSION_STRING", raising=False)
-    cfg = load_config(_write_new_config(tmp_path))
+    extra = "\n[paths]\ncache_dir = store\n"
+    cfg = load_config(_write_new_config(tmp_path, extra))
     assert cfg.primary_user_id == 42
-    assert cfg.session_dir == tmp_path / "sessions"
+    assert cfg.session_dir == tmp_path / "store" / "sessions"
     assert not hasattr(cfg, "session")
     assert not hasattr(cfg, "accounts_file")
 
@@ -161,3 +161,14 @@ def test_runtime_has_no_plaintext_session_configuration():
     # Task 1 does not accidentally retain the old runtime fallback.
     assert "TELEGRAM_SESSION_STRING" not in Path("config.py").read_text("utf-8")
     assert 'get("telegram", "session")' not in Path("config.py").read_text("utf-8")
+
+
+def test_a_leftover_session_dir_setting_is_ignored(tmp_path, monkeypatch, caplog):
+    monkeypatch.delenv("TELEGRAM_SESSION_STRING", raising=False)
+    path = _write_new_config(tmp_path)
+    path.write_text(path.read_text("utf-8").replace(
+        "primary_user_id = 42", "primary_user_id = 42\nsession_dir = elsewhere"
+    ), encoding="utf-8")
+    cfg = load_config(path)
+    assert cfg.session_dir == tmp_path / "data" / "sessions"
+    assert "session_dir is ignored" in caplog.text

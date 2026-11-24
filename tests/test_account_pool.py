@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import time
 import traceback
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+import tdapi
 from config import ConfigError
 from telegram_accounts import AccountUnavailableError, TelegramAccountPool
 from tgio import TelegramWorker
@@ -364,5 +366,43 @@ def test_closing_a_lease_notifies_release_listeners_outside_the_pool_lock():
         with pool.acquire_upload(timeout=0.1):
             assert seen == []
         assert seen == [(1, True)]
+    finally:
+        pool.stop()
+
+
+class UnreachableAccountsApi(FakeApi):
+    """The backend is down: login rides token.txt, /accounts cannot answer."""
+
+    def __init__(self, linked):
+        super().__init__(linked)
+        self.down = True
+
+    def linked_account_ids(self):
+        self.account_lookups += 1
+        if self.down:
+            raise tdapi.ApiError(530, "origin unreachable")
+        return set(self.linked)
+
+
+def test_bridge_starts_when_the_backend_cannot_say_which_accounts_are_linked(monkeypatch):
+    """2026-11-15: an unreachable backend made pool.start() raise, the bridge
+    exit, and H: go dark -- the stale listings it could have served were never
+    reached. Reading never needed /accounts; only new uploads to secondaries do."""
+    monkeypatch.setattr(TelegramAccountPool, "LINKED_RETRY_SECONDS", 0.01)
+    pool = TelegramAccountPool(
+        [spec(1), spec(2)], api_id=123, api_hash="hash", download_connections=4,
+        upload_files=3, upload_parts=12,
+        worker_factory=WorkerFactory({1: FakeWorker(1), 2: FakeWorker(2)}),
+    )
+    api = UnreachableAccountsApi({1, 2})
+    try:
+        pool.start(api)
+        assert pool.eligible_upload_ids == (1,)  # primary is always linked
+        assert pool.for_read(2).online           # secondaries still read
+        api.down = False
+        deadline = time.monotonic() + 2
+        while pool.eligible_upload_ids != (1, 2) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert pool.eligible_upload_ids == (1, 2)
     finally:
         pool.stop()

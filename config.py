@@ -3,7 +3,7 @@
 Secret application credentials may fall back from config.ini to the process
 environment and the optional env_file. Telegram account authorization itself is
 never loaded from plaintext runtime configuration: accounts are discovered from
-SQLite session files in ``session_dir``.
+SQLite session files in ``<cache_dir>/sessions`` (not a separate setting).
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import configparser
 import logging
 import math
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -25,6 +26,12 @@ _ENV_KEYS = {
     "base_url": "TELEDRIVE_BASE_URL",
 }
 _LEGACY_SESSION_ENV = "TELEGRAM_" + "SESSION_STRING"
+SESSIONS_SUBDIR = "sessions"
+
+
+def session_dir_for(cache_dir: Path) -> Path:
+    """Where the Telegram SQLite sessions live, derived from ``cache_dir``."""
+    return Path(cache_dir) / SESSIONS_SUBDIR
 
 
 class ConfigError(RuntimeError):
@@ -40,10 +47,17 @@ class Config:
     base_url: str = "http://127.0.0.1:8000"
     game_folder: str = "game"
     dir_cache_seconds: float = 3600.0
+    list_deadline_seconds: float = 8.0
     host: str = "127.0.0.1"
     port: int = 8081
     mount_drive: str = "E:"
     auto_mount: bool = True
+    # rclone VFS cache limits, in rclone's size syntax (e.g. 160G, 1.5T).
+    vfs_cache_max_size: str = "160G"
+    vfs_cache_min_free_space: str = "20G"
+    # Remount when rclone's pacer has leaked its tokens (mountwatch.py). Off:
+    # remounting unmounts the drive and drops the dir cache, the user's call.
+    auto_recover_mount: bool = False
     log_level: str = "INFO"
     cache_dir: Path = Path("data/meta")
     local_dir: Path = Path("data/local")
@@ -78,6 +92,11 @@ class Config:
     @property
     def pack_dir(self) -> Path:
         return self.staging_dir / ".pack"
+
+    @property
+    def rejected_dir(self) -> Path:
+        """Writes rclone kept retrying after the bridge refused them (rejectedputs.py)."""
+        return self.upload_dir.parent / "rejected"
 
 
 def ext_path(path) -> str:
@@ -140,6 +159,27 @@ def positive_float(name: str, raw: str) -> float:
     return value
 
 
+def list_deadline(raw: str) -> float:
+    """How long a folder listing may wait on the backend before the stale copy answers.
+
+    Bounded both ways: below 2s an ordinary slow listing (20,930 rows measured
+    at 2.5s) would be treated as a failure; above 60s it is no bound at all.
+    """
+    value = positive_float("list_deadline_seconds", raw)
+    if not 2 <= value <= 60:
+        raise ConfigError(f"list_deadline_seconds must be between 2 and 60, got {raw!r}")
+    return value
+
+
+def rclone_size(name: str, raw: str) -> str:
+    """A size rclone accepts (160G, 1.5T, 500M). Checked here so a typo fails at
+    startup instead of rclone refusing to mount in the background."""
+    value = raw.strip()
+    if not re.fullmatch(r"\d+(\.\d+)?[KMGTP]?", value, re.IGNORECASE) or float(value.rstrip("KMGTPkmgtp")) <= 0:
+        raise ConfigError(f"{name} must be a positive size like 160G or 1.5T, got {raw!r}")
+    return value
+
+
 def load_config(path: Optional[Path] = None) -> Config:
     if path is None:
         env_path = os.environ.get("TELEDRIVE_WEBDAV_CONFIG")
@@ -178,13 +218,17 @@ def load_config(path: Optional[Path] = None) -> Config:
     api_id = get("telegram", "api_id")
     api_hash = get("telegram", "api_hash")
     primary_raw = parser.get("telegram", "primary_user_id", fallback="").strip()
-    session_dir_raw = parser.get("telegram", "session_dir", fallback="").strip()
+    if parser.get("telegram", "session_dir", fallback="").strip():
+        log.warning(
+            "config.ini [telegram] session_dir is ignored; sessions live in "
+            "<cache_dir>/%s", SESSIONS_SUBDIR,
+        )
 
     legacy_config_keys = tuple(
         key for key in ("session", "accounts_file")
         if parser.get("telegram", key, fallback="").strip()
     )
-    new_complete = bool(primary_raw and session_dir_raw)
+    new_complete = bool(primary_raw)
     legacy_env_present = bool(
         os.environ.get(_LEGACY_SESSION_ENV) or file_env.get(_LEGACY_SESSION_ENV)
     )
@@ -213,7 +257,6 @@ def load_config(path: Optional[Path] = None) -> Config:
             ("api_id", api_id),
             ("api_hash", api_hash),
             ("primary_user_id", primary_raw),
-            ("session_dir", session_dir_raw),
         ) if not value
     ]
     if missing:
@@ -225,7 +268,7 @@ def load_config(path: Optional[Path] = None) -> Config:
         api_id=int(api_id),
         api_hash=api_hash,
         primary_user_id=positive_int("primary_user_id", primary_raw),
-        session_dir=resolve_dir(session_dir_raw),
+        session_dir=session_dir_for(data_root),
         download_connections=positive_int(
             "download_connections", get("telegram", "download_connections", "8")
         ),
@@ -251,9 +294,16 @@ def load_config(path: Optional[Path] = None) -> Config:
         base_url=get("teledrive", "base_url", "http://127.0.0.1:8000"),
         game_folder=get("teledrive", "game_folder", "game"),
         dir_cache_seconds=float(get("teledrive", "dir_cache_seconds", "3600")),
+        list_deadline_seconds=list_deadline(get("bridge", "list_deadline_seconds", "8")),
+        auto_mount=get("bridge", "auto_mount", "true").lower() not in ("0", "false", "no", "off"),
+        auto_recover_mount=get("bridge", "auto_recover_mount", "false").lower() in ("1", "true", "yes", "on"),
         host=get("bridge", "host", "127.0.0.1"),
         port=int(get("bridge", "port", "8081")),
         mount_drive=get("bridge", "mount_drive", "E:").rstrip("\\/"),
+        vfs_cache_max_size=rclone_size("vfs_cache_max_size", get("bridge", "vfs_cache_max_size", "160G")),
+        vfs_cache_min_free_space=rclone_size(
+            "vfs_cache_min_free_space", get("bridge", "vfs_cache_min_free_space", "20G")
+        ),
         log_level=get("bridge", "log_level", "INFO").upper(),
         cache_dir=data_root / "meta",
         local_dir=data_root / "local",

@@ -109,7 +109,7 @@ def test_accounts_file_is_authoritative_and_first_account_becomes_primary(rig):
     ]
     text = rig.config.read_text("utf-8")
     assert "primary_user_id = 20" in text
-    assert f"session_dir = {rig.session_dir.resolve()}" in text
+    assert "session_dir" not in text
     assert "\naccounts_file =" not in text
     assert "\nsession =" not in text
     assert "ignored" not in rig.copies

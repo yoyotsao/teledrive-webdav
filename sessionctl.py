@@ -15,6 +15,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 from typing import Protocol
 
+from config import session_dir_for
 from telegram_sessions import SessionDirectoryLock, SessionLockError
 
 
@@ -153,8 +154,37 @@ Set-Acl -LiteralPath $p -AclObject $acl
         self._run(self._file_script(), path)
 
 
+class NoSessionPermissionPolicy:
+    """Create the directory and leave its permissions as the filesystem gives them."""
+
+    def prepare_directory(self, path: Path) -> None:
+        try:
+            Path(path).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            raise SessionCtlError("Telegram session directory could not be created") from None
+
+    def verify_staged_file(self, path: Path) -> None:
+        return None
+
+
 def default_permission_policy() -> SessionPermissionPolicy:
-    return WindowsSessionPermissionPolicy() if os.name == "nt" else PosixSessionPermissionPolicy()
+    # Deliberately no permission checks: the owner chose to keep sessions under
+    # cache_dir without locking the directory down. Pass Windows/Posix policy
+    # explicitly to get the strict behaviour back.
+    return NoSessionPermissionPolicy()
+
+
+def default_session_dir(config_path: Path) -> Path:
+    """``<cache_dir>/sessions`` as ``config.load_config`` derives it."""
+    config_path = Path(config_path).resolve()
+    parser = configparser.ConfigParser()
+    try:
+        parser.read([config_path], encoding="utf-8")
+    except (OSError, configparser.Error):
+        pass
+    raw = Path(parser.get("paths", "cache_dir", fallback="data").strip() or "data")
+    cache_dir = (raw if raw.is_absolute() else config_path.parent / raw).resolve()
+    return session_dir_for(cache_dir)
 
 
 def resolve_session_dir_for_cli(config_path: Path, session_dir: Path) -> Path:
@@ -446,7 +476,7 @@ async def _validate_migrated_session(
 
 
 def _rewrite_runtime_config(
-    config_path: Path, *, primary_user_id: int, session_dir: Path
+    config_path: Path, *, primary_user_id: int
 ) -> None:
     parser = configparser.ConfigParser()
     try:
@@ -456,7 +486,7 @@ def _rewrite_runtime_config(
         parser.remove_option("telegram", "session")
         parser.remove_option("telegram", "accounts_file")
         parser.set("telegram", "primary_user_id", str(primary_user_id))
-        parser.set("telegram", "session_dir", str(Path(session_dir).resolve()))
+        parser.remove_option("telegram", "session_dir")
         config_dir = Path(config_path).resolve().parent
         with NamedTemporaryFile(
             "w",
@@ -575,9 +605,7 @@ def _migrate_legacy_sessions_impl(
 
         primary = staged[0][2]
         account_ids = tuple(actual for _item, _temporary, actual in staged)
-        _rewrite_runtime_config(
-            config_path, primary_user_id=primary, session_dir=directory
-        )
+        _rewrite_runtime_config(config_path, primary_user_id=primary)
         return MigrationResult(primary, directory, account_ids, obsolete)
 
 
@@ -615,10 +643,10 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     login = sub.add_parser("login", help="create a fresh Telegram SQLite session")
     login.add_argument("--config", type=Path, default=Path("config.ini"))
-    login.add_argument("--session-dir", type=Path, required=True)
+    login.add_argument("--session-dir", type=Path, default=None, help=argparse.SUPPRESS)
     migrate = sub.add_parser("migrate", help="convert legacy plaintext sessions")
     migrate.add_argument("--config", type=Path, default=Path("config.ini"))
-    migrate.add_argument("--session-dir", type=Path, required=True)
+    migrate.add_argument("--session-dir", type=Path, default=None, help=argparse.SUPPRESS)
     return parser
 
 
@@ -626,11 +654,15 @@ def main(argv=None) -> int:
     args = _build_parser().parse_args(argv)
     try:
         if args.command == "login":
-            result = login_session(args.config, args.session_dir)
+            result = login_session(
+                args.config, args.session_dir or default_session_dir(args.config)
+            )
             print(f"Telegram session created for account {result.stem}: {result}")
             return 0
         if args.command == "migrate":
-            result = migrate_legacy_sessions(args.config, args.session_dir)
+            result = migrate_legacy_sessions(
+                args.config, args.session_dir or default_session_dir(args.config)
+            )
             print(f"Migrated Telegram accounts {','.join(map(str, result.account_ids))} to {result.session_dir}")
             if result.obsolete_sources:
                 print("Remove obsolete plaintext sources: " + ", ".join(result.obsolete_sources), file=sys.stderr)

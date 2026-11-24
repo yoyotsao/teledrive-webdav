@@ -220,7 +220,6 @@ class TelegramAccountPool:
         try:
             api.set_dm_sender(primary.worker.send_dm)
             api.login()
-            linked_ids = api.linked_account_ids()
         except Exception as exc:
             self.stop()
             detail = self._safe_detail(primary, exc)
@@ -228,11 +227,47 @@ class TelegramAccountPool:
                 f"primary account authentication failed: {detail}"
             ) from None
 
-        for index, runtime in enumerate(self._runtimes):
-            runtime.linked = runtime.online and (
-                index == 0 or runtime.telegram_user_id in linked_ids
+        # Which secondaries are linked only matters for new uploads. With the
+        # backend unreachable this used to abort startup -- the bridge exited and
+        # H: went dark even though its stale listings could have answered
+        # (2026-11-15). Start with the primary alone and ask again later.
+        try:
+            linked_ids = api.linked_account_ids()
+        except Exception as exc:
+            log.warning(
+                "cannot ask the backend which accounts are linked (%s); uploading "
+                "with the primary only until it answers",
+                type(exc).__name__,
             )
+            linked_ids = None
+        self._apply_linked(linked_ids or set())
         self._started = True
+        if linked_ids is None and len(self._runtimes) > 1:
+            threading.Thread(
+                target=self._retry_linked, args=(api,), name="linked-accounts", daemon=True
+            ).start()
+
+    LINKED_RETRY_SECONDS = 60.0
+
+    def _apply_linked(self, linked_ids) -> None:
+        with self._lock:
+            for index, runtime in enumerate(self._runtimes):
+                runtime.linked = runtime.online and (
+                    index == 0 or runtime.telegram_user_id in linked_ids
+                )
+
+    def _retry_linked(self, api) -> None:
+        while self._started:
+            time.sleep(self.LINKED_RETRY_SECONDS)
+            if not self._started:
+                return
+            try:
+                linked_ids = api.linked_account_ids()
+            except Exception:
+                continue
+            self._apply_linked(linked_ids)
+            log.info("linked accounts known again: uploads may use %s", self.eligible_upload_ids)
+            return
 
     def _start_runtime(self, runtime: AccountRuntime) -> None:
         try:
