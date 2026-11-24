@@ -468,3 +468,27 @@ def test_healthy_playtime_files_are_opened_untouched(tmp_path):
     _store, queue = open_playtime_state(tmp_path)
     assert [item["id"] for item in queue.pending()] == ["a"]
     assert not list(tmp_path.glob("*.corrupt-*"))
+
+
+def test_running_store_loads_sessions_saved_before_ignore_existed(tmp_path):
+    path = tmp_path / "running.json"
+    RunningSessionStore(path).save(session())
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for item in (data.values() if isinstance(data, dict) else data):
+        item.pop("ignore", None)
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert RunningSessionStore(path).all()[0].ignore == []
+
+
+def test_recovery_of_batch_session_does_not_attach_to_mtool(tmp_path):
+    class Adapter:
+        def snapshot_all(self):
+            return [ProcessInfo(ProcessRef(50, 150.0), str(tmp_path / "A" / "Tool" / "nw.exe"), None)]
+
+    store = RunningSessionStore(tmp_path / "running.json")
+    queue = PlaytimeQueue(tmp_path / "queue.jsonl")
+    batch = RunningSession("bat", 7, "PC", 100, str(tmp_path / "A"), [ProcessRef(11, 100.0)], 120, "game/A",
+                           [str(tmp_path / "A" / "Tool")])
+    store.save(batch)
+    PlaytimeService(store, queue, None, Adapter()).recover_sessions()
+    assert [item["id"] for item in queue.pending()] == ["bat"]

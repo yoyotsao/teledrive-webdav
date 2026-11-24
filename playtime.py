@@ -10,7 +10,7 @@ import threading
 from dataclasses import asdict
 from pathlib import Path
 
-from gamelaunch import ProcessRef, RunningSession
+from gamelaunch import ProcessRef, RunningSession, is_ignored
 
 log = logging.getLogger("bridge.playtime")
 
@@ -35,6 +35,7 @@ def _session_from_dict(data: dict) -> RunningSession:
     data = dict(data)
     data["pids"] = [ProcessRef(int(ref["pid"]), float(ref["create_time"])) for ref in data["pids"]]
     data["path"] = str(data.get("path", ""))
+    data["ignore"] = [str(item) for item in data.get("ignore", [])]
     return RunningSession(**data)
 
 
@@ -263,6 +264,7 @@ class PlaytimeService:
                     self.launcher.sessions.pop(session.session_id, None)
                 continue
             snapshot = self.adapter.snapshot_all() if self.adapter else []
+            snapshot = [item for item in snapshot if not is_ignored(session, item.exe_path)]
             by_pid = {item.ref.pid: item for item in snapshot}
             found = [ref for ref in session.pids if (item := by_pid.get(ref.pid)) and item.ref == ref]
             if not found and self.adapter:

@@ -16,6 +16,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from gamelaunch import GameLauncher, LaunchError
+import savedata
 
 log = logging.getLogger("bridge.game_rpc")
 
@@ -116,6 +117,17 @@ class GameState:
             except (OSError, ValueError):
                 pass
         return self.fetcher.destination_for(segments)
+
+    def ready_root(self, path: str) -> Path:
+        """已下载完成（有完成标记）的本机游戏根目录；否则 409 game_not_ready。"""
+        segments = self.canonical_game_segments(path)
+        try:
+            root = Path(self._root_for(path, segments)).resolve(strict=True)
+        except Exception:
+            root = None
+        if root is None or not root.is_dir() or not (root / self.COMPLETE_MARKER).is_file():
+            raise GameStateError(409, "game_not_ready", "游戏尚未下载完成")
+        return root
 
     def _is_running(self, path: str) -> bool:
         providers = [self.running_provider]
@@ -529,7 +541,49 @@ class GameRpc:
                 except (ValueError, TypeError, KeyError, json.JSONDecodeError):
                     return self._response(start_response, 400, {"code": "invalid_json", "error": "invalid JSON body"}, cors)
             return self._response(start_response, 501, {"code": "not_implemented", "error": "game RPC is not implemented"}, cors)
+        if route in ("/rpc/game/savedata/detect", "/rpc/game/savedata/import"):
+            if self.state is None:
+                return self._response(start_response, 501, {"code": "not_implemented", "error": "game RPC is not implemented"}, cors)
+            try:
+                return self._savedata(environ, start_response, method, cors, route)
+            except (GameStateError, savedata.SavedataError) as exc:
+                return self._response(start_response, exc.status, {"code": exc.code, "error": exc.message}, cors)
         return self._response(start_response, 404, {"error": "no such game RPC"}, cors)
+
+    def _savedata(self, environ, start_response, method, cors, route):
+        if route == "/rpc/game/savedata/detect":
+            if method != "GET":
+                raise GameStateError(405, "method_not_allowed", "method not allowed")
+            query = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
+            paths = query.get("path", [])
+            exe_values = query.get("exe_relpath", [])
+            if len(paths) != 1 or len(exe_values) > 1:
+                raise GameStateError(400, "invalid_query", "exactly one path parameter is required")
+            root = self.state.ready_root(paths[0])
+            result = savedata.detect(root, exe_values[0] if exe_values else None)
+            return self._response(start_response, 200, result, cors)
+        if method != "POST":
+            raise GameStateError(405, "method_not_allowed", "method not allowed")
+        try:
+            length = int(environ.get("CONTENT_LENGTH") or "0")
+            payload = json.loads(environ["wsgi.input"].read(length))
+        except (ValueError, TypeError, KeyError):
+            raise GameStateError(400, "invalid_json", "invalid JSON body") from None
+        if not isinstance(payload, dict) or not isinstance(payload.get("path"), str):
+            raise GameStateError(400, "invalid_game_path", "invalid game path")
+        game_id = payload.get("game_id")
+        if not isinstance(game_id, int) or isinstance(game_id, bool) or game_id <= 0:
+            raise GameStateError(400, "invalid_game_id", "game id must be a positive integer")
+        root = self.state.ready_root(payload["path"])
+        if self.state._is_running(payload["path"]):
+            raise GameStateError(409, "game_running", "游戏正在运行，请先关闭游戏再导入存档")
+        result = savedata.import_savedata(
+            root, payload.get("source_relpath"), payload.get("target"), game_id,
+            Path(self.cfg.cache_dir) / "savedata-backups",
+        )
+        log.info("savedata imported: game_id=%s files=%d backup=%s",
+                 game_id, result["copied_files"], bool(result["backup_path"]))
+        return self._response(start_response, 200, result, cors)
 
     def _cors_headers(self, environ, origin):
         headers = [

@@ -332,3 +332,95 @@ def test_already_running_game_uses_its_own_error_code(game):
         launcher.launch("game/A", "start.exe", 11)
     assert caught.value.status == 409
     assert caught.value.code == "bridge_game_running"
+
+
+def _with_mtool(root: Path) -> None:
+    (root / "Game.exe").write_bytes(b"exe")
+    (root / "Tool" / "loaders").mkdir(parents=True)
+    (root / "Tool" / "nw.exe").write_bytes(b"exe")
+    (root / "Tool" / "loaders" / "inject.exe").write_bytes(b"exe")
+    (root / "與工具一同啟動.bat").write_text("@echo off\r\n", encoding="utf-8")
+    (root / "tools.CMD").write_text("@echo off\r\n", encoding="utf-8")
+
+
+def _script_spawn(adapter: FakeAdapter):
+    def spawn(command, cwd):
+        adapter.spawned.append((command, cwd))
+        process = FakeProcess(adapter.next_pid)
+        adapter.processes.append(ProcessInfo(ProcessRef(process.pid, 2000.0), r"C:\Windows\System32\cmd.exe", 1))
+        adapter.next_pid += 1
+        return process
+    adapter.spawn = spawn
+
+
+def test_list_exes_includes_batch_files_after_executables_with_original_names(game):
+    root, *_, launcher = game
+    _with_mtool(root)
+    assert launcher.list_exes("game/A") == [
+        "bin/game.exe", "Game.exe", "start.exe", "Tool/loaders/inject.exe", "Tool/nw.exe",
+        "tools.CMD", "與工具一同啟動.bat",
+    ]
+
+
+def test_batch_launch_runs_cmd_in_script_directory_without_extra_arguments(game):
+    root, adapter, _, _, launcher = game
+    _with_mtool(root)
+    _script_spawn(adapter)
+    launcher.launch("game/A", "與工具一同啟動.bat", 9)
+    command, cwd = adapter.spawned[0]
+    script = Path(launcher.state.root).resolve() / "與工具一同啟動.bat"
+    assert isinstance(command, str)
+    assert command.endswith(f'cmd.exe" /d /c ""{script}""')
+    assert cwd == str(script.parent)
+
+
+def test_batch_launch_ignores_locale_emulator(game, tmp_path):
+    root, adapter, _, _, launcher = game
+    _with_mtool(root)
+    _script_spawn(adapter)
+    launcher.locale_emulator = str(tmp_path / "missing-LEProc.exe")
+    launcher.launch("game/A", "tools.CMD", 9, locale_emulator=True)
+    assert "LEProc" not in adapter.spawned[0][0]
+
+
+@pytest.mark.parametrize("script", ["../outside.bat", r"C:\outside.bat", "readme.txt"])
+def test_batch_launch_rejects_paths_outside_root_and_other_types(game, tmp_path, script):
+    root, *_, launcher = game
+    (tmp_path / "outside.bat").write_text("@echo off\r\n", encoding="utf-8")
+    (root / "readme.txt").write_text("x", encoding="utf-8")
+    with pytest.raises(LaunchError) as error:
+        launcher.launch("game/A", script, 1)
+    assert error.value.code == "bridge_exe_invalid"
+
+
+def test_batch_session_tracks_game_but_not_mtool_after_cmd_exits(game):
+    root, adapter, store, _, launcher = game
+    _with_mtool(root)
+    _script_spawn(adapter)
+    session = launcher.launch("game/A", "與工具一同啟動.bat", 9)
+    cmd = session.pids[0]
+    game_ref = ProcessRef(301, 2001.0)
+    adapter.processes = [
+        ProcessInfo(game_ref, str(root / "Game.exe"), 300),
+        ProcessInfo(ProcessRef(302, 2002.0), str(root / "Tool" / "nw.exe"), cmd.pid),
+        ProcessInfo(ProcessRef(303, 2003.0), r"C:\Windows\renderer.exe", 302),
+    ]
+    launcher.monitor_once(session)
+    assert session.pids == [game_ref]
+    assert launcher.is_running("game/A")
+
+    adapter.processes = [adapter.processes[1], adapter.processes[2]]
+    launcher.monitor_once(session)
+    assert session.pids == []
+    assert not launcher.is_running("game/A")
+    assert store.sessions[session.session_id].ignore == [str(Path(launcher.state.root).resolve() / "Tool")]
+
+
+def test_exe_session_still_counts_processes_under_tool(game):
+    root, adapter, _, _, launcher = game
+    _with_mtool(root)
+    session = launcher.launch("game/A", "Game.exe", 9)
+    nw = ProcessRef(302, 2002.0)
+    adapter.processes = [ProcessInfo(nw, str(root / "Tool" / "nw.exe"), 1)]
+    launcher.monitor_once(session)
+    assert session.pids == [nw]

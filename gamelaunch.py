@@ -14,6 +14,11 @@ from typing import Protocol
 
 log = logging.getLogger("bridge.game_launch")
 
+LAUNCHABLE_SUFFIXES = (".exe", ".bat", ".cmd")
+SCRIPT_SUFFIXES = (".bat", ".cmd")
+# 批处理启动的游戏常附带 MTool（`Tool\nw.exe`），它在游戏关闭后通常仍开着，不能算进游玩时间。
+SCRIPT_IGNORED_SUBDIR = "Tool"
+
 
 @dataclass(frozen=True, order=True)
 class ProcessRef:
@@ -38,6 +43,27 @@ class RunningSession:
     pids: list[ProcessRef]
     last_seen: int
     path: str = ""
+    # 这些目录底下的程序不算「游戏仍在执行」（批处理启动时的 MTool）；持久化以便重启后沿用同一规则。
+    ignore: list[str] = field(default_factory=list)
+
+
+def _contains(root: str | Path, candidate: str | Path) -> bool:
+    try:
+        common = os.path.commonpath((str(root), str(candidate)))
+    except (OSError, ValueError):
+        return False
+    # Windows 路径不区分大小写；casefold 也让非 Windows 测试中的模拟路径一致。
+    return os.path.normcase(common).casefold() == os.path.normcase(str(root)).casefold()
+
+
+def is_ignored(session: RunningSession, exe_path: str | None) -> bool:
+    if not session.ignore or not exe_path:
+        return False
+    try:
+        executable = Path(exe_path).resolve()
+    except OSError:
+        return False
+    return any(_contains(Path(directory), executable) for directory in session.ignore)
 
 
 class LaunchError(Exception):
@@ -54,7 +80,7 @@ class ProcessAdapter(Protocol):
     def exe_path(self, pid: int) -> str | None: ...
     def parent_pid(self, pid: int) -> int | None: ...
     def process_ref(self, pid: int) -> ProcessRef | None: ...
-    def spawn(self, command: list[str], cwd: str): ...
+    def spawn(self, command: list[str] | str, cwd: str): ...
 
 
 class SessionStore(Protocol):
@@ -126,7 +152,7 @@ class PsutilProcessAdapter:
         except (self.psutil.NoSuchProcess, self.psutil.AccessDenied, self.psutil.ZombieProcess):
             return None
 
-    def spawn(self, command: list[str], cwd: str):
+    def spawn(self, command: list[str] | str, cwd: str):
         return subprocess.Popen(command, cwd=cwd, shell=False)
 
 
@@ -178,12 +204,7 @@ class GameLauncher:
 
     @staticmethod
     def _inside(root: Path, candidate: Path) -> bool:
-        try:
-            common = os.path.commonpath((str(root), str(candidate)))
-        except (OSError, ValueError):
-            return False
-        # Windows 路径不区分大小写；casefold 也让非 Windows 测试中的模拟路径一致。
-        return os.path.normcase(common).casefold() == os.path.normcase(str(root)).casefold()
+        return _contains(root, candidate)
 
     def _ready_root(self, path: str) -> Path:
         try:
@@ -209,7 +230,7 @@ class GameLauncher:
             resolved = candidate.resolve(strict=True)
         except OSError as exc:
             raise LaunchError(409, "bridge_exe_invalid", "selected executable does not exist") from exc
-        if not self._inside(root, resolved) or not resolved.is_file() or resolved.suffix.casefold() != ".exe":
+        if not self._inside(root, resolved) or not resolved.is_file() or resolved.suffix.casefold() not in LAUNCHABLE_SUFFIXES:
             raise LaunchError(409, "bridge_exe_invalid", "selected executable is outside the game folder or invalid")
         return resolved
 
@@ -236,27 +257,34 @@ class GameLauncher:
                         continue
                     if candidate.is_dir():
                         pending.append(candidate)
-                    elif candidate.suffix.casefold() == ".exe" and candidate.is_file():
+                    elif candidate.suffix.casefold() in LAUNCHABLE_SUFFIXES and candidate.is_file():
                         exes.append(candidate.relative_to(root).as_posix())
                 except (OSError, ValueError):
                     continue
-        return sorted(set(exes), key=lambda item: (item.casefold(), item))
+        # 批处理排在 .exe 后面；前端不依赖顺序，只是让原版执行档排在下拉选单前面。
+        return sorted(set(exes), key=lambda item: (item.casefold().endswith(SCRIPT_SUFFIXES), item.casefold(), item))
+
+    def _session_active(self, session: RunningSession) -> bool:
+        if self._session_alive(session):
+            return True
+        # 批处理的 cmd.exe 几秒就结束，游戏本体要等下一次 poll 才接上；
+        # monitor 还没判定结束前都算在跑，避免状态在两次 poll 之间闪回 ready。
+        with self._lock:
+            thread = self._monitor_threads.get(session.session_id)
+            pending = self._empty_polls.get(session.session_id, 0) < 2
+        return thread is not None and thread.is_alive() and pending
 
     def _is_game_running(self, path: str) -> bool:
         with self._lock:
             sessions = [session for session in self.sessions.values() if session.path.casefold() == path.casefold()]
-        if not sessions:
-            return False
-        adapter = self._adapter()
-        return any(adapter.is_alive(ref) for session in sessions for ref in session.pids)
+        return any(self._session_active(session) for session in sessions)
 
     def elapsed_seconds(self, path: str) -> int:
         with self._lock:
             sessions = [session for session in self.sessions.values() if session.path.casefold() == path.casefold()]
         if not sessions:
             return 0
-        adapter = self._adapter()
-        active = [session for session in sessions if any(adapter.is_alive(ref) for ref in session.pids)]
+        active = [session for session in sessions if self._session_active(session)]
         if not active:
             return 0
         return max(0, int(self.clock()) - min(session.start for session in active))
@@ -269,7 +297,18 @@ class GameLauncher:
         exe_path = self._resolve_exe(root, exe_relpath)
         if not isinstance(game_id, int) or isinstance(game_id, bool) or game_id <= 0:
             raise LaunchError(400, "invalid_game_id", "game id must be a positive integer")
-        if locale_emulator:
+        ignore: list[str] = []
+        if exe_path.suffix.casefold() in SCRIPT_SUFFIXES:
+            # 只执行该文件本身，不附加任何来自请求的参数。Windows 路径不可能含 `"`，
+            # `cmd /c` 剥掉外层那对引号后剩下完整引用的路径，`&` 之类的字符不会被解读。
+            cmd = Path(os.environ.get("SystemRoot") or "C:\\Windows") / "System32" / "cmd.exe"
+            command = f'"{cmd}" /d /c ""{exe_path}""'
+            ignore = sorted({str(root / SCRIPT_IGNORED_SUBDIR), str(exe_path.parent / SCRIPT_IGNORED_SUBDIR)})
+            if locale_emulator:
+                # Locale Emulator 包不了批处理，忽略它照常启动。
+                log.info("locale emulator ignored for batch-file launch")
+                locale_emulator = False
+        elif locale_emulator:
             if not self.locale_emulator_available:
                 raise LaunchError(409, "bridge_locale_emulator_unavailable", "已请求使用 Locale Emulator，但配置的启动程序不存在或不可用。")
             command = [str(Path(self.locale_emulator).resolve()), str(exe_path)]
@@ -308,7 +347,7 @@ class GameLauncher:
 
             now = int(self.clock())
             session = RunningSession(
-                str(uuid.uuid4()), game_id, self.device, int(ref.create_time), str(root), [ref], now, path,
+                str(uuid.uuid4()), game_id, self.device, int(ref.create_time), str(root), [ref], now, path, ignore,
             )
             with self._lock:
                 # 串行化 durable snapshot 写入，避免并发 launch 覆盖 running map。
@@ -371,7 +410,8 @@ class GameLauncher:
 
     def monitor_once(self, session: RunningSession) -> bool:
         adapter = self._adapter()
-        snapshot = adapter.snapshot_all()
+        # 被忽略的程序（MTool）既不计入，也不沿着它把子孙带进来。
+        snapshot = [item for item in adapter.snapshot_all() if not is_ignored(session, item.exe_path)]
         by_pid = {item.ref.pid: item for item in snapshot}
         retained = {
             ref for ref in session.pids
