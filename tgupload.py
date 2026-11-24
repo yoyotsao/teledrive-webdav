@@ -334,7 +334,15 @@ async def send_part(
                 if flood is None:
                     raise
                 seconds, premium = flood
-                log.warning("%s hit FLOOD_WAIT; retrying after %.1fs", label, seconds)
+                # A premium wait is Telegram's expected cap on a non-Premium
+                # account, and upload_engine's "premium flood" line already
+                # records it with file/segment/speed. Only a plain FLOOD_WAIT
+                # (we sent too fast) is worth a WARNING of its own.
+                log.log(
+                    logging.DEBUG if premium else logging.WARNING,
+                    "%s hit %s; retrying after %.1fs",
+                    label, "FLOOD_PREMIUM_WAIT" if premium else "FLOOD_WAIT", seconds,
+                )
                 gate.flood(seconds, premium=premium)
                 if premium and observer is not None:
                     snapshot = getattr(gate, "snapshot", None)

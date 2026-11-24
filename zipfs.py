@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 import struct
 import time
 import zlib
@@ -20,6 +21,7 @@ import zipfile
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
+import fileid
 from tgio import SlicedReader
 
 log = logging.getLogger("zipfs")
@@ -65,17 +67,182 @@ def _split_name(name: str) -> Optional[List[str]]:
     return parts
 
 
+# Names without the UTF-8 flag (0x800) are whatever codepage the packer's
+# Windows ran in; zipfile decodes them as cp437, so a Big5 name comes out as
+# '«g║δ¡╡'. cp437 maps all 256 bytes, so the original bytes are recoverable
+# exactly and the codepage is guessed once per archive (one packer, one codepage).
+_UTF8_FLAG = 0x800
+_LEGACY_CODEPAGES = ("cp932", "cp950", "gbk")  # Windows tables: cp950 has the ETEN extensions big5 lacks
+# Mojibake lands anywhere in a codepage, so it is mostly rare characters; real
+# names are mostly common ones. "Common" is judged on the double-byte code in
+# the candidate's own table: punctuation, kana and level-1 kanji/hanzi.
+def _common_cp932(lead: int, trail: int) -> bool:
+    code = lead << 8 | trail
+    return (
+        0x8141 <= code <= 0x81AC  # punctuation, ー
+        or 0x829F <= code <= 0x82F1  # hiragana
+        or 0x8340 <= code <= 0x8396  # katakana
+        or 0x889F <= code <= 0x9872  # JIS level 1 kanji
+    )
+
+
+def _common_big5(lead: int, trail: int) -> bool:
+    return 0xA1 <= lead <= 0xA3 or 0xA4 <= lead <= 0xC6  # symbols, frequent hanzi
+
+
+def _common_gbk(lead: int, trail: int) -> bool:
+    # GB2312 proper has both bytes >= 0xA1; lower trails are the GBK extension
+    return trail >= 0xA1 and (0xA1 <= lead <= 0xA5 or 0xB0 <= lead <= 0xD7)
+
+
+_COMMON = {"cp932": _common_cp932, "cp950": _common_big5, "gbk": _common_gbk}
+_BAD_CHARS = re.compile("[｡-ﾟ─-╿-]")  # halfwidth kana, box drawing, PUA
+_MIN_SCORE = 1  # rare characters score 0, so random bytes stay below this
+
+
+def _legacy_raw(info: zipfile.ZipInfo) -> Optional[bytes]:
+    """The name's original bytes, if zipfile decoded them as cp437 and they are not ASCII."""
+    if info.flag_bits & _UTF8_FLAG:
+        return None
+    # orig_filename: on Windows zipfile turns '\\' into '/' in .filename, and
+    # 0x5C is a valid Big5/Shift-JIS trail byte (許, 表 ...).
+    raw = getattr(info, "orig_filename", info.filename).encode("cp437")
+    return None if raw.isascii() else raw
+
+
+def _text_score(raw: bytes, enc: str) -> Optional[int]:
+    """How much ``raw`` decoded as ``enc`` looks like real text; None if it does not decode."""
+    try:
+        text = raw.decode(enc)
+    except UnicodeDecodeError:
+        return None
+    score = -3 * len(_BAD_CHARS.findall(text))
+    for ch in text:
+        code = ch.encode(enc)
+        if len(code) == 2 and _COMMON[enc](code[0], code[1]):
+            score += 1
+    return score
+
+
+def guess_codepage(raws: Sequence[bytes]) -> Optional[str]:
+    """The codepage that turns these names into the most real text, or None (keep cp437)."""
+    if not raws:
+        return None
+    try:
+        for raw in raws:
+            raw.decode("utf-8")
+        return "utf-8"  # flag missing but the bytes are UTF-8 (7-Zip, macOS)
+    except UnicodeDecodeError:
+        pass
+    best, best_score = None, _MIN_SCORE - 1
+    for enc in _LEGACY_CODEPAGES:
+        score = sum(-5 if (s := _text_score(raw, enc)) is None else s for raw in raws)
+        if score > best_score:
+            best, best_score = enc, score
+    return best
+
+
+def _decode_one(raw: bytes, enc: str) -> Optional[str]:
+    """``raw`` in the archive's codepage, unless another one reads clearly better.
+
+    Repacks mix codepages: a Chinese translator's GBK readme next to the
+    original Shift-JIS soundtrack, which GBK still "decodes" into rare hanzi.
+    A fallback must stand on its own evidence and beat the archive's codepage
+    by a wide margin, so a stray cp437 'é' is not turned into a fullwidth letter
+    and a Big5 name is not flipped to GBK by one lucky character.
+    """
+    main = _text_score(raw, enc)
+    scored = [(s, alt) for alt in _LEGACY_CODEPAGES if alt != enc and (s := _text_score(raw, alt)) is not None]
+    if scored:
+        score, alt = max(scored)
+        if score >= _MIN_SCORE and (main is None or score > 2 * max(main, 0) + 1):
+            return raw.decode(alt)
+    return None if main is None else raw.decode(enc)  # None: keep zipfile's cp437 name
+
+
+def _baked_raw(info: zipfile.ZipInfo) -> Optional[bytes]:
+    """Bytes behind a UTF-8 name that is itself cp437 mojibake, else None.
+
+    A repacker that read a legacy archive as cp437 and saved it with the UTF-8
+    flag writes the garbage itself ('êñé╠Æ┤' for 愛の超越). Every such name is
+    cp437-encodable; most genuine non-ASCII names (CJK, most accents) are not.
+    """
+    if not info.flag_bits & _UTF8_FLAG:
+        return None
+    try:
+        raw = info.filename.encode("cp437")
+    except UnicodeEncodeError:
+        return None
+    # 'año', 'Pokémon' are cp437-encodable too, but only mojibake carries cp437's
+    # box drawing, Greek and math (╗ α ⌐ ¼): real Latin names have just letters.
+    if not any(not ch.isascii() and (ord(ch) > 0xFF or not ch.isalpha()) for ch in info.filename):
+        return None
+    return raw
+
+
+# Baked names were deliberately written as UTF-8, so the bar is higher than for
+# flagless ones: 'año' is one common Big5 character away from 'a大'. The
+# archive's baked names are judged together first; once they agree on a
+# codepage, a one-character name like '裸.png' needs no more evidence than that.
+_BAKED_MIN_SCORE = 2
+
+
+def _baked_names(raws: Dict[int, bytes]) -> Dict[int, str]:
+    enc = None
+    totals = {}
+    for alt in _LEGACY_CODEPAGES:
+        scores = [_text_score(raw, alt) for raw in raws.values()]
+        totals[alt] = sum(s for s in scores if s is not None and s > 0)
+    if totals and max(totals.values()) >= _BAKED_MIN_SCORE:
+        enc = max(totals, key=totals.get)
+    out = {}
+    for key, raw in raws.items():
+        if enc is not None and (_text_score(raw, enc) or 0) >= _MIN_SCORE:
+            out[key] = raw.decode(enc)
+            continue
+        scored = [(s, alt) for alt in _LEGACY_CODEPAGES if (s := _text_score(raw, alt)) is not None]
+        if scored and max(scored)[0] >= _BAKED_MIN_SCORE:
+            out[key] = raw.decode(max(scored)[1])
+    return out
+
+
+def _atag(archive: str) -> str:
+    """Log name of an archive (a direct child of the game folder): an id, never its name."""
+    return fileid.tag("game/" + archive) if archive else fileid.UNKNOWN_TAG
+
+
+def decoded_names(infos: Sequence[zipfile.ZipInfo], archive: str = "") -> Dict[int, str]:
+    """``id(info) -> display name`` for members whose name re-decodes cleanly."""
+    out: Dict[int, str] = {}
+    raws = {id(info): raw for info in infos if (raw := _legacy_raw(info)) is not None}
+    enc = guess_codepage(list(raws.values()))
+    if enc is not None:
+        out.update((key, name) for key, raw in raws.items() if (name := _decode_one(raw, enc)) is not None)
+        log.info("zip %s: %d of %d legacy names decoded, mostly %s", _atag(archive), len(out), len(raws), enc)
+    elif raws:
+        log.info("zip %s: %d legacy names, codepage unknown, kept as cp437", _atag(archive), len(raws))
+
+    baked = {id(info): raw for info in infos if (raw := _baked_raw(info)) is not None}
+    fixed = _baked_names(baked)
+    out.update(fixed)
+    if fixed:
+        log.info("zip %s: %d of %d UTF-8 names were stored as cp437 mojibake, repaired", _atag(archive), len(fixed), len(baked))
+    return out
+
+
 def build_tree(infos: Sequence[zipfile.ZipInfo], root_name: str = "") -> ZipNode:
     """Build the virtual tree from a central directory listing.
 
     Directories implied by a member's path are created even when the archive
-    carries no explicit entry for them.
+    carries no explicit entry for them. ``zip_name`` keeps zipfile's own name
+    (what ``ZipFile.open`` looks up); only the visible path is re-decoded.
     """
     root = ZipNode(name=root_name, is_dir=True)
-    for info in infos:
-        parts = _split_name(info.filename)
+    names = decoded_names(infos, root_name)
+    for index, info in enumerate(infos):
+        parts = _split_name(names.get(id(info), info.filename))
         if parts is None:
-            log.warning("skipping unsafe zip member %r", info.filename)
+            log.warning("skipping unsafe zip member #%d of %s", index, _atag(root_name))
             continue
         is_dir = info.is_dir()
         node = root
@@ -85,7 +252,7 @@ def build_tree(infos: Sequence[zipfile.ZipInfo], root_name: str = "") -> ZipNode
                 child = ZipNode(name=segment, is_dir=True)
                 node.children[segment] = child
             elif not child.is_dir:
-                log.warning("zip member %r collides with a file entry", info.filename)
+                log.warning("zip member #%d of %s collides with a file entry", index, _atag(root_name))
                 child = None
                 break
             node = child
@@ -162,6 +329,23 @@ def tree_from_json(data: dict) -> ZipNode:
     for key, child in (data.get("ch") or {}).items():
         node.children[key] = tree_from_json(child)
     return node
+
+
+# 4: legacy-codepage and baked cp437 names re-decoded (decoded_names; 2-4 were drafts). Older trees with
+# non-ASCII names may hold cp437 mojibake and are re-read once; ASCII-only
+# trees cannot be affected, so they are kept and cost no Telegram round trip.
+TREE_VERSION = 5
+
+
+def _ascii_tree(data: dict) -> bool:
+    return data["n"].isascii() and all(_ascii_tree(c) for c in (data.get("ch") or {}).values())
+
+
+def _cache_current(data: dict) -> bool:
+    if data.get("v") == TREE_VERSION:
+        return True
+    # the root's own name is the archive's, not a member's
+    return all(_ascii_tree(c) for c in (data.get("ch") or {}).values())
 
 
 def local_data_offset(fp, header_offset: int) -> int:
@@ -332,7 +516,7 @@ class ZipView:
             return self._root
         if self._cache is not None and self._cache_key:
             cached = self._cache.get(self._cache_key)
-            if cached:
+            if cached and _cache_current(cached):
                 self._root = tree_from_json(cached)
                 return self._root
         stream = self._open_stream()
@@ -351,7 +535,7 @@ class ZipView:
         now = time.monotonic()
         if not force and now - self._last_save < self.SAVE_INTERVAL:
             return
-        self._cache.put(self._cache_key, tree_to_json(self._root))
+        self._cache.put(self._cache_key, {**tree_to_json(self._root), "v": TREE_VERSION})
         self._dirty = False
         self._last_save = now
 

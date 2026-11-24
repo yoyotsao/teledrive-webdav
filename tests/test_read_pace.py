@@ -183,6 +183,40 @@ def test_home_dc_media_is_not_pinned():
     assert pool[0].borrowed == []
 
 
+class _PingedSender:
+    def __init__(self):
+        self._user_connected = True
+        self.pings = []
+
+    def _keepalive_ping(self, rnd_id):
+        self.pings.append(rnd_id)
+
+
+def test_a_pinned_sender_is_kept_alive_until_disconnect():
+    """Telethon only pings the main sender; a pinned one left silent is closed
+    by Telegram every ~90s, which logged a WARNING + reconnect like clockwork."""
+    sender = _PingedSender()
+    client = _FakeClient()
+
+    async def borrow(dc_id):
+        return sender
+
+    client._borrow_exported_sender = borrow
+    worker = _worker([client])
+    worker.PIN_KEEPALIVE_SECONDS = 0.01
+
+    async def scenario():
+        await worker._pin_exported_sender(client, 1)
+        await asyncio.sleep(0.05)
+        assert len(sender.pings) >= 2
+        await worker._disconnect_all()
+        seen = len(sender.pings)
+        await asyncio.sleep(0.05)
+        assert len(sender.pings) == seen  # cancelled with the connections
+
+    asyncio.run(scenario())
+
+
 def test_a_read_closes_its_download_iterator():
     """One chunk is the whole request, so the iterator is always left early.
 

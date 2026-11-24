@@ -286,3 +286,133 @@ def test_zip_name_helpers():
     assert not zipfs.is_zip_name("MyGame.rar")
     assert zipfs.strip_zip_suffix("MyGame.zip") == "MyGame"
     assert zipfs.strip_zip_suffix("plain.txt") == "plain.txt"
+
+
+# -- legacy-codepage names (no UTF-8 flag) ----------------------------------- #
+
+
+def legacy_zip(members) -> bytes:
+    """A zip whose names are raw codepage bytes without the UTF-8 flag (what
+    WinRAR / old 7-Zip write on a Big5 or Shift-JIS Windows)."""
+    buf = io.BytesIO()
+    placeholders = {}
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        for i, (raw, blob) in enumerate(members.items()):
+            stand_in = (f"~{i}~".encode() + b"x" * len(raw))[: len(raw)]
+            placeholders[stand_in] = raw
+            zf.writestr(stand_in.decode(), blob)
+    data = buf.getvalue()
+    for stand_in, raw in placeholders.items():
+        assert data.count(stand_in) == 2  # local header + central directory
+        data = data.replace(stand_in, raw)
+    return data
+
+
+def legacy_view(members, cache=None, key=""):
+    data = legacy_zip(members)
+    return zipfs.ZipView(lambda: io.BytesIO(data), name="Game", cache=cache, cache_key=key)
+
+
+def test_big5_names_are_shown_decoded_and_still_open():
+    members = {
+        "www/audio/se/射精音5.rpgmvo".encode("big5"): b"a",
+        "www/img/許可.png".encode("big5"): b"b",  # 許 = B3 5C: a '\' trail byte
+        "使用AI翻方法/說明.txt".encode("big5"): b"c",
+    }
+    view = legacy_view(members)
+    files = {rel: node for rel, node in view.walk() if not node.is_dir}
+    assert set(files) == {raw.decode("big5") for raw in members}
+    for raw, blob in members.items():
+        with view.open(files[raw.decode("big5")]) as fp:
+            assert fp.read() == blob
+
+
+def test_shift_jis_and_flagless_utf8_names_are_recognised():
+    sjis = legacy_view({"セーブ/データ.rvdata2".encode("cp932"): b"x", "画像.png".encode("cp932"): b"y"})
+    assert {rel for rel, n in sjis.walk() if not n.is_dir} == {"セーブ/データ.rvdata2", "画像.png"}
+    utf8 = legacy_view({"資料/設定.ini".encode("utf-8"): b"x"})
+    assert {rel for rel, n in utf8.walk() if not n.is_dir} == {"資料/設定.ini"}
+
+
+def test_weak_evidence_keeps_the_cp437_name():
+    view = legacy_view({b"\x82\x82.txt": b"x"})  # one CJK char at best: not enough
+    assert [rel for rel, _ in view.walk()] == ["éé.txt"]
+
+
+def test_old_cache_with_non_ascii_names_is_reparsed_once(tmp_path):
+    raw = "說明.txt".encode("big5")
+    store = JsonStore(tmp_path / "zips.json")
+    mojibake = raw.decode("cp437")
+    store.put("k", {"n": "Game", "d": True, "ch": {mojibake: {"n": mojibake, "d": False, "z": mojibake}}})
+    view = legacy_view({raw: b"x"}, cache=store, key="k")
+    assert [rel for rel, _ in view.walk()] == ["說明.txt"]
+    assert store.get("k")["v"] == zipfs.TREE_VERSION
+
+
+def test_old_ascii_only_cache_is_kept_without_a_reread(tmp_path):
+    store = JsonStore(tmp_path / "zips.json")
+    store.put("k", {"n": "遊戲", "d": True, "ch": {"a.txt": {"n": "a.txt", "d": False, "z": "a.txt"}}})
+
+    def no_network():
+        raise AssertionError("an ASCII-only tree cannot hold mojibake; must not re-read")
+
+    view = zipfs.ZipView(no_network, name="遊戲", cache=store, cache_key="k")
+    assert [rel for rel, _ in view.walk()] == ["a.txt"]
+
+
+def test_big5_is_not_mistaken_for_gbk_extension_characters():
+    # 繁体中文 in Big5 decodes in GBK too: as two extension-area hanzi plus kana
+    raw = "localization-繁体中文(zh-tw).bundle".encode("big5")
+    assert zipfs.guess_codepage([raw]) == "cp950"
+    assert zipfs.guess_codepage(["Actor1、５.png".encode("big5"), "★SEX".encode("big5")]) == "cp950"
+
+
+def test_genuine_cp437_accents_are_left_alone():
+    assert zipfs.guess_codepage(["Alizée.ogg".encode("cp437")]) is None
+
+
+def test_mixed_codepage_repack_decodes_each_name():
+    # a Chinese repack: GBK readmes added next to the original Shift-JIS soundtrack
+    members = {
+        "【女装神话】H场景追加资料 说明.txt".encode("gbk"): b"a",
+        "【女装神话】H场景追加资料 说明.png".encode("gbk"): b"b",
+        "Theme/00_OP_愛の超越デスティニー(Full).mp3".encode("cp932"): b"c",
+    }
+    view = legacy_view(members)
+    assert {rel for rel, n in view.walk() if not n.is_dir} == {
+        "【女装神话】H场景追加资料 说明.txt",
+        "【女装神话】H场景追加资料 说明.png",
+        "Theme/00_OP_愛の超越デスティニー(Full).mp3",
+    }
+
+
+def utf8_zip_view(names):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name in names:
+            zf.writestr(name, b"x")  # non-ASCII names get the UTF-8 flag
+    data = buf.getvalue()
+    return zipfs.ZipView(lambda: io.BytesIO(data), name="Game")
+
+
+def test_mojibake_baked_into_utf8_names_is_repaired():
+    # a repacker read the Shift-JIS original as cp437 and saved it as UTF-8,
+    # then added its own readme correctly
+    baked = "Theme/00_OP_愛の超越デスティニー(Full).mp3".encode("cp932").decode("cp437")
+    view = utf8_zip_view([baked, "【女装神话】说明.txt"])
+    assert {rel for rel, n in view.walk() if not n.is_dir} == {
+        "Theme/00_OP_愛の超越デスティニー(Full).mp3",
+        "【女装神话】说明.txt",
+    }
+
+
+def test_genuine_utf8_accents_are_not_reinterpreted():
+    names = ["año.txt", "niño.txt", "señor.txt", "Pokémon Café.png", "Alizée.ogg", "naïve résumé.doc"]
+    view = utf8_zip_view(names)
+    assert {rel for rel, n in view.walk() if not n.is_dir} == set(names)
+
+
+def test_one_character_baked_names_follow_the_archive():
+    bake = lambda s: s.encode("big5").decode("cp437")  # noqa: E731
+    view = utf8_zip_view([bake("說明1.jpg"), bake("img/裸.png"), bake("bgm/20春(spring).ogg")])
+    assert {rel for rel, n in view.walk() if not n.is_dir} == {"說明1.jpg", "img/裸.png", "bgm/20春(spring).ogg"}

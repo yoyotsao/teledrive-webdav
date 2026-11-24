@@ -404,3 +404,19 @@ def test_a_full_width_streamed_read_stays_in_the_cache():
     fh.seek(0)
     assert fh.read(width) == blob[:width]
     assert len(reader.calls) == fetched
+
+
+def test_telegram_shorter_than_listed_size_pads_instead_of_stopping_short():
+    """Chat-import photos: Telegram served 62,285 bytes for a 67,857-byte listing.
+
+    A short answer made rclone retry forever and left warmshell wedged in a
+    kernel read. Every read must deliver exactly what the listed size promises.
+    """
+    real = bytes((i % 251) for i in range(80))
+    reader = FakeReader({1: real})
+    fh = SeekableRemoteFile(reader, [routed(1, 100)], name="photo.jpg", block_size=64)
+    assert fh.read() == real + bytes(20)
+    fh.seek(90)
+    assert fh.read(10) == bytes(10)
+    fh.seek(70)
+    assert fh.read(20) == real[70:] + bytes(10)
